@@ -1,0 +1,11 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Local data the CLI may create during manual testing
+/.rstore-data/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/

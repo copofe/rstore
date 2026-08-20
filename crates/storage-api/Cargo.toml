@@ -1,0 +1,20 @@
+[package]
+name = "rstore-storage-api"
+description = "Storage abstraction and capability model. No GPUI, no concrete SDK."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rstore-domain.workspace = true
+rstore-secrets.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

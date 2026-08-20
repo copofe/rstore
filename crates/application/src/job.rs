@@ -1,0 +1,213 @@
+//! Job inspection and control (JOB-004..012, 015).
+//!
+//! Foreground job execution and persisted state transitions for the runtime.
+//! Cooperative cancellation is shared by CLI and future desktop callers.
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use rstore_domain::job::Job;
+use rstore_domain::job::JobState;
+use rstore_domain::JobRepository;
+use rstore_domain::{Clock, Error, JobId, Result};
+
+/// A reference to a job: `job_…` id or its ordinal position in the list
+/// (`1`, `2`, … newest-first) for convenient typing.
+#[derive(Debug, Clone)]
+pub enum JobRef {
+    Id(JobId),
+    Ordinal(u32),
+}
+
+impl JobRef {
+    pub fn parse(s: &str) -> Result<Self> {
+        if s.starts_with("job_") {
+            return s
+                .parse()
+                .map(JobRef::Id)
+                .map_err(|e| Error::invalid_input(format!("invalid job id `{s}`")).with_source(e));
+        }
+        s.parse::<u32>().map(JobRef::Ordinal).map_err(|e| {
+            Error::invalid_input(format!("invalid job reference `{s}`")).with_source(e)
+        })
+    }
+}
+
+/// Job control operations behind `rstore task …`.
+#[async_trait]
+pub trait JobService: Send + Sync {
+    /// All jobs, newest first.
+    async fn list(&self) -> Result<Vec<Job>>;
+    /// Resolve a reference (`job_…` id or 1-based ordinal, newest first).
+    async fn resolve(&self, reference: &JobRef) -> Result<Job>;
+    /// Pause a running job (JOB-006). Only `running` may pause.
+    async fn pause(&self, reference: &JobRef) -> Result<Job>;
+    /// Resume a paused/interrupted job (JOB-007).
+    async fn resume(&self, reference: &JobRef) -> Result<Job>;
+    /// Re-run a failed/partial job (JOB-010).
+    async fn retry(&self, reference: &JobRef) -> Result<Job>;
+    /// Cancel a job in any non-terminal state (JOB-008).
+    async fn cancel(&self, reference: &JobRef) -> Result<Job>;
+    /// JOB-015: at startup, mark jobs orphaned by a dead process as
+    /// `interrupted`. Called once from `Application::open`.
+    async fn mark_stale_interrupted(&self) -> Result<u64>;
+}
+
+/// The default implementation over the [`JobRepository`] seam (SQLite in
+/// production; an in-memory store in tests).
+pub struct DefaultJobService {
+    repo: Arc<dyn JobRepository>,
+    clock: Arc<dyn Clock>,
+}
+
+impl DefaultJobService {
+    pub fn new(repo: Arc<dyn JobRepository>, clock: Arc<dyn Clock>) -> Self {
+        Self { repo, clock }
+    }
+}
+
+fn not_found(reference: &JobRef) -> Error {
+    match reference {
+        JobRef::Id(id) => Error::not_found(format!("job {id} not found")),
+        JobRef::Ordinal(n) => Error::not_found(format!("job #{n} not found")),
+    }
+}
+
+#[async_trait]
+impl JobService for DefaultJobService {
+    async fn list(&self) -> Result<Vec<Job>> {
+        self.repo.list().await
+    }
+
+    async fn resolve(&self, reference: &JobRef) -> Result<Job> {
+        match reference {
+            JobRef::Id(id) => self
+                .repo
+                .get(*id)
+                .await?
+                .ok_or_else(|| not_found(reference)),
+            JobRef::Ordinal(n) => {
+                let all = self.repo.list().await?;
+                all.into_iter()
+                    .nth((*n as usize).saturating_sub(1))
+                    .ok_or_else(|| not_found(reference))
+            }
+        }
+    }
+
+    async fn pause(&self, reference: &JobRef) -> Result<Job> {
+        let job = self.resolve(reference).await?;
+        if job.state != JobState::Running {
+            return Err(Error::conflict(format!(
+                "only a running job can pause; this one is `{}`",
+                job.state.as_str()
+            )));
+        }
+        self.repo
+            .transition(job.id, JobState::Paused, self.clock.now())
+            .await
+    }
+
+    async fn resume(&self, reference: &JobRef) -> Result<Job> {
+        let job = self.resolve(reference).await?;
+        if !matches!(job.state, JobState::Paused | JobState::Interrupted) {
+            return Err(Error::conflict(format!(
+                "only a paused/interrupted job can resume; this one is `{}`",
+                job.state.as_str()
+            )));
+        }
+        self.repo
+            .transition(job.id, JobState::Running, self.clock.now())
+            .await
+    }
+
+    async fn retry(&self, reference: &JobRef) -> Result<Job> {
+        let job = self.resolve(reference).await?;
+        if !matches!(job.state, JobState::Failed | JobState::PartialSuccess) {
+            return Err(Error::conflict(format!(
+                "only a failed/partial job can retry; this one is `{}`",
+                job.state.as_str()
+            )));
+        }
+        self.repo
+            .transition(job.id, JobState::Running, self.clock.now())
+            .await
+    }
+
+    async fn cancel(&self, reference: &JobRef) -> Result<Job> {
+        let job = self.resolve(reference).await?;
+        if job.state.is_terminal() {
+            return Err(Error::conflict(format!(
+                "job already finished as `{}`",
+                job.state.as_str()
+            )));
+        }
+        self.repo
+            .transition(job.id, JobState::Cancelled, self.clock.now())
+            .await
+    }
+    async fn mark_stale_interrupted(&self) -> Result<u64> {
+        self.repo
+            .mark_stale_jobs_interrupted(self.clock.now())
+            .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rstore_domain::job::{JobKind, JobState};
+    use rstore_domain::ErrorCode;
+    use rstore_domain::SystemClock;
+    use rstore_persistence::Database;
+    use time::OffsetDateTime;
+
+    async fn setup() -> DefaultJobService {
+        let db = Database::open_in_memory().await.unwrap();
+        let svc = DefaultJobService::new(Arc::new(db.jobs()), Arc::new(SystemClock));
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let job = Job::new(JobKind::Upload, JobId::new(), now);
+        svc.repo.create(&job).await.unwrap();
+        svc.repo
+            .transition(job.id, JobState::Running, now)
+            .await
+            .unwrap();
+        svc
+    }
+
+    #[tokio::test]
+    async fn control_flow_and_references() {
+        let svc = setup().await;
+        let job = svc.resolve(&JobRef::Ordinal(1)).await.unwrap();
+        assert_eq!(job.state, JobState::Running);
+
+        // Pause → resume.
+        let paused = svc.pause(&JobRef::Id(job.id)).await.unwrap();
+        assert_eq!(paused.state, JobState::Paused);
+        let resumed = svc.resume(&JobRef::Ordinal(1)).await.unwrap();
+        assert_eq!(resumed.state, JobState::Running);
+
+        // Fail the job, then retry it (JOB-010), then cancel.
+        svc.repo
+            .transition(job.id, JobState::Failed, OffsetDateTime::UNIX_EPOCH)
+            .await
+            .unwrap();
+        let retrying = svc.retry(&JobRef::Id(job.id)).await.unwrap();
+        assert_eq!(retrying.state, JobState::Running);
+        let cancelled = svc.cancel(&JobRef::Id(job.id)).await.unwrap();
+        assert!(cancelled.state.is_terminal());
+
+        // Cancelling a finished job again is a conflict.
+        let err = svc.cancel(&JobRef::Id(job.id)).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Conflict);
+    }
+
+    #[tokio::test]
+    async fn pause_only_when_running() {
+        let svc = setup().await;
+        let job = svc.resolve(&JobRef::Ordinal(1)).await.unwrap();
+        svc.cancel(&JobRef::Id(job.id)).await.unwrap();
+        let err = svc.pause(&JobRef::Id(job.id)).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Conflict);
+    }
+}

@@ -1,0 +1,10 @@
+[package]
+name = "rstore-desktop-ui"
+description = "GPUI desktop product UI placeholder; no business logic or GPUI dependency yet."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true

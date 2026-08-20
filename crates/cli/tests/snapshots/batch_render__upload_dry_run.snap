@@ -1,0 +1,10 @@
+---
+source: crates/cli/tests/batch_render.rs
+expression: redacted
+---
+(dry run — nothing transferred)
+  ok       <tmp>/new.txt → media/new.txt
+           would upload to media/new.txt
+  ok       <tmp>/b.txt → media/b.txt
+           would upload to media/b.txt
+job job_<id> — 2 succeeded, 0 skipped, 0 failed (succeeded)

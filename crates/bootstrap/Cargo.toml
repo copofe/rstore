@@ -1,0 +1,21 @@
+[package]
+name = "rstore-bootstrap"
+description = "Runtime composition root for the CLI and future desktop entry points."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rstore-application.workspace = true
+rstore-application-ports.workspace = true
+rstore-domain.workspace = true
+rstore-persistence.workspace = true
+rstore-secrets.workspace = true
+rstore-storage-api.workspace = true
+rstore-storage-s3.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "rstore-platform"
+description = "Platform integration: app data dirs, file locks, OS detection. Does not depend on Domain."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+directories.workspace = true
+fs4.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

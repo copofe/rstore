@@ -1,0 +1,213 @@
+//! Repository for [`ConnectionConfig`] rows (CON-/DATA-).
+//!
+//! Stores only non-sensitive configuration. Credentials live in a SecretStore
+//! and are referenced by `secret_ref`; they never touch this table (SEC-001).
+//!
+//! Enum ↔ column encoding lives on the domain enums (`Region::as_token`,
+//! `AddressingStyle::as_str`); this module only binds and reads those tokens
+//! through the shared [`RowReader`](crate::codec::RowReader), which fails
+//! loud on any field that cannot be decoded.
+
+use rstore_domain::connection::{AddressingStyle, ConnectionConfig, ConnectionTestStatus, Region};
+use rstore_domain::id::ConnectionId;
+use rstore_domain::{CredentialRef, Error, Result};
+use sqlx::sqlite::SqlitePool;
+
+use crate::codec::{unix_secs, uuid_to_text, Bind, Insert, RowReader, Update};
+use crate::error::map_sqlx;
+
+/// Every column of `storage_connections`, in canonical order. One list serves
+/// every SELECT/INSERT here, so adding a field is a bind + decode change, not
+/// an SQL-in-four-places change.
+const COLUMNS: &str = "id, name, endpoint, region, addressing_style, \
+                       tls_verify, secret_ref, created_at, updated_at, \
+                       last_tested_at, last_test_status";
+
+/// CRUD access to `storage_connections`.
+#[derive(Clone)]
+pub struct ConnectionRepository {
+    pool: SqlitePool,
+    read_pool: SqlitePool,
+    writer: crate::actor::SqliteWriter,
+}
+
+impl ConnectionRepository {
+    pub fn new(pool: SqlitePool) -> Self {
+        Self::new_with_pools(pool.clone(), pool, crate::actor::SqliteWriter::new(64))
+    }
+
+    pub fn new_with_pools(
+        pool: SqlitePool,
+        read_pool: SqlitePool,
+        writer: crate::actor::SqliteWriter,
+    ) -> Self {
+        Self {
+            pool,
+            read_pool,
+            writer,
+        }
+    }
+
+    /// Insert a new connection. The caller is responsible for name uniqueness
+    /// (CON-002); a duplicate surfaces as a `Conflict` error.
+    pub async fn insert(&self, config: &ConnectionConfig) -> Result<()> {
+        let _write = self.writer.acquire().await?;
+        Insert::into("storage_connections")
+            .column("id", uuid_to_text(&config.id))
+            .column("name", &config.name)
+            .column("endpoint", &config.endpoint)
+            .column("region", config.region.as_token())
+            .column("addressing_style", config.addressing_style.as_str())
+            .column("tls_verify", config.tls_verify)
+            .column(
+                "secret_ref",
+                config.secret_ref.as_ref().map(CredentialRef::as_str),
+            )
+            .column("created_at", unix_secs(config.created_at))
+            .column("updated_at", unix_secs(config.updated_at))
+            .column("last_tested_at", config.last_tested_at.map(unix_secs))
+            .column(
+                "last_test_status",
+                config.last_test_status.map(|s| s.as_str()),
+            )
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// All connections, ordered by name.
+    pub async fn list(&self) -> Result<Vec<ConnectionConfig>> {
+        let rows = sqlx::query(&format!(
+            "SELECT {COLUMNS} FROM storage_connections ORDER BY name ASC"
+        ))
+        .fetch_all(&self.read_pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.into_iter().map(row_to_config).collect()
+    }
+
+    pub async fn get(&self, id: ConnectionId) -> Result<Option<ConnectionConfig>> {
+        let row = sqlx::query(&format!(
+            "SELECT {COLUMNS} FROM storage_connections WHERE id = ?"
+        ))
+        .bind(uuid_to_text(&id))
+        .fetch_optional(&self.read_pool)
+        .await
+        .map_err(map_sqlx)?;
+        row.map(row_to_config).transpose()
+    }
+
+    pub async fn get_by_name(&self, name: &str) -> Result<Option<ConnectionConfig>> {
+        let row = sqlx::query(&format!(
+            "SELECT {COLUMNS} FROM storage_connections WHERE name = ?"
+        ))
+        .bind(name)
+        .fetch_optional(&self.read_pool)
+        .await
+        .map_err(map_sqlx)?;
+        row.map(row_to_config).transpose()
+    }
+
+    /// Update an existing connection's mutable fields.
+    pub async fn update(&self, config: &ConnectionConfig) -> Result<()> {
+        let _write = self.writer.acquire().await?;
+        let affected = Update::table("storage_connections")
+            .set("name", &config.name)
+            .set("endpoint", &config.endpoint)
+            .set("region", config.region.as_token())
+            .set("addressing_style", config.addressing_style.as_str())
+            .set("tls_verify", config.tls_verify)
+            .set(
+                "secret_ref",
+                config.secret_ref.as_ref().map(CredentialRef::as_str),
+            )
+            .set("updated_at", unix_secs(config.updated_at))
+            .set("last_tested_at", config.last_tested_at.map(unix_secs))
+            .set(
+                "last_test_status",
+                config.last_test_status.map(|s| s.as_str()),
+            )
+            .filter("id = ?", [Bind::Text(uuid_to_text(&config.id))])
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        if affected == 0 {
+            return Err(Error::not_found("connection not found"));
+        }
+        Ok(())
+    }
+
+    /// Persist the outcome of a connection test (CON-007/010).
+    pub async fn record_test(
+        &self,
+        id: ConnectionId,
+        status: ConnectionTestStatus,
+        at: time::OffsetDateTime,
+    ) -> Result<()> {
+        let _write = self.writer.acquire().await?;
+        let affected = Update::table("storage_connections")
+            .set("last_tested_at", unix_secs(at))
+            .set("last_test_status", status.as_str())
+            .set("updated_at", unix_secs(at))
+            .filter("id = ?", [Bind::Text(uuid_to_text(&id))])
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        if affected == 0 {
+            return Err(Error::not_found("connection not found"));
+        }
+        Ok(())
+    }
+
+    /// Delete a connection. Returns `false` if it did not exist (CON-013 leaves
+    /// cascade/cleanup policy to the application layer).
+    pub async fn delete(&self, id: ConnectionId) -> Result<bool> {
+        let _write = self.writer.acquire().await?;
+        let affected = sqlx::query("DELETE FROM storage_connections WHERE id = ?")
+            .bind(uuid_to_text(&id))
+            .execute(&self.pool)
+            .await
+            .map_err(map_sqlx)?
+            .rows_affected();
+        Ok(affected > 0)
+    }
+
+    /// Number of stored connections.
+    pub async fn count(&self) -> Result<i64> {
+        Ok(crate::codec::count_scalar(
+            &self.read_pool,
+            "SELECT COUNT(*) AS n FROM storage_connections",
+            Vec::new(),
+        )
+        .await? as i64)
+    }
+}
+
+/// Decode one row. `Region` is an open vocabulary (`parse_token` never fails),
+/// so it needs no failure path; `AddressingStyle` is closed and fails loud.
+fn row_to_config(row: sqlx::sqlite::SqliteRow) -> Result<ConnectionConfig> {
+    let row = RowReader::new(row);
+    Ok(ConnectionConfig {
+        id: ConnectionId::from_uuid(row.uuid("id")?),
+        name: row.text("name")?,
+        endpoint: row.text("endpoint")?,
+        region: Region::parse_token(&row.text("region")?),
+        addressing_style: row.token("addressing_style", AddressingStyle::parse)?,
+        tls_verify: row.bool("tls_verify")?,
+        secret_ref: row
+            .opt_text("secret_ref")?
+            .map(CredentialRef::new)
+            .transpose()?,
+        created_at: row.timestamp("created_at")?,
+        updated_at: row.timestamp("updated_at")?,
+        last_tested_at: row.opt_timestamp("last_tested_at")?,
+        last_test_status: row
+            .opt_text("last_test_status")?
+            .map(|token| {
+                ConnectionTestStatus::parse(&token).ok_or_else(|| {
+                    Error::database(format!("invalid connection test status `{token}`"))
+                })
+            })
+            .transpose()?,
+    })
+}

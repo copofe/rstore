@@ -1,0 +1,41 @@
+[package]
+name = "rstore-application"
+description = "Application services: Command/Query interfaces, authorisation, transaction orchestration. No GPUI."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rstore-domain.workspace = true
+rstore-application-ports.workspace = true
+rstore-persistence = { workspace = true, optional = true }
+rstore-secrets.workspace = true
+rstore-storage-api.workspace = true
+rstore-catalog.workspace = true
+rstore-transfer.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bytes.workspace = true
+time.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+# Optional so the `test-util` fixture can share FakeStorage wiring without
+# pulling test scaffolding into production builds.
+rstore-test-support = { workspace = true, optional = true }
+
+[features]
+default = []
+test-util = ["dep:rstore-test-support", "dep:rstore-persistence"]
+
+[dev-dependencies]
+tokio.workspace = true
+rstore-test-support.workspace = true
+rstore-persistence.workspace = true
+# Self dev-dependency: turns the feature on for this crate's own test builds,
+# so unit and integration tests share one fixture.
+rstore-application = { path = ".", features = ["test-util"] }
+
+[lints]
+workspace = true

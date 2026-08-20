@@ -1,0 +1,23 @@
+[package]
+name = "rstore-transfer"
+description = "Transfer engine: upload/download/copy/move. No GPUI."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rstore-domain.workspace = true
+rstore-storage-api.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+serde.workspace = true
+time.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+rstore-test-support.workspace = true
+
+[lints]
+workspace = true

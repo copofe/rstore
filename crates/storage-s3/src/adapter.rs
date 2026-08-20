@@ -1,0 +1,554 @@
+//! The S3-compatible [`Storage`] implementation (CORE-004 / STORE-008..014).
+//!
+//! `list`, `stat`, `read`, `put`, `delete`, server-side `copy` (STORE-016)
+//! and `presign` (STORE-017) are implemented; `copy` is verified against
+//! MinIO through the shared storage contract.
+
+use async_trait::async_trait;
+use aws_sdk_s3::primitives::ByteStream;
+use aws_smithy_types::DateTime as SdkDateTime;
+use bytes::Bytes;
+use rstore_domain::remote::ObjectPath;
+use rstore_domain::{Error, ErrorCode, Result};
+use rstore_storage_api::model::{
+    BucketSummary, CopyRequest, DeleteOutcome, ListOptions, ListPage, ObjectEntry, ObjectMetadata,
+    PresignMethod, PresignRequest, PresignedUrl, PutOptions, ReadRange, UploadedPart,
+};
+use rstore_storage_api::Storage;
+use time::OffsetDateTime;
+
+use crate::error::map_sdk;
+
+/// An S3-compatible object store backed by the AWS SDK.
+#[derive(Clone)]
+pub struct S3Storage {
+    client: aws_sdk_s3::Client,
+    /// Objects at or below this size copy in one atomic action; larger ones
+    /// copy by parts. Fixed at S3's 5 GiB limit in production; the MinIO
+    /// gate lowers it to exercise the part-copy path on small objects.
+    single_copy_limit: u64,
+}
+
+impl S3Storage {
+    /// Wrap an already-configured SDK client.
+    pub fn new(client: aws_sdk_s3::Client) -> Self {
+        Self {
+            client,
+            single_copy_limit: Self::S3_ATOMIC_COPY_LIMIT,
+        }
+    }
+
+    /// The provider-fixed atomic copy limit, lowered by tests only.
+    pub fn with_single_copy_limit(client: aws_sdk_s3::Client, limit: u64) -> Self {
+        assert!(limit > 0, "copy limit must be positive");
+        Self {
+            client,
+            single_copy_limit: limit,
+        }
+    }
+
+    /// S3's atomic single-action copy limit (5 GiB).
+    const S3_ATOMIC_COPY_LIMIT: u64 = 5 * 1024 * 1024 * 1024;
+}
+
+impl S3Storage {
+    async fn copy_single(
+        &self,
+        req: &CopyRequest,
+        copy_source: &str,
+        source: &ObjectMetadata,
+    ) -> Result<ObjectMetadata> {
+        let out = self
+            .client
+            .copy_object()
+            .bucket(&req.target_bucket)
+            .key(req.target_key.as_str())
+            .copy_source(copy_source)
+            .send()
+            .await
+            .map_err(map_sdk)?;
+        let result = out.copy_object_result();
+        Ok(ObjectMetadata {
+            key: req.target_key.as_str().to_string(),
+            size: source.size,
+            etag: result.and_then(|r| r.e_tag().map(str::to_string)),
+            // A server-side copy preserves the source's content type; the
+            // provider's copy result does not restate it.
+            content_type: source.content_type.clone(),
+            last_modified: match result.and_then(|r| r.last_modified()) {
+                Some(dt) => to_offset(dt)?,
+                // The copy just happened; the provider did not restate when.
+                None => OffsetDateTime::now_utc(),
+            },
+            storage_class: source.storage_class.clone(),
+            version_id: out.version_id().map(str::to_string),
+        })
+    }
+
+    /// Beyond the atomic limit: `UploadPartCopy` per 5 GiB range (each part
+    /// copies provider-side), then complete. A failed part-copy aborts the
+    /// provider upload best-effort — server-side parts are cheap to redo, so
+    /// there is nothing worth resuming.
+    async fn copy_by_parts(
+        &self,
+        req: &CopyRequest,
+        copy_source: &str,
+        source: &ObjectMetadata,
+    ) -> Result<ObjectMetadata> {
+        let upload_id = self
+            .create_multipart(
+                &req.target_bucket,
+                &req.target_key,
+                &PutOptions {
+                    content_type: source.content_type.clone(),
+                    ..PutOptions::default()
+                },
+            )
+            .await?;
+        let result = self
+            .copy_parts_loop(req, copy_source, &upload_id, source.size)
+            .await;
+        let parts = match result {
+            Ok(parts) => parts,
+            Err(error) => {
+                if let Err(abort_error) = self
+                    .abort_multipart(&req.target_bucket, &req.target_key, &upload_id)
+                    .await
+                {
+                    tracing::warn!(error = %abort_error, "could not abort failed copy upload");
+                }
+                return Err(error);
+            }
+        };
+        self.complete_multipart(&req.target_bucket, &req.target_key, &upload_id, &parts)
+            .await
+    }
+
+    async fn copy_parts_loop(
+        &self,
+        req: &CopyRequest,
+        copy_source: &str,
+        upload_id: &str,
+        size: u64,
+    ) -> Result<Vec<UploadedPart>> {
+        let mut parts = Vec::new();
+        let mut offset = 0u64;
+        let mut part_number = 1u32;
+        while offset < size {
+            let end = (offset + self.single_copy_limit).min(size);
+            let out = self
+                .client
+                .upload_part_copy()
+                .bucket(&req.target_bucket)
+                .key(req.target_key.as_str())
+                .upload_id(upload_id)
+                .part_number(part_number as i32)
+                .copy_source(copy_source)
+                .copy_source_range(format!("bytes={}-{}", offset, end - 1))
+                .send()
+                .await
+                .map_err(map_sdk)?;
+            let etag = out
+                .copy_part_result()
+                .and_then(|r| r.e_tag().map(str::to_string))
+                .ok_or_else(|| Error::unknown("provider returned no copy-part etag"))?;
+            parts.push(UploadedPart {
+                part_number,
+                etag,
+                size: end - offset,
+            });
+            offset = end;
+            part_number += 1;
+        }
+        Ok(parts)
+    }
+}
+
+#[async_trait]
+impl Storage for S3Storage {
+    fn name(&self) -> &str {
+        "s3"
+    }
+
+    async fn list_buckets(&self) -> Result<Vec<BucketSummary>> {
+        let out = self.client.list_buckets().send().await.map_err(map_sdk)?;
+        let mut buckets = Vec::new();
+        for b in out.buckets() {
+            let Some(name) = b.name() else { continue };
+            let created_at = match b.creation_date() {
+                Some(dt) => Some(to_offset(dt)?),
+                None => None,
+            };
+            buckets.push(BucketSummary {
+                name: name.to_string(),
+                created_at,
+            });
+        }
+        Ok(buckets)
+    }
+
+    async fn list(&self, bucket: &str, opts: &ListOptions) -> Result<ListPage> {
+        let mut req = self.client.list_objects_v2().bucket(bucket);
+
+        if let Some(prefix) = &opts.prefix {
+            if !prefix.is_empty() {
+                req = req.prefix(prefix);
+            }
+        }
+        // `delimiter: None` means a flat recursive listing (no folding);
+        // callers wanting folder folding pass `Some("/")` explicitly.
+        if let Some(delimiter) = &opts.delimiter {
+            if !delimiter.is_empty() {
+                req = req.delimiter(delimiter);
+            }
+        }
+        if let Some(token) = &opts.continuation_token {
+            req = req.continuation_token(token);
+        }
+        if let Some(max) = opts.max_keys {
+            req = req.max_keys(max as i32);
+        }
+
+        let out = req.send().await.map_err(map_sdk)?;
+
+        let objects = out
+            .contents()
+            .iter()
+            .filter(|o| o.key().is_some())
+            .map(object_entry)
+            .collect::<Result<Vec<_>>>()?;
+
+        let common_prefixes = out
+            .common_prefixes()
+            .iter()
+            .filter_map(|p| p.prefix().map(str::to_string))
+            .collect();
+
+        Ok(ListPage {
+            objects,
+            common_prefixes,
+            continuation_token: out.next_continuation_token().map(str::to_string),
+            is_truncated: out.is_truncated().unwrap_or(false),
+        })
+    }
+
+    async fn stat(&self, bucket: &str, key: &ObjectPath) -> Result<ObjectMetadata> {
+        let out = self
+            .client
+            .head_object()
+            .bucket(bucket)
+            .key(key.as_str())
+            .send()
+            .await
+            .map_err(map_sdk)?;
+
+        Ok(ObjectMetadata {
+            key: key.as_str().to_string(),
+            size: out.content_length().unwrap_or_default() as u64,
+            etag: out.e_tag().map(str::to_string),
+            content_type: out.content_type().map(str::to_string),
+            // A provider that omits LastModified (real S3 never does) reads
+            // as the epoch rather than failing the whole stat.
+            last_modified: out
+                .last_modified()
+                .map(to_offset)
+                .transpose()?
+                .unwrap_or(OffsetDateTime::UNIX_EPOCH),
+            storage_class: out.storage_class.as_ref().map(|s| s.as_str().to_string()),
+            version_id: out.version_id().map(str::to_string),
+        })
+    }
+
+    async fn read(
+        &self,
+        bucket: &str,
+        key: &ObjectPath,
+        range: Option<ReadRange>,
+    ) -> Result<Bytes> {
+        let mut req = self.client.get_object().bucket(bucket).key(key.as_str());
+        if let Some(r) = range {
+            req = req.range(range_header(r));
+        }
+        let out = req.send().await.map_err(map_sdk)?;
+        let bytes = out
+            .body
+            .collect()
+            .await
+            .map_err(|e| {
+                Error::wrap(
+                    ErrorCode::NetworkUnreachable,
+                    "failed reading object body",
+                    e,
+                )
+            })?
+            .into_bytes();
+        Ok(bytes)
+    }
+
+    async fn put(
+        &self,
+        bucket: &str,
+        key: &ObjectPath,
+        body: Bytes,
+        opts: &PutOptions,
+    ) -> Result<ObjectMetadata> {
+        let size = body.len() as u64;
+        let mut req = self
+            .client
+            .put_object()
+            .bucket(bucket)
+            .key(key.as_str())
+            .body(ByteStream::from(body));
+        if let Some(ct) = &opts.content_type {
+            req = req.content_type(ct);
+        }
+        if let Some(cc) = &opts.cache_control {
+            req = req.cache_control(cc);
+        }
+        let out = req.send().await.map_err(map_sdk)?;
+
+        let mut meta = ObjectMetadata::after_put(
+            key.as_str(),
+            size,
+            out.e_tag().map(str::to_string),
+            opts,
+            OffsetDateTime::now_utc(),
+        );
+        meta.version_id = out.version_id().map(str::to_string);
+        Ok(meta)
+    }
+
+    /// Server-side copy (STORE-016): one `CopyObject` action up to S3's
+    /// 5 GiB atomic limit, an `UploadPartCopy` loop beyond it — no object
+    /// bytes transit the local device either way. The target's metadata is
+    /// derived from the caller's source stat plus the provider's copy result
+    /// (which carries the new ETag and modification time but no size).
+    async fn copy(&self, req: &CopyRequest, source: &ObjectMetadata) -> Result<ObjectMetadata> {
+        let copy_source = copy_source_header(&req.source_bucket, req.source_key.as_str());
+        if source.size <= self.single_copy_limit {
+            self.copy_single(req, &copy_source, source).await
+        } else {
+            self.copy_by_parts(req, &copy_source, source).await
+        }
+    }
+
+    async fn delete(&self, bucket: &str, key: &ObjectPath) -> Result<DeleteOutcome> {
+        let out = self
+            .client
+            .delete_object()
+            .bucket(bucket)
+            .key(key.as_str())
+            .send()
+            .await
+            .map_err(map_sdk)?;
+        Ok(DeleteOutcome {
+            deleted: true,
+            version_id: out.version_id().map(str::to_string),
+        })
+    }
+
+    async fn create_multipart(
+        &self,
+        bucket: &str,
+        key: &ObjectPath,
+        opts: &PutOptions,
+    ) -> Result<String> {
+        let mut req = self
+            .client
+            .create_multipart_upload()
+            .bucket(bucket)
+            .key(key.as_str());
+        if let Some(ct) = &opts.content_type {
+            req = req.content_type(ct);
+        }
+        if let Some(cc) = &opts.cache_control {
+            req = req.cache_control(cc);
+        }
+        let out = req.send().await.map_err(map_sdk)?;
+        out.upload_id
+            .ok_or_else(|| Error::unknown("provider returned no upload id"))
+    }
+
+    async fn upload_part(
+        &self,
+        bucket: &str,
+        key: &ObjectPath,
+        upload_id: &str,
+        part_number: u32,
+        body: Bytes,
+    ) -> Result<UploadedPart> {
+        let size = body.len() as u64;
+        let out = self
+            .client
+            .upload_part()
+            .bucket(bucket)
+            .key(key.as_str())
+            .upload_id(upload_id)
+            .part_number(part_number as i32)
+            .body(ByteStream::from(body))
+            .send()
+            .await
+            .map_err(map_sdk)?;
+        let etag = out
+            .e_tag()
+            .map(str::to_string)
+            .ok_or_else(|| Error::unknown("provider returned no part etag"))?;
+        Ok(UploadedPart {
+            part_number,
+            etag,
+            size,
+        })
+    }
+
+    async fn complete_multipart(
+        &self,
+        bucket: &str,
+        key: &ObjectPath,
+        upload_id: &str,
+        parts: &[UploadedPart],
+    ) -> Result<ObjectMetadata> {
+        let completed: Vec<aws_sdk_s3::types::CompletedPart> = parts
+            .iter()
+            .map(|p| {
+                aws_sdk_s3::types::CompletedPart::builder()
+                    .part_number(p.part_number as i32)
+                    .e_tag(&p.etag)
+                    .build()
+            })
+            .collect();
+        let out = self
+            .client
+            .complete_multipart_upload()
+            .bucket(bucket)
+            .key(key.as_str())
+            .upload_id(upload_id)
+            .multipart_upload(
+                aws_sdk_s3::types::CompletedMultipartUpload::builder()
+                    .set_parts(Some(completed))
+                    .build(),
+            )
+            .send()
+            .await
+            .map_err(map_sdk)?;
+        let mut meta = ObjectMetadata::from_parts(
+            key.as_str(),
+            out.e_tag().map(str::to_string),
+            parts,
+            OffsetDateTime::now_utc(),
+        );
+        meta.version_id = out.version_id().map(str::to_string);
+        Ok(meta)
+    }
+
+    async fn abort_multipart(&self, bucket: &str, key: &ObjectPath, upload_id: &str) -> Result<()> {
+        self.client
+            .abort_multipart_upload()
+            .bucket(bucket)
+            .key(key.as_str())
+            .upload_id(upload_id)
+            .send()
+            .await
+            .map_err(map_sdk)?;
+        Ok(())
+    }
+    /// Generate a presigned URL locally (STORE-017 / LINK-005): the request is
+    /// never sent, so no credentials touch the network and the signature
+    /// query stays out of logs (LINK-012).
+    async fn presign(&self, req: &PresignRequest) -> Result<PresignedUrl> {
+        use aws_sdk_s3::presigning::PresigningConfig;
+        let config = PresigningConfig::expires_in(std::time::Duration::from_secs(req.ttl_seconds))
+            .map_err(|e| {
+                Error::new(
+                    ErrorCode::InvalidInput,
+                    format!("invalid presign TTL {}s", req.ttl_seconds),
+                )
+                .with_source(e)
+            })?;
+        let url = match req.method {
+            PresignMethod::Get => self
+                .client
+                .get_object()
+                .bucket(&req.bucket)
+                .key(&req.key)
+                .presigned(config)
+                .await
+                .map_err(map_sdk)?
+                .uri()
+                .to_string(),
+            PresignMethod::Put => self
+                .client
+                .put_object()
+                .bucket(&req.bucket)
+                .key(&req.key)
+                .presigned(config)
+                .await
+                .map_err(map_sdk)?
+                .uri()
+                .to_string(),
+        };
+        Ok(PresignedUrl::expiring(
+            url,
+            req.method,
+            req.ttl_seconds,
+            OffsetDateTime::now_utc(),
+        ))
+    }
+}
+
+fn object_entry(o: &aws_sdk_s3::types::Object) -> Result<ObjectEntry> {
+    Ok(ObjectEntry {
+        metadata: ObjectMetadata {
+            key: o.key().unwrap_or_default().to_string(),
+            size: o.size().unwrap_or_default() as u64,
+            etag: o.e_tag().map(str::to_string),
+            // LIST does not return Content-Type; a stat fills it in.
+            content_type: None,
+            last_modified: o
+                .last_modified()
+                .map(to_offset)
+                .transpose()?
+                .unwrap_or(OffsetDateTime::UNIX_EPOCH),
+            storage_class: o.storage_class.as_ref().map(|s| s.as_str().to_string()),
+            version_id: None,
+        },
+    })
+}
+
+/// Provider timestamps convert loudly: an out-of-range value is corrupt
+/// provider data, not "the epoch" — silently mapping it there would poison
+/// modified-sorting and retention math.
+fn to_offset(dt: &SdkDateTime) -> Result<OffsetDateTime> {
+    let secs = dt.secs();
+    let nanos = dt.subsec_nanos() as i128;
+    OffsetDateTime::from_unix_timestamp_nanos(secs as i128 * 1_000_000_000 + nanos)
+        .map_err(|e| Error::unknown("provider timestamp out of range").with_source(e))
+}
+
+/// The `CopySource` header value: `/{bucket}/{key}` percent-encoded as S3
+/// requires (slashes stay literal — they are the path; everything outside
+/// the unreserved set encodes, including UTF-8 bytes beyond ASCII).
+fn copy_source_header(bucket: &str, key: &str) -> String {
+    fn encode_into(out: &mut String, part: &str) {
+        for byte in part.bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                    out.push(byte as char);
+                }
+                _ => out.push_str(&format!("%{byte:02X}")),
+            }
+        }
+    }
+    let mut value = String::with_capacity(bucket.len() + key.len() + 2);
+    value.push('/');
+    encode_into(&mut value, bucket);
+    value.push('/');
+    encode_into(&mut value, key);
+    value
+}
+
+fn range_header(r: ReadRange) -> String {
+    match r.end {
+        Some(end) => format!("bytes={}-{}", r.start, end.saturating_sub(1)),
+        None => format!("bytes={}-", r.start),
+    }
+}

@@ -1,0 +1,29 @@
+[package]
+name = "rstore-cli"
+description = "CLI library: command tree, JSON envelope, exit codes. No GPUI."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rstore-application.workspace = true
+rstore-domain.workspace = true
+rstore-platform.workspace = true
+rstore-secrets.workspace = true
+rstore-transfer.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+rpassword.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
+tokio.workspace = true
+rstore-test-support.workspace = true
+rstore-persistence.workspace = true
+rstore-application-test-support.workspace = true
+
+[lints]
+workspace = true

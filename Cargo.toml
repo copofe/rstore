@@ -1,0 +1,115 @@
+[workspace]
+resolver = "2"
+members = [
+    "apps/cli",
+    "apps/desktop",
+    "crates/domain",
+    "crates/application-ports",
+    "crates/application",
+    "crates/application-test-support",
+    "crates/bootstrap",
+    "crates/storage-api",
+    "crates/storage-s3",
+    "crates/catalog",
+    "crates/persistence",
+    "crates/transfer",
+    "crates/secrets",
+    "crates/platform",
+    "crates/test-support",
+    "crates/cli",
+    "ui/ui-kit",
+    "ui/desktop-ui",
+    "xtask",
+]
+default-members = ["apps/cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "Apache-2.0"
+repository = "https://example.invalid/rstore"
+
+# Centralised dependency versions so every crate resolves the same release.
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+# CLI
+clap = { version = "4", features = ["derive", "env", "wrap_help"] }
+
+# Serde / JSON
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Errors & logging
+thiserror = "2"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# IDs & time
+uuid = { version = "1", features = ["v4", "serde"] }
+time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
+
+# Storage (S3-compatible)
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1"
+aws-credential-types = "1"
+aws-smithy-types = "1"
+bytes = "1"
+
+# Persistence (SQLite)
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "sqlite",
+    "macros",
+    "migrate",
+    "uuid",
+    "time",
+] }
+
+# Platform
+directories = "5"
+fs4 = "0.13"
+rpassword = "7"
+
+# Test tooling
+insta = { version = "1", features = ["json", "redactions"] }
+tempfile = "3"
+
+# Internal crates (paths)
+rstore-domain = { path = "crates/domain" }
+rstore-application-ports = { path = "crates/application-ports" }
+rstore-bootstrap = { path = "crates/bootstrap" }
+rstore-application-test-support = { path = "crates/application-test-support" }
+rstore-application = { path = "crates/application" }
+rstore-storage-api = { path = "crates/storage-api" }
+rstore-storage-s3 = { path = "crates/storage-s3" }
+rstore-catalog = { path = "crates/catalog" }
+rstore-persistence = { path = "crates/persistence" }
+rstore-transfer = { path = "crates/transfer" }
+rstore-secrets = { path = "crates/secrets" }
+rstore-platform = { path = "crates/platform" }
+rstore-test-support = { path = "crates/test-support" }
+rstore-cli = { path = "crates/cli" }
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+needless_pass_by_value = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+# Do NOT enable `strip` here: profile-wide stripping corrupts proc-macro
+# dylibs (e.g. sqlx-macros) on newer macOS dyld ("mis-aligned LINKEDIT string
+# pool"), breaking `cargo build --release`. Strip the final binary manually
+# if a smaller artifact is needed.
+strip = false

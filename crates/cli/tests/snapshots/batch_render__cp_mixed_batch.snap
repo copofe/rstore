@@ -1,0 +1,8 @@
+---
+source: crates/cli/tests/batch_render.rs
+expression: redacted
+---
+  ok       conn_<id>/media/src.txt → conn_<id>/media/out/src.txt
+  skipped  conn_<id>/media/dup.txt → conn_<id>/media/out/dup.txt
+           target exists: out/dup.txt
+job job_<id> — 1 succeeded, 1 skipped, 0 failed, 0 blocked (succeeded)

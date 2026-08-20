@@ -1,0 +1,23 @@
+[package]
+name = "rstore-test-support"
+description = "Test fixtures: Fake storage adapter, temp DB, test clock. Never shipped in release binaries."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rstore-domain.workspace = true
+rstore-storage-api.workspace = true
+rstore-catalog.workspace = true
+rstore-persistence.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+time.workspace = true
+tempfile.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true
