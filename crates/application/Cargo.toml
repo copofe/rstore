@@ -10,7 +10,6 @@ license.workspace = true
 rstore-domain.workspace = true
 rstore-application-ports.workspace = true
 rstore-persistence = { workspace = true, optional = true }
-rstore-secrets.workspace = true
 rstore-storage-api.workspace = true
 rstore-catalog.workspace = true
 rstore-transfer.workspace = true

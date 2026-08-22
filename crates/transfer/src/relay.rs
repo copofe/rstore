@@ -1,7 +1,7 @@
 //! Constant-memory object relay across storage adapters (MOVE-006).
 //!
-//! The provider multipart lifetime runs through
-//! [`MultipartSession`](crate::multipart::MultipartSession): once an upload
+//! The provider multipart lifetime runs through the storage seam's
+//! [`MultipartSession`](rstore_storage_api::MultipartSession): once an upload
 //! is created, every read, upload, completion, or cancellation error takes
 //! the same best-effort `abandon` path before the original error returns —
 //! the relay has no checkpoint to resume from.
@@ -12,9 +12,8 @@
 
 use rstore_domain::remote::ObjectPath;
 use rstore_domain::Result;
-use rstore_storage_api::{ObjectMetadata, PutOptions, Storage, UploadedPart};
+use rstore_storage_api::{MultipartSession, ObjectMetadata, PutOptions, Storage, UploadedPart};
 
-use crate::multipart::MultipartSession;
 use crate::progress::{Progress, ProgressSink};
 use crate::pump::{pump, ChunkPlan, ChunkSink, RangedSource};
 use crate::{CancellationToken, TransferConfig};
@@ -76,9 +75,10 @@ pub async fn relay(
         return Ok(metadata);
     }
 
-    let session =
-        MultipartSession::create(target, request.target_bucket, request.target_key, &opts).await?;
-    let result = relay_parts(source, &session, request, cancel, config, progress).await;
+    let session = target
+        .create_multipart(request.target_bucket, request.target_key, &opts)
+        .await?;
+    let result = relay_parts(source, session.as_ref(), request, cancel, config, progress).await;
     if result.is_err() {
         // No checkpoint exists to resume from — clean up the provider
         // upload, warn-only; the original error stays the answer.
@@ -90,13 +90,13 @@ pub async fn relay(
 /// One cross-adapter part pump: read a chunk from the source, upload it as
 /// the next part. The relay-specific residue is exactly this sink — the walk,
 /// cancellation and progress are the shared [`pump`].
-struct PartUploader<'a, 's> {
-    session: &'s MultipartSession<'a>,
+struct PartUploader<'s> {
+    session: &'s dyn MultipartSession,
     parts: Vec<UploadedPart>,
 }
 
 #[async_trait::async_trait]
-impl ChunkSink for PartUploader<'_, '_> {
+impl ChunkSink for PartUploader<'_> {
     async fn accept(&mut self, index: usize, body: bytes::Bytes) -> Result<()> {
         let part = self.session.upload_part(index as u32 + 1, body).await?;
         self.parts.push(part);
@@ -106,7 +106,7 @@ impl ChunkSink for PartUploader<'_, '_> {
 
 async fn relay_parts(
     source: &dyn Storage,
-    session: &MultipartSession<'_>,
+    session: &dyn MultipartSession,
     request: &RelayRequest<'_>,
     cancel: &CancellationToken,
     config: &TransferConfig,
@@ -138,9 +138,16 @@ mod tests {
     use super::*;
     use rstore_domain::remote::ObjectPath;
 
+    /// Real S3 minimum so multipart completions satisfy the legality rules
+    /// the fake now enforces.
+    const PART: u64 = 5 * 1024 * 1024;
+
     async fn source_fixture() -> (Arc<FakeStorage>, ObjectMetadata) {
         let source = Arc::new(FakeStorage::new());
-        source.seed("source", "large.bin", b"abcdefghij", None);
+        let payload: Vec<u8> = (0..(PART * 2 + 1024) as usize)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        source.seed("source", "large.bin", &payload, None);
         let metadata = source
             .stat("source", &ObjectPath::new("large.bin").unwrap())
             .await
@@ -156,16 +163,7 @@ mod tests {
         RelayRequest::new("source", source, "target", target, metadata)
     }
 
-    /// A tiny config so the multipart path runs on bytes, not 8 MiB.
-    fn tiny_config() -> TransferConfig {
-        TransferConfig {
-            multipart_threshold: 4,
-            part_size: 4,
-            download_chunk: 4,
-        }
-    }
-
-    async fn relay_tiny(
+    async fn relay_part(
         source: &dyn Storage,
         target: &dyn Storage,
         request: &RelayRequest<'_>,
@@ -176,19 +174,29 @@ mod tests {
             target,
             request,
             cancel,
-            &tiny_config(),
+            &part_config(),
             &crate::NullProgressSink,
         )
         .await
     }
 
-    /// The chunk boundary table: every size around a small part size relays
+    /// A part-sized config so the multipart completion path satisfies the
+    /// S3 legality rules the fake enforces (non-final parts >= 5 MiB).
+    fn part_config() -> TransferConfig {
+        TransferConfig {
+            multipart_threshold: PART,
+            part_size: PART,
+            download_chunk: PART,
+        }
+    }
+
+    /// The chunk boundary table: every size around a part boundary relays
     /// byte-exact (k·part, k·part±1, under one part).
     #[tokio::test]
     async fn part_boundaries_relay_byte_exact() {
-        for size in [1u8, 3, 4, 5, 7, 8, 9, 12] {
+        for size in [PART - 1, PART, PART + 1, 2 * PART, 2 * PART + 1] {
             let source = Arc::new(FakeStorage::new());
-            let payload: Vec<u8> = (0..size).collect();
+            let payload: Vec<u8> = (0..size as usize).map(|i| (i % 251) as u8).collect();
             source.seed("source", "obj.bin", &payload, None);
             let metadata = source
                 .stat("source", &ObjectPath::new("obj.bin").unwrap())
@@ -196,7 +204,7 @@ mod tests {
                 .unwrap();
             let target = Arc::new(FakeStorage::new());
 
-            relay_tiny(
+            relay(
                 source.as_ref(),
                 target.as_ref(),
                 &RelayRequest::new(
@@ -207,6 +215,8 @@ mod tests {
                     &metadata,
                 ),
                 &CancellationToken::new(),
+                &part_config(),
+                &crate::NullProgressSink,
             )
             .await
             .unwrap_or_else(|e| panic!("size {size}: {e}"));
@@ -229,7 +239,6 @@ mod tests {
             }
         }
     }
-
     /// A relayed multipart copy reports byte progress per part like any
     /// transfer — the cross-connection path is no longer a silent one.
     #[tokio::test]
@@ -247,14 +256,18 @@ mod tests {
                 &metadata,
             ),
             &CancellationToken::new(),
-            &tiny_config(),
+            &part_config(),
             &sink,
         )
         .await
         .unwrap();
 
         let reports = sink.0.lock().unwrap().clone();
-        assert_eq!(reports, vec![(4, 10), (8, 10), (10, 10)]);
+        let total = PART * 2 + 1024;
+        assert_eq!(
+            reports,
+            vec![(PART, total), (2 * PART, total), (total, total)]
+        );
     }
 
     #[tokio::test]
@@ -266,7 +279,7 @@ mod tests {
         );
         let target = Arc::new(FakeStorage::new());
 
-        let error = relay_tiny(
+        let error = relay_part(
             source.as_ref(),
             target.as_ref(),
             &request(
@@ -292,7 +305,7 @@ mod tests {
             Error::network("injected relay part failure"),
         );
 
-        let error = relay_tiny(
+        let error = relay_part(
             source.as_ref(),
             target.as_ref(),
             &request(
@@ -318,7 +331,7 @@ mod tests {
             Error::network("injected relay completion failure"),
         );
 
-        let error = relay_tiny(
+        let error = relay_part(
             source.as_ref(),
             target.as_ref(),
             &request(
@@ -345,7 +358,7 @@ mod tests {
         });
         let target = Arc::new(FakeStorage::new());
 
-        let error = relay_tiny(
+        let error = relay_part(
             source.as_ref(),
             target.as_ref(),
             &request(

@@ -3,25 +3,17 @@
 //! Split from connection *diagnostics*
 //! ([`crate::diagnostics`]) so each side is a deep module: diagnostics owns
 //! probing a connection; health owns the whole-catalog snapshot behind
-//! `doctor`. The narrow [`HealthDb`] port keeps the service's interface as
-//! wide as its questions; platform paths (`db_path`, the config dir holding
-//! `secrets.json`) are passed in by the caller — the service does not own
-//! them.
+//! doctor. The narrow HealthDb port keeps the service's interface as wide as
+//! its questions; the database path is passed in by the caller — the service
+//! does not own it.
 
 use std::path::Path;
 use std::sync::Arc;
 
-use rstore_application_ports::{ConnectionStore, RuntimeStats, SecretSourceStats};
+use rstore_application_ports::{ConnectionStore, RuntimeStats};
 use rstore_domain::job::JobState;
 use rstore_domain::JobRepository;
 use serde::Serialize;
-
-/// Live credential-source counts (DATA-014: counts only — never values).
-#[derive(Debug, Clone, Copy, Serialize)]
-pub struct CredentialSourceCounts {
-    pub env_refs: usize,
-    pub file_refs: usize,
-}
 
 /// The full health payload behind `doctor` (OBS-004). The CLI renders it and
 /// nothing else — it never assembles health fields itself.
@@ -33,7 +25,6 @@ pub struct HealthReport {
     pub untested_connections: usize,
     pub db_path: String,
     pub storage_adapter: &'static str,
-    pub credentials: CredentialSourceCounts,
     pub tls_default: &'static str,
     pub telemetry: &'static str,
     pub interrupted_jobs: u64,
@@ -41,14 +32,12 @@ pub struct HealthReport {
     pub pending_repairs: u64,
 }
 
-/// Collects the `doctor` health report. Platform paths (`db_path`, the
-/// config dir holding `secrets.json`) are passed in by the caller — the
-/// service does not own them.
+/// Collects the doctor health report. The database path is passed in by the
+/// caller; the service does not own the path.
 pub struct HealthService {
     stats: Arc<dyn RuntimeStats>,
     connections: Arc<dyn ConnectionStore>,
     jobs: Arc<dyn JobRepository>,
-    secret_sources: Arc<dyn SecretSourceStats>,
 }
 
 impl HealthService {
@@ -56,13 +45,11 @@ impl HealthService {
         stats: Arc<dyn RuntimeStats>,
         connections: Arc<dyn ConnectionStore>,
         jobs: Arc<dyn JobRepository>,
-        secret_sources: Arc<dyn SecretSourceStats>,
     ) -> Self {
         Self {
             stats,
             connections,
             jobs,
-            secret_sources,
         }
     }
 
@@ -87,11 +74,6 @@ impl HealthService {
             .filter(|j| j.state == JobState::Interrupted)
             .count() as u64;
 
-        // DATA-014: report which credential sources are live — never values.
-        // The source inventory is injected by Bootstrap so this service does
-        // not choose or construct a concrete secret backend.
-        let source_counts = self.secret_sources.counts().await.unwrap_or_default();
-
         HealthReport {
             connection_count: connections.len(),
             untested_connections: connections
@@ -100,10 +82,6 @@ impl HealthService {
                 .count(),
             db_path: db_path.display().to_string(),
             storage_adapter,
-            credentials: CredentialSourceCounts {
-                env_refs: source_counts.env_refs,
-                file_refs: source_counts.file_refs,
-            },
             tls_default: "on (SEC-003)",
             telemetry: "disabled (SEC-009)",
             interrupted_jobs,
@@ -122,12 +100,7 @@ mod tests {
     async fn health_reports_counts_and_schema_match() {
         let db = Database::open_in_memory().await.unwrap();
         let jobs: Arc<dyn JobRepository> = Arc::new(db.jobs());
-        let service = HealthService::new(
-            Arc::new(db.clone()),
-            Arc::new(db.connections()),
-            jobs,
-            Arc::new(rstore_application_ports::EmptySecretSourceStats),
-        );
+        let service = HealthService::new(Arc::new(db.clone()), Arc::new(db.connections()), jobs);
         let report = service
             .health(Path::new("/tmp/catalog.db"), Some("fake"))
             .await;
@@ -137,8 +110,5 @@ mod tests {
         assert_eq!(report.interrupted_jobs, 0);
         assert_eq!(report.storage_adapter, "fake");
         assert_eq!(report.db_path, "/tmp/catalog.db");
-        // No secrets.json at that config dir: zero file refs. (env refs are
-        // whatever the host environment happens to carry — not asserted.)
-        assert_eq!(report.credentials.file_refs, 0);
     }
 }

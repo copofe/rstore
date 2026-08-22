@@ -264,21 +264,42 @@ pub async fn storage_contract(storage: &dyn Storage, bucket: &str) {
         .create_multipart(bucket, &multipart, &PutOptions::default())
         .await
         .expect("contract create second multipart");
-    storage
-        .upload_part(bucket, &multipart, &first, 1, Bytes::from_static(b"old"))
+    first
+        .upload_part(1, Bytes::from_static(b"old"))
         .await
         .expect("contract first upload part");
-    let live_part = storage
-        .upload_part(bucket, &multipart, &second, 1, Bytes::from_static(b"new"))
+    let live_part = second
+        .upload_part(1, Bytes::from_static(b"new"))
         .await
         .expect("contract second upload part");
-    storage
-        .abort_multipart(bucket, &multipart, &first)
-        .await
-        .expect("contract abort first multipart");
+    first.abort().await.expect("contract abort first multipart");
+    // The session port's part-copy capability: adapters either implement it
+    // (S3/MinIO `UploadPartCopy`, source must already exist) or keep the
+    // default and say so loudly. Both are contract-legal; anything else is
+    // not. The staged copy part is not referenced by the completion list —
+    // providers assemble only the listed parts.
+    let copy_capability = second
+        .copy_part(
+            2,
+            bucket,
+            &object,
+            rstore_storage_api::model::ReadRange {
+                start: 0,
+                end: Some(1),
+            },
+        )
+        .await;
+    match copy_capability {
+        Ok(part) => assert_eq!(part.size, 1, "copy_part must carry the range size"),
+        Err(error) => assert_eq!(
+            error.code,
+            rstore_domain::ErrorCode::CapabilityUnsupported,
+            "copy_part is either implemented or explicitly unsupported"
+        ),
+    }
     let complete_before = time::OffsetDateTime::now_utc();
-    let complete = storage
-        .complete_multipart(bucket, &multipart, &second, &[live_part])
+    let complete = second
+        .complete(&[live_part])
         .await
         .expect("contract complete second multipart");
     let complete_after = time::OffsetDateTime::now_utc();

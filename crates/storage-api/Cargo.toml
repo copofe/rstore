@@ -8,13 +8,13 @@ license.workspace = true
 
 [dependencies]
 rstore-domain.workspace = true
-rstore-secrets.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 time.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 
 [lints]
 workspace = true

@@ -203,8 +203,13 @@ fn push_filters(
     workspace: &WorkspaceId,
     filter: &FileFilter,
 ) -> Result<()> {
+    // Closed enums bind like every other value — interpolation is reserved
+    // for structural SQL (column expressions, placeholder lists).
     match filter.state {
-        Some(state) => sql.push_str(&format!(" AND ro.state = '{}' ", state.as_str())),
+        Some(state) => {
+            sql.push_str(" AND ro.state = ? ");
+            params.push(Bind::Text(state.as_str().to_owned()));
+        }
         None => sql.push_str(" AND ro.state != 'deleted' "),
     }
     if let Some(name) = &filter.name_contains {
@@ -276,7 +281,8 @@ fn push_filters(
         params.push(Bind::Integer(before.unix_timestamp()));
     }
     if let Some(kind) = filter.file_type {
-        sql.push_str(&format!(" AND ro.file_type = '{}' ", kind.as_str()));
+        sql.push_str(" AND ro.file_type = ? ");
+        params.push(Bind::Text(kind.as_str().to_owned()));
     }
     if filter.untagged {
         sql.push_str(

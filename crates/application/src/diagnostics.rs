@@ -1,10 +1,10 @@
 //! Connection diagnostics (CON-007..009 / STORE-022).
 //!
-//! Split from connection *lifecycle* ([`crate::connection`]) so each side is a
-//! deep module: lifecycle owns CRUD and credential storage; diagnostics owns
-//! probing (test report, write probe) and the cached capability report. The
-//! diagnostics service's dependencies — gateway, settings, secrets — are
-//! required, not optional: a build without an adapter cannot diagnose.
+//! Split from connection lifecycle so each side is a deep module: lifecycle
+//! owns CRUD and credential storage; diagnostics owns probing (test report,
+//! write probe) and the cached capability report. The diagnostics service's
+//! dependencies — gateway and settings — are required, not optional: a build
+//! without an adapter cannot diagnose.
 
 use std::sync::Arc;
 
@@ -12,7 +12,6 @@ use bytes::Bytes;
 use rstore_application_ports::{ConnectionStore, SettingsStore};
 use rstore_domain::connection::ConnectionTestStatus;
 use rstore_domain::{Clock, ErrorCode, Result, TypedId};
-use rstore_secrets::SecretStore;
 use rstore_storage_api::capability::Capability;
 use rstore_storage_api::model::PutOptions;
 use serde::Serialize;
@@ -63,7 +62,6 @@ pub struct CapabilityReport {
 /// Probes connections and caches the outcomes.
 pub struct ConnectionDiagnostics {
     repo: Arc<dyn ConnectionStore>,
-    secrets: Arc<dyn SecretStore>,
     gateway: RemoteGateway,
     settings: Arc<dyn SettingsStore>,
     clock: Arc<dyn Clock>,
@@ -72,23 +70,18 @@ pub struct ConnectionDiagnostics {
 impl ConnectionDiagnostics {
     pub fn new(
         repo: Arc<dyn ConnectionStore>,
-        secrets: Arc<dyn SecretStore>,
         gateway: RemoteGateway,
         settings: Arc<dyn SettingsStore>,
         clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
             repo,
-            secrets,
             gateway,
             settings,
             clock,
         }
     }
 
-    /// Whether the credential chain can currently resolve `secret_ref` —
-    /// the `connection add` warning heuristic. Only a hint: env vars may
-    /// appear later, so an unresolvable ref is a warning, never an error.
     /// Write a raw capability-cache payload (test seam for cache-format
     /// migration).
     #[cfg(test)]
@@ -103,13 +96,6 @@ impl ConnectionDiagnostics {
             .unwrap();
     }
 
-    pub async fn secret_ref_resolvable(&self, secret_ref: &str) -> bool {
-        rstore_secrets::get_credentials(self.secrets.as_ref(), secret_ref)
-            .await
-            .unwrap_or(None)
-            .is_some()
-    }
-
     /// Probe the connection and persist the outcome (CON-007/008).
     pub async fn test(
         &self,
@@ -120,29 +106,15 @@ impl ConnectionDiagnostics {
         let now = self.clock.now();
         let mut checks = Vec::new();
 
-        // 1. Credentials present in the store chain.
-        let creds_ok = match &config.secret_ref {
-            Some(secret_ref) => {
-                rstore_secrets::get_credentials(self.secrets.as_ref(), secret_ref.as_str())
-                    .await?
-                    .is_some()
-            }
-            None => false,
-        };
+        // 1. Credentials present on the connection.
+        let creds_ok = config.access_key.is_some() && config.secret_key.is_some();
         checks.push(CheckResult {
             name: "credentials".into(),
             passed: creds_ok,
             detail: if creds_ok {
-                format!(
-                    "stored under `{}`",
-                    config
-                        .secret_ref
-                        .as_ref()
-                        .map(ToString::to_string)
-                        .unwrap_or_default()
-                )
+                "stored on connection".into()
             } else {
-                "no credentials resolved (env / config file)".into()
+                "no credentials stored on connection".into()
             },
         });
 
@@ -412,24 +384,16 @@ async fn probe(
     }
 }
 
-/// Create-and-abort one multipart upload: the provider accepting the create
-/// is the capability; the abort is best-effort cleanup.
+/// Create-and-abandon one multipart upload: the provider accepting the create
+/// is the capability; teardown rides the session's own warn-only abandon.
 async fn probe_multipart(storage: &dyn rstore_storage_api::Storage, bucket: &str) -> Capability {
     let key = probe_key("multipart");
     match storage
         .create_multipart(bucket, &key, &PutOptions::default())
         .await
     {
-        Ok(upload_id) => {
-            if let Err(error) = storage.abort_multipart(bucket, &key, &upload_id).await {
-                tracing::warn!(
-                    error = %error,
-                    bucket,
-                    key = key.as_str(),
-                    upload_id,
-                    "capability probe could not clean up multipart upload"
-                );
-            }
+        Ok(session) => {
+            session.abandon().await;
             Capability::Supported
         }
         Err(e) => classify(e.code),
@@ -513,26 +477,20 @@ mod tests {
     use crate::connection::{AddConnectionInput, ConnectionService as _, DefaultConnectionService};
     use rstore_domain::SystemClock;
     use rstore_persistence::Database;
-    use rstore_secrets::{put_credentials, InMemorySecretStore};
     use rstore_test_support::FakeStorageFactory;
 
     async fn setup() -> (ConnectionDiagnostics, DefaultConnectionService) {
         let db = Database::open_in_memory().await.unwrap();
-        let secrets = Arc::new(InMemorySecretStore::new());
-        put_credentials(secrets.as_ref(), "conn_nas", "AK", "SK")
-            .await
-            .unwrap();
         let factory = Arc::new(FakeStorageFactory::new());
         factory.storage().seed_bucket("media");
         let clock = Arc::new(SystemClock);
         let diag = ConnectionDiagnostics::new(
             Arc::new(db.connections()),
-            secrets.clone(),
-            RemoteGateway::new(Arc::new(db.connections()), secrets.clone(), Some(factory)),
+            RemoteGateway::new(Arc::new(db.connections()), Some(factory)),
             Arc::new(db.settings()),
             clock.clone(),
         );
-        let lifecycle = DefaultConnectionService::new(Arc::new(db.connections()), clock, secrets);
+        let lifecycle = DefaultConnectionService::new(Arc::new(db.connections()), clock);
         (diag, lifecycle)
     }
 
@@ -543,11 +501,17 @@ mod tests {
             .add(AddConnectionInput {
                 name: "nas".into(),
                 endpoint: "http://localhost:9000".into(),
+                public_base_url: None,
+                cdn_base_url: None,
                 region: rstore_domain::Region::Auto,
                 addressing_style: rstore_domain::AddressingStyle::Path,
                 tls_verify: true,
-                secret_ref: Some("conn_nas".into()),
-                credentials: None,
+                credentials: Some(rstore_domain::Secret::new(
+                    crate::connection::CredentialInput {
+                        access_key: "AK".into(),
+                        secret_key: "SK".into(),
+                    },
+                )),
             })
             .await
             .unwrap();
@@ -585,11 +549,17 @@ mod tests {
             .add(AddConnectionInput {
                 name: "nas".into(),
                 endpoint: "http://localhost:9000".into(),
+                public_base_url: None,
+                cdn_base_url: None,
                 region: rstore_domain::Region::Auto,
                 addressing_style: rstore_domain::AddressingStyle::Path,
                 tls_verify: true,
-                secret_ref: Some("conn_nas".into()),
-                credentials: None,
+                credentials: Some(rstore_domain::Secret::new(
+                    crate::connection::CredentialInput {
+                        access_key: "AK".into(),
+                        secret_key: "SK".into(),
+                    },
+                )),
             })
             .await
             .unwrap();
@@ -620,11 +590,17 @@ mod tests {
             .add(AddConnectionInput {
                 name: "nas".into(),
                 endpoint: "http://localhost:9000".into(),
+                public_base_url: None,
+                cdn_base_url: None,
                 region: rstore_domain::Region::Auto,
                 addressing_style: rstore_domain::AddressingStyle::Path,
                 tls_verify: true,
-                secret_ref: Some("conn_nas".into()),
-                credentials: None,
+                credentials: Some(rstore_domain::Secret::new(
+                    crate::connection::CredentialInput {
+                        access_key: "AK".into(),
+                        secret_key: "SK".into(),
+                    },
+                )),
             })
             .await
             .unwrap();

@@ -1,39 +1,32 @@
 //! Key/value app settings (`app_settings` table) — capability cache (STORE-022)
 //! and other machine-local state.
 
+use async_trait::async_trait;
+use rstore_application_ports::SettingsStore;
 use rstore_domain::{Clock, Error, Result, SystemClock};
 use sqlx::sqlite::SqlitePool;
 
 use crate::codec::{unix_secs, Insert, RowReader};
 use crate::error::map_sqlx;
+use crate::tx::WriteGate;
 
 /// Access to the `app_settings` table.
 #[derive(Clone)]
 pub struct SettingsRepository {
-    pool: SqlitePool,
+    gate: WriteGate,
     read_pool: SqlitePool,
-    writer: crate::actor::SqliteWriter,
 }
 
 impl SettingsRepository {
-    pub fn new(pool: SqlitePool) -> Self {
-        Self::new_with_pools(pool.clone(), pool, crate::actor::SqliteWriter::new(64))
+    pub(crate) fn new(gate: WriteGate, read_pool: SqlitePool) -> Self {
+        Self { gate, read_pool }
     }
+}
 
-    pub fn new_with_pools(
-        pool: SqlitePool,
-        read_pool: SqlitePool,
-        writer: crate::actor::SqliteWriter,
-    ) -> Self {
-        Self {
-            pool,
-            read_pool,
-            writer,
-        }
-    }
-
+#[async_trait]
+impl SettingsStore for SettingsRepository {
     /// Read a setting's raw JSON/text value.
-    pub async fn get(&self, key: &str) -> Result<Option<String>> {
+    async fn get(&self, key: &str) -> Result<Option<String>> {
         let row = sqlx::query("SELECT value FROM app_settings WHERE key = ?")
             .bind(key)
             .fetch_optional(&self.read_pool)
@@ -43,8 +36,8 @@ impl SettingsRepository {
     }
 
     /// Upsert a setting, stamping `updated_at`.
-    pub async fn set(&self, key: &str, value: &str) -> Result<()> {
-        let _write = self.writer.acquire().await?;
+    async fn set(&self, key: &str, value: &str) -> Result<()> {
+        let _write = self.gate.permit().await?;
         Insert::into("app_settings")
             .column("key", key)
             .column("value", value)
@@ -53,16 +46,16 @@ impl SettingsRepository {
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value, \
                                            updated_at = excluded.updated_at",
             )
-            .execute(&self.pool)
+            .execute(self.gate.pool())
             .await?;
         Ok(())
     }
 
-    pub async fn delete(&self, key: &str) -> Result<bool> {
-        let _write = self.writer.acquire().await?;
+    async fn delete(&self, key: &str) -> Result<bool> {
+        let _write = self.gate.permit().await?;
         let affected = sqlx::query("DELETE FROM app_settings WHERE key = ?")
             .bind(key)
-            .execute(&self.pool)
+            .execute(self.gate.pool())
             .await
             .map_err(map_sqlx)?
             .rows_affected();
@@ -70,7 +63,7 @@ impl SettingsRepository {
     }
 
     /// Parsed JSON read helper.
-    pub async fn get_json(&self, key: &str) -> Result<Option<serde_json::Value>> {
+    async fn get_json(&self, key: &str) -> Result<Option<serde_json::Value>> {
         // `serde_json` is re-exported through rstore-domain's dependency tree;
         // sqlx needs no json feature for a TEXT column we parse ourselves.
         match self.get(key).await? {
@@ -81,7 +74,7 @@ impl SettingsRepository {
         }
     }
 
-    pub async fn set_json(&self, key: &str, value: &serde_json::Value) -> Result<()> {
+    async fn set_json(&self, key: &str, value: &serde_json::Value) -> Result<()> {
         let raw = serde_json::to_string(value)
             .map_err(|e| Error::database("serialise setting").with_source(e))?;
         self.set(key, &raw).await

@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 rstore-domain.workspace = true
 rstore-catalog.workspace = true
+rstore-storage-api.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -273,6 +273,7 @@ pub(super) async fn copy_move(
         conflict,
         recursive: args.recursive,
         keep_tags: args.keep_tags,
+        config: rstore_transfer::TransferConfig::default(),
     };
     let pairs: Vec<rstore_application::CopyPair> = sources
         .iter()

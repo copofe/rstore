@@ -37,7 +37,6 @@ use std::sync::Arc;
 use actor::SqliteWriter;
 
 pub use error::map_sqlx;
-pub use tx::atomically;
 
 const BASELINE_MIGRATION_VERSION: i64 = 20260819000001;
 
@@ -220,6 +219,15 @@ impl Database {
         &self.pool
     }
 
+    /// The write path every repository shares: the write pool paired with the
+    /// bounded writer actor. Acquiring the permit and opening a transaction
+    /// are one operation on the gate ([`tx::WriteGate::write_unit`]) — this is
+    /// the only way repositories reach the write pool for multi-statement
+    /// units.
+    fn gate(&self) -> crate::tx::WriteGate {
+        crate::tx::WriteGate::new(self.pool.clone(), self.writer.clone())
+    }
+
     /// Read-side pool reserved for catalog and diagnostics queries. In-memory
     /// databases share the write pool because a separate SQLite memory pool
     /// would be a different database.
@@ -229,119 +237,66 @@ impl Database {
 
     /// A repository for storage connections.
     pub fn connections(&self) -> ConnectionRepository {
-        ConnectionRepository::new_with_pools(
-            self.pool.clone(),
-            self.read_pool.clone(),
-            self.writer.clone(),
-        )
+        ConnectionRepository::new(self.gate(), self.read_pool.clone())
     }
 
     /// A repository for registered buckets.
     pub fn buckets(&self) -> BucketRepository {
-        BucketRepository::new_with_pools(
-            self.pool.clone(),
-            self.read_pool.clone(),
-            self.writer.clone(),
-        )
+        BucketRepository::new(self.gate(), self.read_pool.clone())
     }
 
     /// A repository for app settings (capability cache, machine-local state).
     pub fn settings(&self) -> SettingsRepository {
-        SettingsRepository::new_with_pools(
-            self.pool.clone(),
-            self.read_pool.clone(),
-            self.writer.clone(),
-        )
+        SettingsRepository::new(self.gate(), self.read_pool.clone())
     }
 
     /// The remote-object catalog repository.
     pub fn remote_objects(&self) -> SqliteRemoteObjectRepository {
-        SqliteRemoteObjectRepository::new_with_pools(
-            self.pool.clone(),
-            self.read_pool.clone(),
-            self.writer.clone(),
-        )
+        SqliteRemoteObjectRepository::new(self.gate(), self.read_pool.clone())
     }
 
     /// The job/transfer-task repository.
     pub fn jobs(&self) -> SqliteJobRepository {
-        SqliteJobRepository::new_with_pools(
-            self.pool.clone(),
-            self.read_pool.clone(),
-            self.writer.clone(),
-        )
+        SqliteJobRepository::new(self.gate(), self.read_pool.clone())
     }
 
     /// The multipart checkpoint store (resumable uploads).
     pub fn multipart(&self, clock: Arc<dyn Clock>) -> SqliteMultipartStore {
-        SqliteMultipartStore::new_with_pools(
-            self.pool.clone(),
-            self.read_pool.clone(),
-            self.writer.clone(),
-            clock,
-        )
+        SqliteMultipartStore::new(self.gate(), self.read_pool.clone(), clock)
     }
 
     /// Domain-event outbox and repair queue.
     pub fn outbox(&self) -> OutboxRepository {
-        OutboxRepository::new_with_pools(
-            self.pool.clone(),
-            self.read_pool.clone(),
-            self.writer.clone(),
-        )
+        OutboxRepository::new(self.gate(), self.read_pool.clone())
     }
 
     pub fn mutation_receipts(&self) -> SqliteRemoteMutationRepository {
-        SqliteRemoteMutationRepository::new_with_pools(
-            self.pool.clone(),
-            self.read_pool.clone(),
-            self.writer.clone(),
-        )
+        SqliteRemoteMutationRepository::new(self.read_pool.clone())
     }
 
     /// Workspaces and their bucket memberships (WSP-).
     pub fn workspaces(&self) -> WorkspaceRepository {
-        WorkspaceRepository::new_with_pools(
-            self.pool.clone(),
-            self.read_pool.clone(),
-            self.writer.clone(),
-        )
+        WorkspaceRepository::new(self.gate(), self.read_pool.clone())
     }
 
     /// Bucket ignore rules (IGN-).
     pub fn ignore_rules(&self) -> IgnoreRuleRepository {
-        IgnoreRuleRepository::new_with_pools(
-            self.pool.clone(),
-            self.read_pool.clone(),
-            self.writer.clone(),
-        )
+        IgnoreRuleRepository::new(self.gate(), self.read_pool.clone())
     }
 
     /// Tag definitions and associations (TAG-).
     pub fn tags(&self) -> TagRepository {
-        TagRepository::new_with_pools(
-            self.pool.clone(),
-            self.read_pool.clone(),
-            self.writer.clone(),
-        )
+        TagRepository::new(self.gate(), self.read_pool.clone())
     }
 
     /// Index runs, checkpoints and revisions (IDX-).
     pub fn index_runs(&self) -> IndexRunRepository {
-        IndexRunRepository::new_with_pools(
-            self.pool.clone(),
-            self.read_pool.clone(),
-            self.writer.clone(),
-        )
+        IndexRunRepository::new(self.gate(), self.read_pool.clone())
     }
 
     /// Per-bucket link settings (LINK-).
     pub fn links(&self) -> repo::link::LinkRepository {
-        repo::link::LinkRepository::new_with_pools(
-            self.pool.clone(),
-            self.read_pool.clone(),
-            self.writer.clone(),
-        )
+        repo::link::LinkRepository::new(self.gate(), self.read_pool.clone())
     }
 
     /// Row counts for `index stats` (IDX-021). Plain COUNT(*)s over the
@@ -415,4 +370,48 @@ fn read_options(db_path: &Path) -> SqliteConnectOptions {
 
 fn migration_error(e: sqlx::migrate::MigrateError) -> Error {
     Error::database("run migrations").with_source(e)
+}
+
+/// The single assembly point (CONTEXT.md: 组装点): turn an opened database,
+/// an optional storage factory and a clock into the application dependency
+/// graph. `bootstrap::Runtime::open` and the application test fixture both
+/// call this; neither re-transcribes the dependency list.
+pub fn assemble(
+    db: &Database,
+    storage_factory: Option<Arc<dyn rstore_storage_api::StorageFactory>>,
+    clock: Arc<dyn Clock>,
+) -> rstore_application_ports::ApplicationDependencies {
+    use rstore_application_ports::{
+        CatalogDependencies, RegistryDependencies, RuntimeDependencies, TransferDependencies,
+    };
+    let catalog = Arc::new(db.remote_objects());
+    let tags = Arc::new(db.tags());
+    rstore_application_ports::ApplicationDependencies::new(
+        RegistryDependencies {
+            connections: Arc::new(db.connections()),
+            buckets: Arc::new(db.buckets()),
+            workspaces: Arc::new(db.workspaces()),
+            ignore_rules: Arc::new(db.ignore_rules()),
+            settings: Arc::new(db.settings()),
+            links: Arc::new(db.links()),
+            tags: tags.clone(),
+        },
+        CatalogDependencies {
+            catalog: catalog.clone(),
+            catalog_query: catalog,
+            index_runs: Arc::new(db.index_runs()),
+            catalog_tags: tags,
+        },
+        TransferDependencies {
+            jobs: Arc::new(db.jobs()),
+            multipart: Arc::new(db.multipart(clock.clone())),
+        },
+        RuntimeDependencies {
+            stats: Arc::new(db.clone()),
+            clock,
+            storage_factory,
+            unit_of_work: Arc::new(db.clone()),
+            repairs: Arc::new(db.outbox()),
+        },
+    )
 }

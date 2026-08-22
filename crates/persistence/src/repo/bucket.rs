@@ -1,5 +1,7 @@
 //! Repository for locally registered [`Bucket`] rows (BKT-).
 
+use async_trait::async_trait;
+use rstore_application_ports::BucketStore;
 use rstore_domain::bucket::{Bucket, BucketConfig};
 use rstore_domain::id::{BucketId, ConnectionId};
 use rstore_domain::policy::ConflictPolicy;
@@ -8,6 +10,7 @@ use sqlx::sqlite::SqlitePool;
 
 use crate::codec::{unix_secs, uuid_to_text, Bind, Insert, RowReader, Update};
 use crate::error::map_sqlx;
+use crate::tx::WriteGate;
 
 const COLUMNS: &str = "id, connection_id, name, display_name, read_only, allow_delete, \
                        index_enabled, default_conflict, concurrency, created_at, updated_at";
@@ -15,32 +18,22 @@ const COLUMNS: &str = "id, connection_id, name, display_name, read_only, allow_d
 /// CRUD access to `buckets`.
 #[derive(Clone)]
 pub struct BucketRepository {
-    pool: SqlitePool,
+    gate: WriteGate,
     read_pool: SqlitePool,
-    writer: crate::actor::SqliteWriter,
 }
 
 impl BucketRepository {
-    pub fn new(pool: SqlitePool) -> Self {
-        Self::new_with_pools(pool.clone(), pool, crate::actor::SqliteWriter::new(64))
+    pub(crate) fn new(gate: WriteGate, read_pool: SqlitePool) -> Self {
+        Self { gate, read_pool }
     }
+}
 
-    pub fn new_with_pools(
-        pool: SqlitePool,
-        read_pool: SqlitePool,
-        writer: crate::actor::SqliteWriter,
-    ) -> Self {
-        Self {
-            pool,
-            read_pool,
-            writer,
-        }
-    }
-
+#[async_trait]
+impl BucketStore for BucketRepository {
     /// Insert a bucket registration. A duplicate `(connection, name)` surfaces
     /// as `Conflict` (BKT-002).
-    pub async fn insert(&self, bucket: &Bucket) -> Result<()> {
-        let _write = self.writer.acquire().await?;
+    async fn insert(&self, bucket: &Bucket) -> Result<()> {
+        let _write = self.gate.permit().await?;
         Insert::into("buckets")
             .column("id", uuid_to_text(&bucket.id))
             .column("connection_id", uuid_to_text(&bucket.connection_id))
@@ -53,13 +46,13 @@ impl BucketRepository {
             .column("concurrency", bucket.config.concurrency.map(|c| c as i64))
             .column("created_at", unix_secs(bucket.created_at))
             .column("updated_at", unix_secs(bucket.updated_at))
-            .execute(&self.pool)
+            .execute(self.gate.pool())
             .await?;
         Ok(())
     }
 
     /// All registered buckets, ordered by connection then name.
-    pub async fn list(&self) -> Result<Vec<Bucket>> {
+    async fn list(&self) -> Result<Vec<Bucket>> {
         let rows = sqlx::query(&format!(
             "SELECT {COLUMNS} FROM buckets ORDER BY connection_id, name"
         ))
@@ -69,7 +62,7 @@ impl BucketRepository {
         rows.into_iter().map(row_to_bucket).collect()
     }
 
-    pub async fn get(&self, id: BucketId) -> Result<Option<Bucket>> {
+    async fn get(&self, id: BucketId) -> Result<Option<Bucket>> {
         let row = sqlx::query(&format!("SELECT {COLUMNS} FROM buckets WHERE id = ?"))
             .bind(uuid_to_text(&id))
             .fetch_optional(&self.read_pool)
@@ -78,11 +71,7 @@ impl BucketRepository {
         row.map(row_to_bucket).transpose()
     }
 
-    pub async fn get_by_name(
-        &self,
-        connection: ConnectionId,
-        name: &str,
-    ) -> Result<Option<Bucket>> {
+    async fn get_by_name(&self, connection: ConnectionId, name: &str) -> Result<Option<Bucket>> {
         let row = sqlx::query(&format!(
             "SELECT {COLUMNS} FROM buckets WHERE connection_id = ? AND name = ?"
         ))
@@ -95,7 +84,7 @@ impl BucketRepository {
     }
 
     /// All buckets registered under a connection (CON-013 reference check).
-    pub async fn list_by_connection(&self, connection: ConnectionId) -> Result<Vec<Bucket>> {
+    async fn list_by_connection(&self, connection: ConnectionId) -> Result<Vec<Bucket>> {
         let rows = sqlx::query(&format!(
             "SELECT {COLUMNS} FROM buckets WHERE connection_id = ? ORDER BY name"
         ))
@@ -107,8 +96,8 @@ impl BucketRepository {
     }
 
     /// Update an existing bucket's mutable fields.
-    pub async fn update(&self, bucket: &Bucket) -> Result<()> {
-        let _write = self.writer.acquire().await?;
+    async fn update(&self, bucket: &Bucket) -> Result<()> {
+        let _write = self.gate.permit().await?;
         let affected = Update::table("buckets")
             .set("display_name", bucket.config.display_name.as_ref())
             .set("read_only", bucket.config.read_only)
@@ -118,7 +107,7 @@ impl BucketRepository {
             .set("concurrency", bucket.config.concurrency.map(|c| c as i64))
             .set("updated_at", unix_secs(bucket.updated_at))
             .filter("id = ?", [Bind::Text(uuid_to_text(&bucket.id))])
-            .execute(&self.pool)
+            .execute(self.gate.pool())
             .await?
             .rows_affected();
         if affected == 0 {
@@ -128,11 +117,11 @@ impl BucketRepository {
     }
 
     /// Delete a bucket registration (workspace links cascade via FK).
-    pub async fn delete(&self, id: BucketId) -> Result<bool> {
-        let _write = self.writer.acquire().await?;
+    async fn delete(&self, id: BucketId) -> Result<bool> {
+        let _write = self.gate.permit().await?;
         let affected = sqlx::query("DELETE FROM buckets WHERE id = ?")
             .bind(uuid_to_text(&id))
-            .execute(&self.pool)
+            .execute(self.gate.pool())
             .await
             .map_err(map_sqlx)?
             .rows_affected();

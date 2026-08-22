@@ -4,7 +4,7 @@
 //! so repository and application contract tests can run with zero network.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -14,7 +14,7 @@ use rstore_storage_api::model::{
     BucketSummary, DeleteOutcome, ListOptions, ListPage, ObjectEntry, ObjectMetadata, PutOptions,
     ReadRange, UploadedPart,
 };
-use rstore_storage_api::Storage;
+use rstore_storage_api::{MultipartSession, Storage};
 use time::OffsetDateTime;
 
 type Store = HashMap<(String, String), (ObjectMetadata, Bytes)>;
@@ -22,6 +22,11 @@ type Store = HashMap<(String, String), (ObjectMetadata, Bytes)>;
 /// (bucket, key, upload_id, part_number).
 type PartStore = HashMap<(String, String, String, u32), Vec<u8>>;
 type UploadStore = HashSet<(String, String, String)>;
+
+/// S3's real minimum for every non-final part of a multipart upload. The
+/// fake enforces it at `complete_multipart` — the same point the provider
+/// does — so undersized part plans fail offline instead of only on AWS.
+const MIN_NON_FINAL_PART_SIZE: u64 = 5 * 1024 * 1024;
 
 /// Which [`Storage`] method a [`FakeStorage::fail_next`] fault targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,23 +69,39 @@ impl ErrorTemplate {
     }
 }
 
-/// In-memory object store.
-pub struct FakeStorage {
+/// Shared mutable state: the fake's object store, upload registry, part
+/// staging and fault queues — held by the fake itself and by every
+/// [`FakeMultipartSession`] it hands out. Opaque: every field and method is
+/// crate-private.
+pub struct FakeInner {
     objects: Mutex<Store>,
     /// Buckets known to `list_buckets`; `put`/`seed` register buckets implicitly.
     buckets: Mutex<Vec<String>>,
     uploads: Mutex<UploadStore>,
     parts: Mutex<PartStore>,
     /// Queued one-shot faults, consumed front-first per method.
-    faults: Mutex<Vec<(StorageMethod, rstore_domain::Error)>>,
+    faults: Mutex<Vec<(StorageMethod, Error)>>,
     /// Persistent faults, removed only through [`FakeStorage::clear_fault`].
     persistent_faults: Mutex<Vec<(StorageMethod, ErrorTemplate)>>,
     /// Optional one-shot hook invoked after a successful read.
     read_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
-impl FakeStorage {
-    pub fn new() -> Self {
+/// In-memory object store.
+pub struct FakeStorage {
+    inner: Arc<FakeInner>,
+}
+
+impl std::ops::Deref for FakeStorage {
+    type Target = FakeInner;
+
+    fn deref(&self) -> &FakeInner {
+        &self.inner
+    }
+}
+
+impl FakeInner {
+    fn new() -> Self {
         Self {
             objects: Mutex::new(HashMap::new()),
             buckets: Mutex::new(Vec::new()),
@@ -89,6 +110,71 @@ impl FakeStorage {
             faults: Mutex::new(Vec::new()),
             persistent_faults: Mutex::new(Vec::new()),
             read_hook: Mutex::new(None),
+        }
+    }
+
+    /// Consume the next queued fault for `method`, if any.
+    fn fault(&self, method: StorageMethod) -> Result<()> {
+        if let Some((_, error)) = self
+            .persistent_faults
+            .lock()
+            .expect("fake store poisoned")
+            .iter()
+            .find(|(fault_method, _)| *fault_method == method)
+        {
+            return Err(error.build());
+        }
+        let mut faults = self.faults.lock().expect("fake store poisoned");
+        if let Some(pos) = faults.iter().position(|(m, _)| *m == method) {
+            let (_, error) = faults.remove(pos);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn register_bucket(&self, name: &str) {
+        let mut buckets = self.buckets.lock().expect("fake store poisoned");
+        if !buckets.iter().any(|b| b == name) {
+            buckets.push(name.to_string());
+        }
+    }
+
+    fn take_part(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: u32,
+    ) -> Result<Vec<u8>> {
+        self.parts
+            .lock()
+            .expect("fake store poisoned")
+            .remove(&(
+                bucket.to_string(),
+                key.to_string(),
+                upload_id.to_string(),
+                part_number,
+            ))
+            .ok_or_else(|| Error::not_found("multipart part not found"))
+    }
+
+    fn part_buffer(&self, bucket: &str, key: &str, upload_id: &str, part_number: u32, body: &[u8]) {
+        self.parts.lock().expect("fake store poisoned").insert(
+            (
+                bucket.to_string(),
+                key.to_string(),
+                upload_id.to_string(),
+                part_number,
+            ),
+            body.to_vec(),
+        );
+    }
+}
+
+impl FakeStorage {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(FakeInner::new()),
         }
     }
 
@@ -132,36 +218,10 @@ impl FakeStorage {
         }
     }
 
-    /// Consume the next queued fault for `method`, if any.
-    fn fault(&self, method: StorageMethod) -> Result<()> {
-        if let Some((_, error)) = self
-            .persistent_faults
-            .lock()
-            .expect("fake store poisoned")
-            .iter()
-            .find(|(fault_method, _)| *fault_method == method)
-        {
-            return Err(error.build());
-        }
-        let mut faults = self.faults.lock().expect("fake store poisoned");
-        if let Some(pos) = faults.iter().position(|(m, _)| *m == method) {
-            let (_, error) = faults.remove(pos);
-            return Err(error);
-        }
-        Ok(())
-    }
-
     /// Register a bucket (affects `list_buckets` only — listing an unseeded
     /// bucket still returns an empty page).
     pub fn seed_bucket(&self, name: &str) {
-        let mut buckets = self.buckets.lock().expect("fake store poisoned");
-        if !buckets.iter().any(|b| b == name) {
-            buckets.push(name.to_string());
-        }
-    }
-
-    fn register_bucket(&self, name: &str) {
-        self.seed_bucket(name);
+        self.inner.register_bucket(name);
     }
 
     /// Seed a part as if a previous (interrupted) run had uploaded it to the
@@ -420,7 +480,7 @@ impl Storage for FakeStorage {
         bucket: &str,
         key: &ObjectPath,
         _opts: &PutOptions,
-    ) -> Result<String> {
+    ) -> Result<Box<dyn MultipartSession>> {
         self.fault(StorageMethod::CreateMultipart)?;
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -430,54 +490,95 @@ impl Storage for FakeStorage {
             key.as_str().to_string(),
             upload_id.clone(),
         ));
-        Ok(upload_id)
+        Ok(Box::new(FakeMultipartSession {
+            store: self.inner.clone(),
+            bucket: bucket.to_string(),
+            key: key.as_str().to_string(),
+            upload_id,
+        }))
     }
 
-    async fn upload_part(
+    async fn adopt_multipart(
         &self,
         bucket: &str,
         key: &ObjectPath,
         upload_id: &str,
-        part_number: u32,
-        body: Bytes,
-    ) -> Result<UploadedPart> {
-        self.fault(StorageMethod::UploadPart)?;
+    ) -> Result<Box<dyn MultipartSession>> {
+        // Binding an id is no provider call; the session validates the id
+        // on first use exactly like the provider's NoSuchUpload.
+        Ok(Box::new(FakeMultipartSession {
+            store: self.inner.clone(),
+            bucket: bucket.to_string(),
+            key: key.as_str().to_string(),
+            upload_id: upload_id.to_owned(),
+        }))
+    }
+}
+
+/// One in-flight fake multipart upload over the shared state. Implements the
+/// same legality rules as the provider so engine/relay bugs fail offline:
+/// part-number range, upload existence, the 5 MiB non-final floor and
+/// etag echo at completion, ascending order. `copy_part` keeps the session
+/// port's default (`CapabilityUnsupported`) — the fake has no server-side
+/// copy, which the storage contract pins as the fallback capability.
+struct FakeMultipartSession {
+    store: Arc<FakeInner>,
+    bucket: String,
+    key: String,
+    upload_id: String,
+}
+
+#[async_trait]
+impl MultipartSession for FakeMultipartSession {
+    fn upload_id(&self) -> &str {
+        &self.upload_id
+    }
+
+    async fn upload_part(&self, part_number: u32, body: Bytes) -> Result<UploadedPart> {
+        self.store.fault(StorageMethod::UploadPart)?;
+        // S3 rejects part numbers outside 1..=10_000 outright.
+        if !(1..=10_000).contains(&part_number) {
+            return Err(Error::invalid_input(format!(
+                "part number {part_number} is outside the S3 range 1..=10000"
+            )));
+        }
         if !self
+            .store
             .uploads
             .lock()
             .expect("fake store poisoned")
             .contains(&(
-                bucket.to_string(),
-                key.as_str().to_string(),
-                upload_id.to_string(),
+                self.bucket.clone(),
+                self.key.clone(),
+                self.upload_id.clone(),
             ))
         {
             return Err(Error::not_found("multipart upload not found"));
         }
         let size = body.len() as u64;
-        // Accumulate part bytes so complete_multipart can assemble the object.
-        self.part_buffer(bucket, key.as_str(), upload_id, part_number, &body);
+        // Accumulate part bytes so completion can assemble the object.
+        self.store
+            .part_buffer(&self.bucket, &self.key, &self.upload_id, part_number, &body);
         Ok(UploadedPart {
             part_number,
-            etag: format!("etag-{part_number}"),
+            etag: FakeStorage::etag_for(part_number),
             size,
         })
     }
 
-    async fn complete_multipart(
-        &self,
-        bucket: &str,
-        key: &ObjectPath,
-        upload_id: &str,
-        parts: &[UploadedPart],
-    ) -> Result<ObjectMetadata> {
-        self.fault(StorageMethod::CompleteMultipart)?;
+    async fn complete(&self, parts: &[UploadedPart]) -> Result<ObjectMetadata> {
+        self.store.fault(StorageMethod::CompleteMultipart)?;
+        // Validate before consuming the upload: an illegal part list leaves
+        // the multipart upload alive for a corrected retry, exactly like the
+        // provider's InvalidPartList response.
+        FakeStorage::validate_completion(parts)?;
         let upload = (
-            bucket.to_string(),
-            key.as_str().to_string(),
-            upload_id.to_string(),
+            self.bucket.clone(),
+            self.key.clone(),
+            self.upload_id.clone(),
         );
         if !self
+            .store
             .uploads
             .lock()
             .expect("fake store poisoned")
@@ -487,74 +588,113 @@ impl Storage for FakeStorage {
         }
         let mut body = Vec::new();
         for part in parts {
-            body.extend_from_slice(&self.take_part(
-                bucket,
-                key.as_str(),
-                upload_id,
+            body.extend_from_slice(&self.store.take_part(
+                &self.bucket,
+                &self.key,
+                &self.upload_id,
                 part.part_number,
             )?);
         }
         let body = Bytes::from(body);
         let size = body.len() as u64;
         let meta = ObjectMetadata::from_parts(
-            key.as_str(),
+            &self.key,
             Some(format!("multipart-{size:x}")),
             parts,
             OffsetDateTime::now_utc(),
         );
-        self.objects.lock().expect("fake store poisoned").insert(
-            (bucket.to_string(), key.as_str().to_string()),
-            (meta.clone(), body),
-        );
-        self.seed_bucket(bucket);
+        self.store
+            .objects
+            .lock()
+            .expect("fake store poisoned")
+            .insert(
+                (self.bucket.clone(), self.key.clone()),
+                (meta.clone(), body),
+            );
+        // Completed uploads leave no staged parts behind, exactly like the
+        // provider after a successful CompleteMultipartUpload.
+        self.store
+            .parts
+            .lock()
+            .expect("fake store poisoned")
+            .retain(|(b, k, id, _), _| {
+                !(b == &self.bucket && k == &self.key && id == &self.upload_id)
+            });
+        self.store.register_bucket(&self.bucket);
         Ok(meta)
     }
 
-    async fn abort_multipart(&self, bucket: &str, key: &ObjectPath, upload_id: &str) -> Result<()> {
-        self.fault(StorageMethod::AbortMultipart)?;
-        self.uploads.lock().expect("fake store poisoned").remove(&(
-            bucket.to_string(),
-            key.as_str().to_string(),
-            upload_id.to_string(),
-        ));
-        self.parts
+    async fn abort(&self) -> Result<()> {
+        self.store.fault(StorageMethod::AbortMultipart)?;
+        self.store
+            .uploads
             .lock()
             .expect("fake store poisoned")
-            .retain(|(b, k, id, _), _| !(b == bucket && k == key.as_str() && id == upload_id));
+            .remove(&(
+                self.bucket.clone(),
+                self.key.clone(),
+                self.upload_id.clone(),
+            ));
+        self.store
+            .parts
+            .lock()
+            .expect("fake store poisoned")
+            .retain(|(b, k, id, _), _| {
+                !(b == &self.bucket && k == &self.key && id == &self.upload_id)
+            });
         Ok(())
     }
 }
 
 impl FakeStorage {
-    fn part_buffer(&self, bucket: &str, key: &str, upload_id: &str, part_number: u32, body: &[u8]) {
-        self.parts.lock().expect("fake store poisoned").insert(
-            (
-                bucket.to_string(),
-                key.to_string(),
-                upload_id.to_string(),
-                part_number,
-            ),
-            body.to_vec(),
-        );
+    /// The deterministic ETag an uploaded part carries. Completion must
+    /// echo it back — a caller that fabricates etags is not exercising the
+    /// provider contract.
+    fn etag_for(part_number: u32) -> String {
+        format!("etag-{part_number}")
     }
 
-    fn take_part(
-        &self,
-        bucket: &str,
-        key: &str,
-        upload_id: &str,
-        part_number: u32,
-    ) -> Result<Vec<u8>> {
-        self.parts
-            .lock()
-            .expect("fake store poisoned")
-            .remove(&(
-                bucket.to_string(),
-                key.to_string(),
-                upload_id.to_string(),
-                part_number,
-            ))
-            .ok_or_else(|| Error::not_found("multipart part not found"))
+    /// S3's CompleteMultipartUpload legality rules, enforced so engine/relay
+    /// bugs fail fast offline instead of surfacing only against AWS/MinIO:
+    ///
+    /// - at least one part, part numbers strictly ascending without gaps in
+    ///   ordering and no duplicates;
+    /// - every non-final part is at least 5 MiB;
+    /// - each entry echoes the exact ETag its UploadPart returned.
+    fn validate_completion(parts: &[UploadedPart]) -> Result<()> {
+        if parts.is_empty() {
+            return Err(Error::invalid_input(
+                "multipart completion requires at least one part",
+            ));
+        }
+        for (index, part) in parts.iter().enumerate() {
+            if !(1..=10_000).contains(&part.part_number) {
+                return Err(Error::invalid_input(format!(
+                    "part number {} is outside the S3 range 1..=10000",
+                    part.part_number
+                )));
+            }
+            if let Some(previous) = parts.get(index.wrapping_sub(1)) {
+                if previous.part_number >= part.part_number {
+                    return Err(Error::invalid_input(
+                        "multipart parts must be ascending and unique",
+                    ));
+                }
+            }
+            if index + 1 < parts.len() && part.size < MIN_NON_FINAL_PART_SIZE {
+                return Err(Error::invalid_input(format!(
+                    "non-final part {} is {} bytes; S3 requires at least 5 MiB",
+                    part.part_number, part.size
+                )));
+            }
+            if part.etag != Self::etag_for(part.part_number) {
+                return Err(Error::invalid_input(format!(
+                    "part {} was submitted with an etag that was never issued",
+                    part.part_number
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -621,14 +761,96 @@ mod tests {
             StorageMethod::UploadPart,
             Error::network("injected part failure"),
         );
-        s.upload_part("b", &key, &upload, 1, Bytes::from_static(b"xxx"))
+        upload
+            .upload_part(1, Bytes::from_static(b"xxx"))
             .await
             .unwrap_err();
         // The provider upload survives the failed part — an abort decision is
         // the caller's, and the abort path stays exercisable afterwards.
-        assert!(s.has_upload("b", "multipart.bin", &upload));
-        s.seed_part("b", "multipart.bin", &upload, 1, b"xxx");
-        s.abort_multipart("b", &key, &upload).await.unwrap();
+        assert!(s.has_upload("b", "multipart.bin", upload.upload_id()));
+        s.seed_part("b", "multipart.bin", upload.upload_id(), 1, b"xxx");
+        upload.abort().await.unwrap();
         assert_eq!(s.active_upload_count(), 0);
+    }
+
+    /// A completed multipart upload leaves no staged parts behind — the
+    /// provider forgets them after a successful CompleteMultipartUpload.
+    #[tokio::test]
+    async fn complete_multipart_clears_staged_parts() {
+        let s = FakeStorage::new();
+        let key = ObjectPath::new("multipart.bin").unwrap();
+        let upload = s
+            .create_multipart("b", &key, &PutOptions::default())
+            .await
+            .unwrap();
+        let part = upload
+            .upload_part(1, Bytes::from_static(b"final"))
+            .await
+            .unwrap();
+        let meta = upload.complete(&[part]).await.unwrap();
+        assert_eq!(meta.size, 5);
+        assert_eq!(s.active_upload_count(), 0);
+    }
+
+    /// The S3 legality rules the fake now enforces at completion.
+    #[tokio::test]
+    async fn complete_multipart_rejects_illegal_part_lists() {
+        use rstore_storage_api::model::UploadedPart;
+        let s = FakeStorage::new();
+        let key = ObjectPath::new("illegal.bin").unwrap();
+
+        // Undersized non-final part.
+        let upload = s
+            .create_multipart("b", &key, &PutOptions::default())
+            .await
+            .unwrap();
+        let small = UploadedPart {
+            part_number: 1,
+            etag: "etag-1".into(),
+            size: 10,
+        };
+        let tail = upload
+            .upload_part(2, Bytes::from_static(b"tail"))
+            .await
+            .unwrap();
+        let error = upload.complete(&[small, tail]).await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidInput);
+
+        // Fabricated etag (never issued by an UploadPart).
+        let forged = UploadedPart {
+            part_number: 1,
+            etag: "forged".into(),
+            size: 5,
+        };
+        let error = upload.complete(&[forged]).await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidInput);
+        upload.abort().await.unwrap();
+
+        // Duplicate part numbers.
+        let upload = s
+            .create_multipart("b", &key, &PutOptions::default())
+            .await
+            .unwrap();
+        let first = upload
+            .upload_part(1, Bytes::from_static(b"one"))
+            .await
+            .unwrap();
+        let duplicate = UploadedPart {
+            etag: first.etag.clone(),
+            ..first.clone()
+        };
+        let error = upload
+            .complete(&[first.clone(), duplicate])
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidInput);
+
+        // Descending order.
+        let second = upload
+            .upload_part(2, Bytes::from_static(b"two"))
+            .await
+            .unwrap();
+        let error = upload.complete(&[second, first]).await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidInput);
     }
 }

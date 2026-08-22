@@ -2321,7 +2321,6 @@ dependencies = [
  "rstore-catalog",
  "rstore-domain",
  "rstore-persistence",
- "rstore-secrets",
  "rstore-storage-api",
  "rstore-test-support",
  "rstore-transfer",
@@ -2340,6 +2339,7 @@ dependencies = [
  "async-trait",
  "rstore-catalog",
  "rstore-domain",
+ "rstore-storage-api",
  "serde",
  "serde_json",
  "time",
@@ -2357,14 +2357,13 @@ dependencies = [
 name = "rstore-bootstrap"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "rstore-application",
- "rstore-application-ports",
  "rstore-domain",
  "rstore-persistence",
- "rstore-secrets",
+ "rstore-platform",
  "rstore-storage-api",
  "rstore-storage-s3",
+ "tempfile",
  "tokio",
 ]
 
@@ -2373,6 +2372,7 @@ name = "rstore-catalog"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "rstore-domain",
  "rstore-test-support",
  "serde",
@@ -2384,6 +2384,7 @@ dependencies = [
 name = "rstore-cli"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "clap",
  "insta",
  "rpassword",
@@ -2392,7 +2393,6 @@ dependencies = [
  "rstore-domain",
  "rstore-persistence",
  "rstore-platform",
- "rstore-secrets",
  "rstore-test-support",
  "rstore-transfer",
  "serde",
@@ -2460,30 +2460,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "rstore-secrets"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "rstore-domain",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "rstore-storage-api"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
  "rstore-domain",
- "rstore-secrets",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
  "time",
+ "tracing",
 ]
 
 [[package]]
@@ -2498,9 +2485,11 @@ dependencies = [
  "aws-smithy-types",
  "bytes",
  "rstore-domain",
- "rstore-secrets",
+ "rstore-persistence",
  "rstore-storage-api",
  "rstore-test-support",
+ "rstore-transfer",
+ "tempfile",
  "time",
  "tokio",
  "tracing",

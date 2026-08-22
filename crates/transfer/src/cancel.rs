@@ -39,6 +39,18 @@ impl CancellationToken {
             Ok(())
         }
     }
+
+    /// Resolves as soon as cancellation is signalled. Polls at 10 ms: the
+    /// only latency this bounds is how fast a backoff sleep unwinds, and a
+    /// sleeping retry needs no tighter precision.
+    pub async fn cancelled(&self) {
+        loop {
+            if self.is_cancelled() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
 }
 
 #[cfg(test)]

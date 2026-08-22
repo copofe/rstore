@@ -2,7 +2,8 @@
 //!
 //! One service turns a remote reference into the requested representation —
 //! object path, S3 URI, public URL, presigned URL, Markdown or HTML — using
-//! the bucket's [`LinkProfile`] for bases and permissions. Presigning
+//! the connection's defaults and the bucket's [`LinkProfile`] overrides for
+//! public/CDN bases and permissions. Presigning
 //! delegates to the storage adapter; a bucket or adapter that disallows it
 //! surfaces `CapabilityUnsupported` (CLI exit 11) rather than a silently
 //! degraded link (LINK-011). Presigned URLs are results, never logs
@@ -88,8 +89,30 @@ pub fn parse_ttl(raw: &str) -> Result<u64> {
     rstore_domain::duration::parse_span(raw, "smhd", 7 * 86_400, "TTL", "7d (S3 presign limit)")
 }
 
+/// Resolve the effective object delivery base from connection defaults and
+/// bucket overrides. CDN/proxy delivery wins over a plain public base.
+pub fn resolve_link_base(
+    config: &rstore_domain::ConnectionConfig,
+    profile: &LinkProfile,
+) -> String {
+    profile
+        .cdn_base_url
+        .as_deref()
+        .or(config.cdn_base_url.as_deref())
+        .or(profile.public_base_url.as_deref())
+        .or(config.public_base_url.as_deref())
+        .unwrap_or(config.endpoint.as_str())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn normalize_base_url(base: String) -> Option<String> {
+    let base = base.trim().trim_end_matches('/');
+    (!base.is_empty()).then(|| base.to_string())
+}
+
 /// Editable link-profile fields for [`DefaultLinkService::set_profile`];
-/// `None` keeps the current value.
+/// `None` keeps the current value and `Some("")` clears a base override.
 #[derive(Debug, Clone, Default)]
 pub struct LinkProfileInput {
     pub public_base_url: Option<String>,
@@ -141,10 +164,10 @@ impl DefaultLinkService {
         let resolved = self.resolve(bucket).await?;
         let mut profile = self.profiles.get(resolved.id).await?;
         if let Some(base) = input.public_base_url {
-            profile.public_base_url = Some(base);
+            profile.public_base_url = normalize_base_url(base);
         }
         if let Some(base) = input.cdn_base_url {
-            profile.cdn_base_url = Some(base);
+            profile.cdn_base_url = normalize_base_url(base);
         }
         if let Some(allow) = input.allow_public_url {
             profile.allow_public_url = allow;
@@ -195,14 +218,11 @@ impl DefaultLinkService {
         let path = parsed.object_path()?;
         let profile = self.profiles.get(bucket.id).await?;
 
-        // Public URL (LINK-003/004): profile base wins, else derive from the
-        // connection endpoint (path-style).
+        // Delivery URL (LINK-003/004): bucket CDN override, connection CDN
+        // default, bucket public override, connection public default, then
+        // the unchanged S3 endpoint.
         let public_url = if profile.allow_public_url {
-            let base = profile
-                .cdn_base_url
-                .or(profile.public_base_url)
-                .map(|b| b.trim_end_matches('/').to_string())
-                .unwrap_or_else(|| config.endpoint.trim_end_matches('/').to_string());
+            let base = resolve_link_base(&config, &profile);
             Some(format!("{}/{}/{}", base, bucket.name, encode_path(key)))
         } else {
             None
@@ -339,6 +359,30 @@ mod tests {
         app.link_service()
     }
 
+    async fn setup_with_public_base() -> Arc<DefaultLinkService> {
+        let (app, _factory) = crate::test_util::app_with(&["nas"], &[("nas", "media")]).await;
+        let connection = app
+            .api()
+            .registry()
+            .connections()
+            .resolve(&crate::connection::ConnectionRef::Name("nas".into()))
+            .await
+            .unwrap();
+        app.api()
+            .registry()
+            .connections()
+            .update(
+                connection.id,
+                crate::connection::UpdateConnectionInput {
+                    public_base_url: Some("https://cdn.example.com/assets".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        app.link_service()
+    }
+
     fn req(format: LinkFormat) -> LinkRequest {
         LinkRequest {
             format,
@@ -377,19 +421,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn profile_base_url_overrides_endpoint() {
-        let svc = setup().await;
-        let bucket = svc_for_profile(&svc).await;
-        svc.profiles
-            .upsert(
-                bucket,
-                &LinkProfile {
-                    public_base_url: Some("https://cdn.example.com/assets".into()),
-                    ..LinkProfile::default()
-                },
-            )
-            .await
-            .unwrap();
+    async fn connection_public_base_url_overrides_endpoint() {
+        let svc = setup_with_public_base().await;
         let out = svc
             .generate(&["nas/media/img/logo.png".into()], &req(LinkFormat::Url))
             .await
@@ -398,6 +431,97 @@ mod tests {
             out.link.unwrap().requested,
             "https://cdn.example.com/assets/media/img/logo.png"
         );
+    }
+
+    #[tokio::test]
+    async fn bucket_and_connection_delivery_bases_follow_precedence() {
+        let (app, _factory) = crate::test_util::app_with(&["nas"], &[("nas", "media")]).await;
+        let connection = app
+            .api()
+            .registry()
+            .connections()
+            .resolve(&crate::connection::ConnectionRef::Name("nas".into()))
+            .await
+            .unwrap();
+        let connection = app
+            .api()
+            .registry()
+            .connections()
+            .update(
+                connection.id,
+                crate::connection::UpdateConnectionInput {
+                    public_base_url: Some("https://connection-public.example.com".into()),
+                    cdn_base_url: Some("https://connection-cdn.example.com".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let bucket_override = LinkProfile {
+            public_base_url: Some("https://bucket-public.example.com/".into()),
+            cdn_base_url: Some("https://bucket-cdn.example.com/".into()),
+            ..LinkProfile::default()
+        };
+        assert_eq!(
+            resolve_link_base(&connection, &bucket_override),
+            "https://bucket-cdn.example.com"
+        );
+
+        let public_only = LinkProfile {
+            public_base_url: Some("https://bucket-public.example.com".into()),
+            ..LinkProfile::default()
+        };
+        assert_eq!(
+            resolve_link_base(&connection, &public_only),
+            "https://connection-cdn.example.com"
+        );
+
+        let without_connection_cdn = rstore_domain::ConnectionConfig {
+            cdn_base_url: None,
+            ..connection.clone()
+        };
+        assert_eq!(
+            resolve_link_base(&without_connection_cdn, &public_only),
+            "https://bucket-public.example.com"
+        );
+        assert_eq!(
+            resolve_link_base(&without_connection_cdn, &LinkProfile::default()),
+            "https://connection-public.example.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn bucket_delivery_base_override_normalizes_and_clears() {
+        let svc = setup().await;
+        let bucket = crate::bucket::BucketRef::Name("media".into());
+
+        let profile = svc
+            .set_profile(
+                &bucket,
+                LinkProfileInput {
+                    public_base_url: Some(" https://bucket-public.example.com/// ".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            profile.public_base_url.as_deref(),
+            Some("https://bucket-public.example.com")
+        );
+
+        let profile = svc
+            .set_profile(
+                &bucket,
+                LinkProfileInput {
+                    public_base_url: Some(String::new()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(profile.public_base_url.is_none());
     }
 
     async fn svc_for_profile(svc: &Arc<DefaultLinkService>) -> rstore_domain::BucketId {

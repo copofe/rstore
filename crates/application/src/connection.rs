@@ -11,9 +11,7 @@ use async_trait::async_trait;
 use rstore_application_ports::ConnectionStore;
 use rstore_domain::connection::{AddressingStyle, ConnectionConfig, Region};
 use rstore_domain::id::ConnectionId;
-use rstore_domain::{Clock, CredentialRef, Error, Result};
-use rstore_secrets::Secret;
-use rstore_secrets::SecretStore;
+use rstore_domain::{Clock, Error, Result, Secret};
 
 /// Reference a connection by stable id or by name.
 #[derive(Debug, Clone)]
@@ -50,18 +48,21 @@ pub struct CredentialInput {
     pub secret_key: String,
 }
 
-/// Input for creating a connection. `credentials` are stored in the
-/// SecretStore under the resolved `secret_ref` (DATA-013/014).
+type StoredCredentials = (Option<Secret<String>>, Option<Secret<String>>);
+
+/// Input for creating a connection. Credentials are stored directly with the
+/// connection when supplied.
 #[derive(Debug, Clone)]
 pub struct AddConnectionInput {
     pub name: String,
     pub endpoint: String,
+    /// Public-object base URL; `None` uses the endpoint unchanged.
+    pub public_base_url: Option<String>,
+    /// Default accelerated/proxy delivery base for this connection.
+    pub cdn_base_url: Option<String>,
     pub region: Region,
     pub addressing_style: AddressingStyle,
     pub tls_verify: bool,
-    /// Reference under which credentials are stored; defaults to
-    /// `conn_<normalised name>`.
-    pub secret_ref: Option<String>,
     /// Credentials to store for this connection, if the user supplied them.
     pub credentials: Option<Secret<CredentialInput>>,
 }
@@ -71,10 +72,13 @@ pub struct AddConnectionInput {
 pub struct UpdateConnectionInput {
     pub name: Option<String>,
     pub endpoint: Option<String>,
+    /// Replace the public-object base URL; an empty value clears it.
+    pub public_base_url: Option<String>,
+    /// Replace the accelerated/proxy delivery base; an empty value clears it.
+    pub cdn_base_url: Option<String>,
     pub region: Option<Region>,
     pub addressing_style: Option<AddressingStyle>,
     pub tls_verify: Option<bool>,
-    pub secret_ref: Option<String>,
     /// Replace stored credentials when present.
     pub credentials: Option<Secret<CredentialInput>>,
 }
@@ -112,36 +116,36 @@ pub trait ConnectionService: Send + Sync {
 pub struct DefaultConnectionService {
     repo: Arc<dyn ConnectionStore>,
     clock: Arc<dyn Clock>,
-    secrets: Arc<dyn SecretStore>,
 }
 
 impl DefaultConnectionService {
-    pub fn new(
-        repo: Arc<dyn ConnectionStore>,
-        clock: Arc<dyn Clock>,
-        secrets: Arc<dyn SecretStore>,
-    ) -> Self {
-        Self {
-            repo,
-            clock,
-            secrets,
-        }
+    pub fn new(repo: Arc<dyn ConnectionStore>, clock: Arc<dyn Clock>) -> Self {
+        Self { repo, clock }
     }
 
-    /// Store `credentials` under `secret_ref` (DATA-013/014).
-    async fn store_credentials(
-        &self,
-        secret_ref: &str,
-        credentials: &Secret<CredentialInput>,
-    ) -> Result<()> {
-        let pair = credentials.expose();
-        rstore_secrets::put_credentials(
-            self.secrets.as_ref(),
-            secret_ref,
-            &pair.access_key,
-            &pair.secret_key,
-        )
-        .await
+    fn normalize_base_url(value: Option<String>) -> Option<String> {
+        value.and_then(|base| {
+            let base = base.trim().trim_end_matches('/');
+            (!base.is_empty()).then(|| base.to_string())
+        })
+    }
+
+    fn split_credentials(
+        credentials: Option<Secret<CredentialInput>>,
+    ) -> Result<StoredCredentials> {
+        let Some(credentials) = credentials else {
+            return Ok((None, None));
+        };
+        let pair = credentials.into_inner();
+        if pair.access_key.trim().is_empty() || pair.secret_key.trim().is_empty() {
+            return Err(Error::invalid_input(
+                "access key and secret key must be non-empty",
+            ));
+        }
+        Ok((
+            Some(Secret::new(pair.access_key.trim().to_string())),
+            Some(Secret::new(pair.secret_key.trim().to_string())),
+        ))
     }
 }
 
@@ -164,27 +168,19 @@ impl ConnectionService for DefaultConnectionService {
             )));
         }
 
-        // Always record a secret reference: an explicit one wins, otherwise
-        // derive it from the name so env-var credentials (DATA-013) resolve
-        // even when nothing was stored interactively.
-        let secret_ref = input
-            .secret_ref
-            .clone()
-            .or_else(|| Some(rstore_secrets::default_secret_ref(&input.name)))
-            .map(CredentialRef::new)
-            .transpose()?;
-        if let (Some(ref_name), Some(creds)) = (&secret_ref, &input.credentials) {
-            self.store_credentials(ref_name.as_str(), creds).await?;
-        }
+        let (access_key, secret_key) = Self::split_credentials(input.credentials)?;
         let now = self.clock.now();
         let config = ConnectionConfig {
             id: ConnectionId::new(),
             name: input.name,
             endpoint: input.endpoint,
+            public_base_url: Self::normalize_base_url(input.public_base_url),
+            cdn_base_url: Self::normalize_base_url(input.cdn_base_url),
             region: input.region,
             addressing_style: input.addressing_style,
             tls_verify: input.tls_verify,
-            secret_ref,
+            access_key,
+            secret_key,
             created_at: now,
             updated_at: now,
             last_tested_at: None,
@@ -242,6 +238,12 @@ impl ConnectionService for DefaultConnectionService {
             }
             config.endpoint = endpoint;
         }
+        if let Some(public_base_url) = input.public_base_url {
+            config.public_base_url = Self::normalize_base_url(Some(public_base_url));
+        }
+        if let Some(cdn_base_url) = input.cdn_base_url {
+            config.cdn_base_url = Self::normalize_base_url(Some(cdn_base_url));
+        }
         if let Some(region) = input.region {
             config.region = region;
         }
@@ -251,20 +253,10 @@ impl ConnectionService for DefaultConnectionService {
         if let Some(tls) = input.tls_verify {
             config.tls_verify = tls;
         }
-        if let Some(secret_ref) = input.secret_ref {
-            config.secret_ref = Some(CredentialRef::new(secret_ref)?);
-        }
-        if let Some(creds) = &input.credentials {
-            let secret_ref = match config.secret_ref.clone() {
-                Some(secret_ref) => secret_ref,
-                None => {
-                    let derived =
-                        CredentialRef::new(rstore_secrets::default_secret_ref(&config.name))?;
-                    config.secret_ref = Some(derived.clone());
-                    derived
-                }
-            };
-            self.store_credentials(secret_ref.as_str(), creds).await?;
+        if input.credentials.is_some() {
+            let (access_key, secret_key) = Self::split_credentials(input.credentials)?;
+            config.access_key = access_key;
+            config.secret_key = secret_key;
         }
         config.updated_at = self.clock.now();
         self.repo.update(&config).await?;
@@ -280,10 +272,6 @@ impl ConnectionService for DefaultConnectionService {
                 config.name
             )));
         }
-        // Credentials are dropped with the connection (CON-013).
-        if let Some(secret_ref) = &config.secret_ref {
-            rstore_secrets::delete_credentials(self.secrets.as_ref(), secret_ref.as_str()).await?;
-        }
         Ok(())
     }
 }
@@ -293,25 +281,21 @@ mod tests {
     use super::*;
     use rstore_domain::{ErrorCode, SystemClock};
     use rstore_persistence::Database;
-    use rstore_secrets::{get_credentials, InMemorySecretStore, NullSecretStore};
 
     async fn setup() -> DefaultConnectionService {
         let db = Database::open_in_memory().await.unwrap();
-        DefaultConnectionService::new(
-            Arc::new(db.connections()),
-            Arc::new(SystemClock),
-            Arc::new(NullSecretStore),
-        )
+        DefaultConnectionService::new(Arc::new(db.connections()), Arc::new(SystemClock))
     }
 
     fn input(name: &str) -> AddConnectionInput {
         AddConnectionInput {
             name: name.into(),
             endpoint: "https://example.r2.cloudflarestorage.com".into(),
+            public_base_url: None,
+            cdn_base_url: None,
             region: Region::Auto,
             addressing_style: AddressingStyle::Path,
             tls_verify: true,
-            secret_ref: None,
             credentials: None,
         }
     }
@@ -319,9 +303,7 @@ mod tests {
     #[tokio::test]
     async fn add_list_resolve_remove() {
         let svc = setup().await;
-        let mut add = input("prod-r2");
-        add.secret_ref = Some("conn_prod_r2".into());
-        let added = svc.add(add).await.unwrap();
+        let added = svc.add(input("prod-r2")).await.unwrap();
 
         assert_eq!(svc.list().await.unwrap().len(), 1);
 
@@ -346,14 +328,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn add_stores_credentials_and_remove_deletes_them() {
+    async fn add_stores_credentials_on_the_connection() {
         let db = Database::open_in_memory().await.unwrap();
-        let secrets = Arc::new(InMemorySecretStore::new());
-        let svc = DefaultConnectionService::new(
-            Arc::new(db.connections()),
-            Arc::new(SystemClock),
-            secrets.clone(),
-        );
+        let svc = DefaultConnectionService::new(Arc::new(db.connections()), Arc::new(SystemClock));
 
         let mut add = input("nas");
         add.credentials = Some(Secret::new(CredentialInput {
@@ -362,18 +339,15 @@ mod tests {
         }));
         let added = svc.add(add).await.unwrap();
 
-        // The derived default reference is recorded and backed by the store.
-        assert_eq!(added.secret_ref.as_deref(), Some("conn_nas"));
-        let pair = get_credentials(secrets.as_ref(), "conn_nas")
+        assert_eq!(added.access_key.as_ref().unwrap().expose(), "AK");
+        assert_eq!(added.secret_key.as_ref().unwrap().expose(), "SK");
+        let fetched = svc
+            .resolve(&ConnectionRef::Name("nas".into()))
             .await
-            .unwrap()
-            .expect("stored");
-        assert_eq!(pair.access_key.expose(), "AK");
+            .unwrap();
+        assert_eq!(fetched.access_key.as_ref().unwrap().expose(), "AK");
 
         svc.remove(&ConnectionRef::Id(added.id)).await.unwrap();
-        assert!(get_credentials(secrets.as_ref(), "conn_nas")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(svc.list().await.unwrap().is_empty());
     }
 }

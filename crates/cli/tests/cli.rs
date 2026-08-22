@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use clap::CommandFactory;
 use rstore_application::{AddConnectionInput, Application, ConnectionRef};
-use rstore_cli::args::{Cli, Command, ConnectionAddArgs, ConnectionCommand, UrlArgs};
+use rstore_cli::args::{
+    BucketCommand, Cli, Command, ConnectionAddArgs, ConnectionCommand, UrlArgs,
+};
 use rstore_cli::output::{envelope, exit_code_for};
 use rstore_cli::{command_domains, HandlerResult};
 use rstore_domain::connection::{AddressingStyle, Region};
@@ -85,10 +87,11 @@ fn add_cli(name: &str, addressing: &str) -> Cli {
             action: ConnectionCommand::Add(ConnectionAddArgs {
                 name: name.into(),
                 endpoint: "https://example.r2.cloudflarestorage.com".into(),
+                public_base: None,
+                cdn_base: None,
                 region: "auto".into(),
                 addressing_style: addressing.into(),
                 tls_verify: true,
-                secret_ref: Some("conn_prod_r2".into()),
                 access_key: None,
                 secret_key: None,
             }),
@@ -127,9 +130,10 @@ async fn connection_add_produces_stable_envelope() {
     assert!(obj["data"]["created_at"].is_string());
     // The injected clock controls the envelope timestamp.
     assert_eq!(obj["meta"]["generated_at"], "2023-11-14T22:13:20Z");
-    // The stored secret never leaks into JSON (SEC-001).
-    assert_eq!(obj["data"]["secret_ref"], "conn_prod_r2"); // ref only, never the value
-                                                           // No credentials were supplied: the envelope carries a warning (CLI-004).
+    // Credential fields are omitted from generic JSON config output (SEC-001).
+    assert!(!obj["data"].as_object().unwrap().contains_key("access_key"));
+    assert!(!obj["data"].as_object().unwrap().contains_key("secret_key"));
+    // No credentials were supplied: the envelope carries a warning (CLI-004).
     assert_eq!(obj["warnings"].as_array().unwrap().len(), 1);
     assert!(obj["warnings"][0]
         .as_str()
@@ -162,6 +166,58 @@ async fn connection_add_envelope_snapshot() {
 }
 
 #[tokio::test]
+async fn connection_show_displays_masked_credentials() {
+    let db = Database::open_in_memory().await.unwrap();
+    let app = rstore_application_test_support::application_from_db(db);
+    app.api()
+        .registry()
+        .connections()
+        .add(AddConnectionInput {
+            name: "supabase".into(),
+            endpoint: "https://example.supabase.co/storage/v1/s3".into(),
+            public_base_url: None,
+            cdn_base_url: None,
+            region: Region::Specific("ap-southeast-1".into()),
+            addressing_style: AddressingStyle::Auto,
+            tls_verify: true,
+            credentials: Some(rstore_domain::Secret::new(
+                rstore_application::CredentialInput {
+                    access_key: "AKIAIOSFODNN7EXAMPLE".into(),
+                    secret_key: "super-secret-value".into(),
+                },
+            )),
+        })
+        .await
+        .unwrap();
+
+    let out = run(
+        &Cli {
+            config: None,
+            log_level: "warn".into(),
+            json: false,
+            quiet: false,
+            command: Command::Connection {
+                action: ConnectionCommand::Show {
+                    reference: "supabase".into(),
+                    capabilities: false,
+                },
+            },
+        },
+        &app,
+        &resolve_app_dirs(None),
+        &rstore_transfer::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    assert!(out.human.contains("access key  : AKIA****MPLE"));
+    assert!(out.human.contains("secret key  : supe****alue"));
+    assert!(!out.human.contains("AKIAIOSFODNN7EXAMPLE"));
+    assert_eq!(out.data.as_ref().unwrap()["access_key"], "AKIA****MPLE");
+    assert_eq!(out.data.as_ref().unwrap()["secret_key"], "supe****alue");
+}
+
+#[tokio::test]
 async fn application_contract_via_service_trait() {
     // QA-002: exercise the ConnectionService trait directly (no CLI).
     let db = Database::open_in_memory().await.unwrap();
@@ -172,10 +228,11 @@ async fn application_contract_via_service_trait() {
         .add(AddConnectionInput {
             name: "nas".into(),
             endpoint: "https://nas.local:9000".into(),
+            public_base_url: None,
+            cdn_base_url: None,
             region: Region::Specific("us-east-1".into()),
             addressing_style: AddressingStyle::Path,
             tls_verify: true,
-            secret_ref: None,
             credentials: None,
         })
         .await
@@ -203,10 +260,11 @@ async fn upload_short_target_resolves_the_registered_bucket() {
         .add(AddConnectionInput {
             name: "nas".into(),
             endpoint: "http://localhost:9000".into(),
+            public_base_url: None,
+            cdn_base_url: None,
             region: Region::Auto,
             addressing_style: AddressingStyle::Path,
             tls_verify: true,
-            secret_ref: None,
             credentials: None,
         })
         .await
@@ -273,10 +331,11 @@ async fn url_accepts_short_references() {
         .add(AddConnectionInput {
             name: "nas".into(),
             endpoint: "http://localhost:9000".into(),
+            public_base_url: None,
+            cdn_base_url: None,
             region: Region::Auto,
             addressing_style: AddressingStyle::Path,
             tls_verify: true,
-            secret_ref: None,
             credentials: None,
         })
         .await
@@ -323,6 +382,94 @@ async fn url_accepts_short_references() {
 }
 
 #[tokio::test]
+async fn configured_supabase_public_url_and_bucket_show_use_connection_metadata() {
+    let app = rstore_application_test_support::application_from_db(
+        Database::open_in_memory().await.unwrap(),
+    );
+    app.api()
+        .registry()
+        .connections()
+        .add(AddConnectionInput {
+            name: "supabase".into(),
+            endpoint: "https://xhvtonnrlgsxoqbvmxbo.storage.supabase.co/storage/v1/s3".into(),
+            public_base_url: Some(
+                "https://xhvtonnrlgsxoqbvmxbo.supabase.co/storage/v1/object/public".into(),
+            ),
+            cdn_base_url: None,
+            region: Region::Specific("ap-southeast-1".into()),
+            addressing_style: AddressingStyle::Path,
+            tls_verify: true,
+            credentials: None,
+        })
+        .await
+        .unwrap();
+    app.api()
+        .registry()
+        .buckets()
+        .add(
+            rstore_application::AddBucketInput {
+                connection: ConnectionRef::Name("supabase".into()),
+                name: "Shinji".into(),
+                config: Default::default(),
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    let url = run(
+        &Cli {
+            config: None,
+            log_level: "warn".into(),
+            json: false,
+            quiet: false,
+            command: Command::Url(UrlArgs {
+                uris: vec!["Shinji/friends/imshu.cc.jpg".into()],
+                format: "url".into(),
+                signed: false,
+                ttl: None,
+            }),
+        },
+        &app,
+        &resolve_app_dirs(None),
+        &rstore_transfer::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        url.human.trim(),
+        "https://xhvtonnrlgsxoqbvmxbo.supabase.co/storage/v1/object/public/Shinji/friends/imshu.cc.jpg"
+    );
+
+    let show = run(
+        &Cli {
+            config: None,
+            log_level: "warn".into(),
+            json: false,
+            quiet: false,
+            command: Command::Bucket {
+                action: BucketCommand::Show {
+                    reference: "Shinji".into(),
+                },
+            },
+        },
+        &app,
+        &resolve_app_dirs(None),
+        &rstore_transfer::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(show.human.contains("connection") && show.human.contains("supabase"));
+    assert!(show.human.contains("display name") && show.human.contains("Shinji"));
+    assert!(show.human.contains("public base (connection)"));
+    assert!(show
+        .human
+        .contains("https://xhvtonnrlgsxoqbvmxbo.supabase.co/storage/v1/object/public"));
+    assert_eq!(show.human.matches("public base").count(), 1);
+    assert_eq!(show.human.matches("cdn base").count(), 1);
+    assert!(!show.human.contains("effective base"));
+}
+
+#[tokio::test]
 async fn url_mixed_batch_failure_exits_thirteen() {
     let app = rstore_application_test_support::application_from_db(
         Database::open_in_memory().await.unwrap(),
@@ -333,10 +480,11 @@ async fn url_mixed_batch_failure_exits_thirteen() {
         .add(AddConnectionInput {
             name: "nas".into(),
             endpoint: "http://localhost:9000".into(),
+            public_base_url: None,
+            cdn_base_url: None,
             region: Region::Auto,
             addressing_style: AddressingStyle::Path,
             tls_verify: true,
-            secret_ref: None,
             credentials: None,
         })
         .await

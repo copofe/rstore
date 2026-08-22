@@ -98,7 +98,7 @@ fn region_string(region: &Region) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rstore_secrets::Secret;
+    use rstore_domain::Secret;
 
     fn config() -> ConnectionConfig {
         use time::OffsetDateTime;
@@ -106,10 +106,13 @@ mod tests {
             id: rstore_domain::id::ConnectionId::new(),
             name: "test".into(),
             endpoint: "http://localhost:9000".into(),
+            public_base_url: None,
+            cdn_base_url: None,
             region: Region::Auto,
             addressing_style: AddressingStyle::Path,
             tls_verify: true,
-            secret_ref: Some("conn_test".into()),
+            access_key: None,
+            secret_key: None,
             created_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: OffsetDateTime::UNIX_EPOCH,
             last_tested_at: None,

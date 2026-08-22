@@ -19,26 +19,13 @@ const COLUMNS: &str = "id, connection_id, bucket_id, object_path, size, etag, co
 /// Catalog persistence for indexed remote objects.
 #[derive(Clone)]
 pub struct SqliteRemoteObjectRepository {
-    pool: SqlitePool,
+    gate: crate::tx::WriteGate,
     read_pool: SqlitePool,
-    writer: crate::actor::SqliteWriter,
 }
 
 impl SqliteRemoteObjectRepository {
-    pub fn new(pool: SqlitePool) -> Self {
-        Self::new_with_pools(pool.clone(), pool, crate::actor::SqliteWriter::new(64))
-    }
-
-    pub fn new_with_pools(
-        pool: SqlitePool,
-        read_pool: SqlitePool,
-        writer: crate::actor::SqliteWriter,
-    ) -> Self {
-        Self {
-            pool,
-            read_pool,
-            writer,
-        }
+    pub(crate) fn new(gate: crate::tx::WriteGate, read_pool: SqlitePool) -> Self {
+        Self { gate, read_pool }
     }
 
     /// A tombstone expires at its own `expires_at` when set, else
@@ -132,54 +119,55 @@ impl RemoteObjectRepository for SqliteRemoteObjectRepository {
         path: &ObjectPath,
         at: OffsetDateTime,
     ) -> Result<()> {
-        let _write = self.writer.acquire().await?;
         let path = path.as_str().to_string();
-        crate::tx::atomically(&self.pool, "tombstone", |tx| {
-            Box::pin(async move {
-                let existing =
-                    Self::find_id(&mut **tx, connection, bucket, &ObjectPath::new(&path)?).await?;
-                if let Some((id, _)) = existing {
-                    sqlx::query("DELETE FROM remote_objects WHERE id = ?")
-                        .bind(uuid_to_text(&id))
+        self.gate
+            .write_unit("tombstone", |tx| {
+                Box::pin(async move {
+                    let existing =
+                        Self::find_id(&mut **tx, connection, bucket, &ObjectPath::new(&path)?)
+                            .await?;
+                    if let Some((id, _)) = existing {
+                        sqlx::query("DELETE FROM remote_objects WHERE id = ?")
+                            .bind(uuid_to_text(&id))
+                            .execute(&mut **tx)
+                            .await
+                            .map_err(map_sqlx)?;
+                    }
+                    let object_id = existing
+                        .map(|(id, _)| id)
+                        .unwrap_or_else(RemoteObjectId::new);
+                    Insert::into("metadata_tombstones")
+                        .column("workspace_id", Bind::NullText)
+                        .column("remote_object_id", uuid_to_text(&object_id))
+                        .column("tag_id", Bind::NullText)
+                        .column("locator", format!("{}/{}", bucket.as_uuid(), path))
+                        .column("created_at", unix_secs(at))
+                        .column("expires_at", Bind::NullInteger)
                         .execute(&mut **tx)
-                        .await
-                        .map_err(map_sqlx)?;
-                }
-                let object_id = existing
-                    .map(|(id, _)| id)
-                    .unwrap_or_else(RemoteObjectId::new);
-                Insert::into("metadata_tombstones")
-                    .column("workspace_id", Bind::NullText)
-                    .column("remote_object_id", uuid_to_text(&object_id))
-                    .column("tag_id", Bind::NullText)
-                    .column("locator", format!("{}/{}", bucket.as_uuid(), path))
-                    .column("created_at", unix_secs(at))
-                    .column("expires_at", Bind::NullInteger)
-                    .execute(&mut **tx)
-                    .await?;
-                Ok(())
+                        .await?;
+                    Ok(())
+                })
             })
-        })
-        .await
+            .await
     }
 
     async fn upsert(&self, object: &RemoteObject) -> Result<()> {
-        let _write = self.writer.acquire().await?;
-        Self::upsert_with_executor(&self.pool, object).await
+        let _write = self.gate.permit().await?;
+        Self::upsert_with_executor(self.gate.pool(), object).await
     }
 
     async fn upsert_many(&self, objects: &[RemoteObject]) -> Result<()> {
-        let _write = self.writer.acquire().await?;
         let objects = objects.to_vec();
-        crate::tx::atomically(&self.pool, "catalog page", |tx| {
-            Box::pin(async move {
-                for object in &objects {
-                    Self::upsert_with_executor(&mut **tx, object).await?;
-                }
-                Ok(())
+        self.gate
+            .write_unit("catalog page", |tx| {
+                Box::pin(async move {
+                    for object in &objects {
+                        Self::upsert_with_executor(&mut **tx, object).await?;
+                    }
+                    Ok(())
+                })
             })
-        })
-        .await
+            .await
     }
 
     async fn get(&self, id: RemoteObjectId) -> Result<Option<RemoteObject>> {
@@ -194,10 +182,10 @@ impl RemoteObjectRepository for SqliteRemoteObjectRepository {
     }
 
     async fn delete(&self, id: RemoteObjectId) -> Result<()> {
-        let _write = self.writer.acquire().await?;
+        let _write = self.gate.permit().await?;
         sqlx::query("DELETE FROM remote_objects WHERE id = ?")
             .bind(uuid_to_text(&id))
-            .execute(&self.pool)
+            .execute(self.gate.pool())
             .await
             .map_err(map_sqlx)?;
         Ok(())
@@ -245,13 +233,13 @@ impl RemoteObjectRepository for SqliteRemoteObjectRepository {
         bucket: BucketId,
         before: time::OffsetDateTime,
     ) -> Result<u64> {
-        let _write = self.writer.acquire().await?;
+        let _write = self.gate.permit().await?;
         let affected = sqlx::query(
             "UPDATE remote_objects SET state = 'stale'              WHERE bucket_id = ? AND confirmed_at < ? AND state = 'confirmed'",
         )
         .bind(uuid_to_text(&bucket))
         .bind(crate::codec::unix_secs(before))
-        .execute(&self.pool)
+        .execute(self.gate.pool())
         .await
         .map_err(map_sqlx)?
         .rows_affected();
@@ -259,12 +247,12 @@ impl RemoteObjectRepository for SqliteRemoteObjectRepository {
     }
 
     async fn mark_all_stale_in_bucket(&self, bucket: BucketId) -> Result<u64> {
-        let _write = self.writer.acquire().await?;
+        let _write = self.gate.permit().await?;
         let affected = sqlx::query(
             "UPDATE remote_objects SET state = 'stale' WHERE bucket_id = ? AND state != 'stale'",
         )
         .bind(uuid_to_text(&bucket))
-        .execute(&self.pool)
+        .execute(self.gate.pool())
         .await
         .map_err(map_sqlx)?
         .rows_affected();
@@ -272,11 +260,11 @@ impl RemoteObjectRepository for SqliteRemoteObjectRepository {
     }
 
     async fn delete_stale_in_bucket(&self, bucket: BucketId) -> Result<u64> {
-        let _write = self.writer.acquire().await?;
+        let _write = self.gate.permit().await?;
         let affected =
             sqlx::query("DELETE FROM remote_objects WHERE bucket_id = ? AND state = 'stale'")
                 .bind(uuid_to_text(&bucket))
-                .execute(&self.pool)
+                .execute(self.gate.pool())
                 .await
                 .map_err(map_sqlx)?
                 .rows_affected();
@@ -284,10 +272,10 @@ impl RemoteObjectRepository for SqliteRemoteObjectRepository {
     }
 
     async fn delete_all_in_bucket(&self, bucket: BucketId) -> Result<u64> {
-        let _write = self.writer.acquire().await?;
+        let _write = self.gate.permit().await?;
         let affected = sqlx::query("DELETE FROM remote_objects WHERE bucket_id = ?")
             .bind(uuid_to_text(&bucket))
-            .execute(&self.pool)
+            .execute(self.gate.pool())
             .await
             .map_err(map_sqlx)?
             .rows_affected();
@@ -316,13 +304,13 @@ impl RemoteObjectRepository for SqliteRemoteObjectRepository {
         now: time::OffsetDateTime,
         retention_secs: u64,
     ) -> Result<u64> {
-        let _write = self.writer.acquire().await?;
+        let _write = self.gate.permit().await?;
         let affected = sqlx::query(&format!(
             "DELETE FROM metadata_tombstones WHERE {}",
             Self::expired_clause(retention_secs)
         ))
         .bind(crate::codec::unix_secs(now))
-        .execute(&self.pool)
+        .execute(self.gate.pool())
         .await
         .map_err(map_sqlx)?
         .rows_affected();

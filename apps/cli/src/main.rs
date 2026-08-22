@@ -1,19 +1,19 @@
 //! `rstore` CLI entry point.
 //!
-//! Thin binary: parse → init tracing → resolve dirs → (for DB commands) acquire
-//! the write lock and open the application runtime → dispatch via
-//! [`rstore_cli`] → render human/JSON and map to a stable exit code.
+//! Thin binary: parse → init tracing → resolve dirs → (for DB commands) run
+//! the full startup sequence ([`rstore_bootstrap::Runtime::open_locked`]:
+//! create dirs, write lock, migrate, recover) → dispatch via [`rstore_cli`] →
+//! render human/JSON and map to a stable exit code.
 //!
 //! Command identity and the version renderer come from the library (single
 //! source); the envelope timestamp flows from the injected clock (CORE-009).
 
 use clap::Parser;
-use rstore_bootstrap::{default_secret_source_stats, default_secret_store, Runtime, RuntimeConfig};
+use rstore_bootstrap::Runtime;
 use rstore_cli::args::{Cli, Command};
 use rstore_cli::output::{envelope, error_envelope, exit_code_for};
 use rstore_cli::{resolve_dirs, version_output, HandlerResult};
 use rstore_domain::{Clock, SystemClock};
-use rstore_platform::{AppLock, LockError};
 use time::OffsetDateTime;
 
 #[tokio::main]
@@ -28,40 +28,14 @@ async fn main() {
         return;
     }
 
-    if let Err(e) = dirs.ensure_created() {
-        eprintln!("error: failed to create data directories: {e}");
-        std::process::exit(3);
-    }
-
     let command = cli.command.path();
     let now = SystemClock.now();
 
-    // Acquire the cross-process write lock (DATA-008).
-    let _lock = match AppLock::try_acquire(&dirs.lock_path) {
-        Ok(lock) => lock,
-        Err(LockError::Busy) => {
-            let err =
-                rstore_domain::Error::lock_busy("another rstore runtime holds the write lock");
-            emit(Err(err), &cli, command, now);
-            return;
-        }
-        Err(e) => {
-            eprintln!("error: could not acquire write lock: {e}");
-            std::process::exit(1);
-        }
-    };
-
-    let runtime = match Runtime::open(
-        RuntimeConfig::new(
-            dirs.db_path.clone(),
-            // DATA-014 precedence: environment variables first, then the 0600
-            // credential file under the config directory.
-            default_secret_store(&dirs.config_dir),
-        )
-        .with_secret_source_stats(default_secret_source_stats(&dirs.config_dir)),
-    )
-    .await
-    {
+    // Full startup sequence (CONTEXT.md: 启动编排): create data directories,
+    // acquire the cross-process write lock (DATA-008), open + migrate +
+    // recover. Startup failures flow through the same envelope and the
+    // single-source exit-code mapping as every other domain error.
+    let runtime = match Runtime::open_locked(&dirs).await {
         Ok(runtime) => runtime,
         Err(e) => {
             emit(Err(e), &cli, command, now);

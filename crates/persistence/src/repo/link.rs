@@ -1,5 +1,7 @@
 //! Repository for per-bucket link settings (LINK-003..007).
 
+use async_trait::async_trait;
+use rstore_application_ports::LinkProfileStore;
 use rstore_domain::id::BucketId;
 use rstore_domain::LinkProfile;
 use rstore_domain::Result;
@@ -7,34 +9,25 @@ use sqlx::sqlite::SqlitePool;
 
 use crate::codec::{Insert, RowReader};
 use crate::error::map_sqlx;
+use crate::tx::WriteGate;
 
 /// CRUD over `link_profiles`; absent rows mean [`LinkProfile::default`].
 #[derive(Clone)]
 pub struct LinkRepository {
-    pool: SqlitePool,
+    gate: WriteGate,
     read_pool: SqlitePool,
-    writer: crate::actor::SqliteWriter,
 }
 
 impl LinkRepository {
-    pub fn new(pool: SqlitePool) -> Self {
-        Self::new_with_pools(pool.clone(), pool, crate::actor::SqliteWriter::new(64))
+    pub(crate) fn new(gate: WriteGate, read_pool: SqlitePool) -> Self {
+        Self { gate, read_pool }
     }
+}
 
-    pub fn new_with_pools(
-        pool: SqlitePool,
-        read_pool: SqlitePool,
-        writer: crate::actor::SqliteWriter,
-    ) -> Self {
-        Self {
-            pool,
-            read_pool,
-            writer,
-        }
-    }
-
+#[async_trait]
+impl LinkProfileStore for LinkRepository {
     /// The bucket's profile, or the default when none is stored.
-    pub async fn get(&self, bucket: BucketId) -> Result<LinkProfile> {
+    async fn get(&self, bucket: BucketId) -> Result<LinkProfile> {
         let row = sqlx::query(
             "SELECT public_base_url, cdn_base_url, allow_public_url, allow_presigned, \
              default_ttl_seconds FROM link_profiles WHERE bucket_id = ?",
@@ -59,8 +52,8 @@ impl LinkRepository {
     }
 
     /// Insert or replace the bucket's profile (LINK-003).
-    pub async fn upsert(&self, bucket: BucketId, profile: &LinkProfile) -> Result<()> {
-        let _write = self.writer.acquire().await?;
+    async fn upsert(&self, bucket: BucketId, profile: &LinkProfile) -> Result<()> {
+        let _write = self.gate.permit().await?;
         Insert::into("link_profiles")
             .column("bucket_id", crate::codec::uuid_to_text(&bucket))
             .column("public_base_url", &profile.public_base_url)
@@ -76,17 +69,17 @@ impl LinkRepository {
                  allow_presigned = excluded.allow_presigned, \
                  default_ttl_seconds = excluded.default_ttl_seconds",
             )
-            .execute(&self.pool)
+            .execute(self.gate.pool())
             .await?;
         Ok(())
     }
 
     /// Forget the bucket's profile (back to defaults).
-    pub async fn clear(&self, bucket: BucketId) -> Result<()> {
-        let _write = self.writer.acquire().await?;
+    async fn clear(&self, bucket: BucketId) -> Result<()> {
+        let _write = self.gate.permit().await?;
         sqlx::query("DELETE FROM link_profiles WHERE bucket_id = ?")
             .bind(crate::codec::uuid_to_text(&bucket))
-            .execute(&self.pool)
+            .execute(self.gate.pool())
             .await
             .map_err(map_sqlx)?;
         Ok(())

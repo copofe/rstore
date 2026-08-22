@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use rstore_application::WorkspaceRef;
+use rstore_application_ports::{BucketStore as _, ConnectionStore as _, WorkspaceStore as _};
 use rstore_catalog::{
     CatalogQuery as _, FileFilter, FileSort, InMemoryCatalog, PageRequest,
     RemoteObjectRepository as _,
@@ -26,10 +27,13 @@ async fn files_list_runs_over_the_in_memory_catalog() {
         id: rstore_domain::ConnectionId::new(),
         name: "nas".into(),
         endpoint: "http://localhost:9000".into(),
+        public_base_url: None,
+        cdn_base_url: None,
         region: rstore_domain::Region::Auto,
         addressing_style: rstore_domain::AddressingStyle::Path,
         tls_verify: true,
-        secret_ref: None,
+        access_key: None,
+        secret_key: None,
         created_at: now,
         updated_at: now,
         last_tested_at: None,

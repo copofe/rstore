@@ -53,6 +53,9 @@ pub struct CopyOptions {
     pub recursive: bool,
     /// Carry tag associations from source to target (MOVE-015).
     pub keep_tags: bool,
+    /// Chunk policy for cross-connection relays — the same knobs the
+    /// transfer engine spends (`multipart_threshold`, `part_size`).
+    pub config: rstore_transfer::TransferConfig,
 }
 
 /// Validate the target shape for a multi-source or recursive copy/move. This
@@ -88,9 +91,6 @@ pub struct DefaultCopyService {
     jobs: Arc<dyn JobRepository>,
     clock: Arc<dyn Clock>,
     mutations: Arc<crate::mutation::MutationCoordinator>,
-    /// Chunk policy for cross-connection relays — the same knobs the
-    /// transfer engine spends (`multipart_threshold`, `part_size`).
-    pub config: rstore_transfer::TransferConfig,
 }
 
 impl DefaultCopyService {
@@ -108,7 +108,6 @@ impl DefaultCopyService {
             jobs,
             clock,
             mutations,
-            config: rstore_transfer::TransferConfig::default(),
         }
     }
 
@@ -329,7 +328,7 @@ impl DefaultCopyService {
                 dst.storage.as_ref(),
                 &request,
                 cancel,
-                &self.config,
+                &options.config,
                 progress,
             )
             .await
@@ -356,31 +355,41 @@ impl DefaultCopyService {
         );
         let follow_up =
             crate::mutation::CopyFollowUp::new(source, target, &copied, options.keep_tags, now);
-        self.mutations.settle_copy(&follow_up).await;
+        let settlement = self.mutations.settle_copy(&follow_up).await;
 
         if delete_source {
-            // MOVE-014: verify the target landed before touching the source.
-            match dst.storage.stat(&dst.bucket.name, &dst_path).await {
-                Ok(verified) if verified.size == copied.size => {}
-                Ok(_) => {
-                    return Ok(crate::job_run::Step::failed_msg(
-                        "target size mismatch after copy; source kept",
-                    ));
-                }
-                Err(e) => {
-                    return Ok(crate::job_run::Step::failed_msg(format!(
-                        "target verification failed; source kept: {e}"
-                    )));
-                }
-            }
-            if let Err(e) = src.storage.delete(&src.bucket.name, src_path).await {
-                return Ok(crate::job_run::Step::failed_msg(format!(
-                    "copied, but delete failed: {e}"
-                )));
-            }
-            self.mutations
-                .settle_delete(src.bucket.connection_id, src.bucket.id, src_path, now)
-                .await;
+            // MOVE-014: the verify→delete completion is the coordinator's
+            // follow-up stage — a failure leaves a queryable repair against
+            // the copy settlement instead of a message only the job log saw.
+            let source = crate::mutation::MoveEndpoint {
+                storage: src.storage.as_ref(),
+                connection: src.bucket.connection_id,
+                bucket_id: src.bucket.id,
+                bucket_name: &src.bucket.name,
+                path: src_path,
+            };
+            let target = crate::mutation::MoveEndpoint {
+                storage: dst.storage.as_ref(),
+                connection: dst.bucket.connection_id,
+                bucket_id: dst.bucket.id,
+                bucket_name: &dst.bucket.name,
+                path: &dst_path,
+            };
+            return Ok(
+                match self
+                    .mutations
+                    .finish_move(&settlement, &follow_up, &source, &target)
+                    .await
+                {
+                    crate::mutation::MoveFinish::Completed => {
+                        crate::job_run::Step::done(Outcome::Succeeded, None)
+                    }
+                    crate::mutation::MoveFinish::VerifyFailed(message)
+                    | crate::mutation::MoveFinish::DeleteFailed(message) => {
+                        crate::job_run::Step::failed_msg(message)
+                    }
+                },
+            );
         }
 
         Ok(crate::job_run::Step::done(Outcome::Succeeded, None))
@@ -411,6 +420,7 @@ mod tests {
             conflict,
             recursive: false,
             keep_tags: false,
+            config: rstore_transfer::TransferConfig::default(),
         }
     }
 
@@ -719,6 +729,7 @@ mod tests {
             conflict: ConflictPolicy::Overwrite,
             recursive,
             keep_tags,
+            config: rstore_transfer::TransferConfig::default(),
         }
     }
 

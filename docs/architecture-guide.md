@@ -11,8 +11,8 @@
   输出 runtime ready；尚无 GPUI 页面。
 - `crates/bootstrap::Runtime::open` 会打开 SQLite、执行迁移、恢复处于 processing 的 Outbox
   事件，并调用 `Application::initialize` 将遗留的非终态 Job 标记为 `interrupted`。
-- 默认运行时组装 S3 `StorageFactory`、环境变量覆盖 Connection 配置凭据的 `SecretStore`、
-  SQLite Repository、Multipart checkpoint、Outbox/Repair 和通知广播通道。
+- 默认运行时组装 S3 `StorageFactory`、SQLite Repository、Multipart checkpoint、
+  Outbox/Repair 和通知广播通道；Connection 凭据和其余配置都由 SQLite Repository 管理。
 - `OutboxDispatcher` 提供 `dispatch_once`，但当前入口没有常驻消费循环或配置投影 Handler；
   通知广播也提供订阅/发布接口，Transfer 运行过程尚未自动发布到该通道。
 
@@ -51,13 +51,12 @@ flowchart LR
     subgraph ADAPTERS["基础设施适配器"]
         PERSIST["crates/persistence\nSQLite、Writer Actor、Repository"]
         S3["crates/storage-s3\nS3-compatible 适配器"]
-        SECRETS["crates/secrets\nSecretStore 与脱敏"]
         PLATFORM["crates/platform\n应用目录与进程锁"]
     end
 
     SQLITE[("SQLite\n本地 Catalog / Job / Outbox")]
     PROVIDER[("S3-compatible\n远端对象存储")]
-    SOURCES[("环境变量 / Connection 配置表")]
+    SOURCES[("Connection 配置表")]
 
     CLI_BIN --> CLI_LIB
     CLI_BIN --> BOOT
@@ -66,7 +65,6 @@ flowchart LR
     BOOT --> API
     BOOT --> PERSIST
     BOOT --> S3
-    BOOT --> SECRETS
     CLI_BIN --> PLATFORM
     DESKTOP --> PLATFORM
 
@@ -75,7 +73,6 @@ flowchart LR
     API --> CATALOG
     API --> TRANSFER
     API --> STORAGE_API
-    API --> SECRETS
 
     PERSIST -. "实现" .-> PORTS
     PERSIST -. "实现" .-> CATALOG
@@ -84,7 +81,7 @@ flowchart LR
 
     PERSIST --> SQLITE
     S3 --> PROVIDER
-    SECRETS --> SOURCES
+    PERSIST --> SOURCES
 ```
 
 核心边界如下：
@@ -97,7 +94,7 @@ flowchart LR
 | `catalog` | 定义本地 Catalog 的查询、排序、分页和 Repository 契约 | 依赖具体 SQLite 实现 |
 | `transfer` | 执行上传、下载、复制、移动、Multipart、重试和取消 | 依赖 `persistence`；checkpoint 端口位于 `storage-api` |
 | `storage-api` | 描述与 Provider 无关的 Storage、Capability 和 Multipart 协议 | 依赖具体 AWS/S3 SDK |
-| `bootstrap` | 唯一的 Composition Root，打开数据库并组装 Storage、SecretStore、Outbox 和通知 | 承担业务规则或 CLI 输出；当前不运行常驻 Outbox 消费循环 |
+| `bootstrap` | 唯一的 Composition Root，打开数据库并组装 Storage、Outbox 和通知 | 承担业务规则或 CLI 输出；当前不运行常驻 Outbox 消费循环 |
 | `persistence` | 实现 SQLite schema、迁移、读连接池、有界 Writer Actor 和 Repository | 依赖 `transfer` |
 | `storage-s3` | 将 AWS SDK 映射到 `storage-api`，处理 S3-compatible 差异 | 依赖 GPUI 或向上层暴露 SDK 类型 |
 | `crates/cli` / `apps/*` | 解析输入、调用 Application API、渲染结果、映射退出码；`apps/*` 负责 Runtime/锁 | 在入口业务代码中直接读写 SQLite、调用 AWS SDK、复制业务编排 |
@@ -168,7 +165,6 @@ Outbox 事件要求 `event_id` 幂等、同一 aggregate version 保序、失败
 │   ├── storage-api/           # Provider-neutral Storage 端口
 │   ├── storage-s3/            # AWS SDK / S3-compatible 适配器
 │   ├── persistence/           # SQLite、迁移、Actor、Repository
-│   ├── secrets/               # SecretStore、环境变量与 Connection 凭据访问
 │   ├── platform/              # 应用目录、锁和平台能力
 │   ├── cli/                   # Clap 命令树、Handler、输出与退出码
 │   ├── test-support/          # FakeStorage、TempDb、TestClock、契约辅助
@@ -261,7 +257,7 @@ crates/<crate-name>/
    tracing，但业务动作必须经由 Application API；CLI 只渲染 API 返回值、JSON envelope
    和退出码。
 3. **Bootstrap 负责替换实现。** 只有 `crates/bootstrap` 选择并组装 SQLite、S3 adapter、
-   SecretStore、Outbox dispatcher、Clock 和通知通道，并注入 `ApplicationDependencies`；当前
+   Outbox dispatcher、Clock 和通知通道，并注入 `ApplicationDependencies`；当前
    Runtime 会恢复 processing 状态，但不会自动启动常驻 Outbox 消费循环。
 4. **Domain 只做业务判断。** Domain 保存不变量、状态机和业务事实，不打开文件、数据库或
    网络，不持有 Storage Client。
@@ -275,10 +271,10 @@ crates/<crate-name>/
 7. **远端访问经过 Storage 端口。** Application/Transfer → `storage-api` →
    `storage-s3` → Provider；除 `storage-s3` 外不得调用 AWS SDK，`persistence` 不得依赖
    `transfer`。
-8. **Secret 只通过 SecretStore。** Connection 配置统一保存凭据字段；Secret 值使用
-   `Secret<T>`，只在适配器实际需要时解析。它不得进入导出配置、Application API JSON、
-   错误 context 或日志。`tls_verify` 默认开启；当前 `--tls-verify=false` 只会保存配置，S3 适配器
-   尚未据此安装自定义证书校验器。
+8. **Secret 只通过受保护值类型。** Connection 配置直接保存凭据字段；内存中的值使用
+   `Secret<T>`，只在适配器实际需要时解析。原文不得进入导出配置、通用 Application API
+   JSON、错误 context 或日志；`connection show` 只能输出掩码预览。`tls_verify` 默认开启；
+   当前 `--tls-verify=false` 只会保存配置，S3 适配器尚未据此安装自定义证书校验器。
 9. **远端变更先记录事实再做本地跟进。** 典型顺序是：`Job intent` → 远端操作 →
    `RemoteMutationReceipt + Outbox fact` → Catalog follow-up → 失败时 `Repair item`。
 10. **事件与通知分离。** Domain Event 是可持久化的业务事实；Outbox 负责幂等、顺序、重试

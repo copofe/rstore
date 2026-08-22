@@ -9,7 +9,7 @@ priority.
 
 > Status: **Current architecture is in place.** The CLI and the future desktop
 > client share an infrastructure-neutral Application Core; Bootstrap owns
-> SQLite, storage adapters, secrets, recovery and an Outbox dispatcher seam. The
+> SQLite, storage adapters, recovery and an Outbox dispatcher seam. The
 > dispatcher is currently callable but is not connected to a resident consumer.
 > The desktop binary exercises the same Bootstrap/API/notification contract;
 > GPUI pages remain deferred.
@@ -23,9 +23,8 @@ constraints, see [`docs/architecture-guide.md`](docs/architecture-guide.md).
 ## What the current core delivers
 
 - Credentials are stored together with the Connection configuration in the local
-  SQLite table. `RSTORE_SECRET_*` environment variables provide a read-only
-  override for scripts and CI. Secret values never enter exported config, API JSON
-  or logs (SEC-001).
+  SQLite table. They are shown only as masked previews and never enter exported
+  config, generic API JSON or logs (SEC-001).
 - `connection add/list/show/edit/test/remove` — including a per-check
   connection test with an optional write probe (CON-007/008) and a cached
   capability report (CON-009/STORE-022).
@@ -42,7 +41,7 @@ constraints, see [`docs/architecture-guide.md`](docs/architecture-guide.md).
   catalog tombstones (DEL-).
 - `task list|show|pause|resume|retry|cancel` — jobs persisted from creation,
   stale running jobs marked `interrupted` on startup (JOB-).
-- Doctor reports adapter, credential-source counts and interrupted jobs;
+- Doctor reports the adapter and interrupted jobs;
   logs roll daily under `log_dir` (OBS-002). It also reports pending outbox
   events and repair items.
 - Remote mutations persist a receipt and versioned outbox fact; catalog
@@ -75,9 +74,8 @@ RSTORE_HOME=/tmp/rstore-demo cargo run -p rstore -- bucket add prod media
 RSTORE_HOME=/tmp/rstore-demo cargo run -p rstore -- upload ./file.bin prod/media/
 ```
 
-> **Scripts/CI:** prefer env credentials (`RSTORE_SECRET_<REF>__ACCESS_KEY` /
-> `__SECRET_KEY`) — they override the config file and involve no prompts on
-> any platform.
+> **Scripts/CI:** pass `--access-key` and `--secret-key` explicitly. With
+> `--json`, both flags are required because the CLI never prompts.
 
 ## MinIO integration test
 
@@ -109,7 +107,6 @@ crates/storage-s3   AWS-SDK S3 adapter (list/stat/read/put/delete/multipart)
 crates/catalog    RemoteObject query model + repository contracts
 crates/persistence SQLite + migrations + repositories + multipart checkpoints
 crates/transfer   transfer engine: multipart, resume, retry, cancellation
-crates/secrets    SecretStore: environment overrides and Connection credentials
 crates/platform   app dirs + cross-process write lock
 crates/test-support  FakeStorage (incl. multipart), TempDb, TestClock
 crates/cli        command tree, JSON envelope, exit codes
@@ -123,11 +120,11 @@ xtask             build/package helpers
   GPUI, AWS SDK or SQLite.
 - `application` depends on `domain` + interface crates + application ports,
   never SQLite/SQLx/AWS SDK/GPUI in its normal dependency graph.
-- `bootstrap` selects SQLite, the S3 adapter and SecretStore, then injects
-  them through `ApplicationDependencies`; the core never imports an SDK.
-- Secret values are managed by `SecretStore` and persisted with the Connection
-  configuration in SQLite; they never enter exported config, API JSON or logs
-  (`secrets::Secret` redacts Debug).
+- `bootstrap` selects SQLite and the S3 adapter, then injects them through
+  `ApplicationDependencies`; the core never imports an SDK.
+- Connection credentials are persisted in the Connection row as
+  `domain::Secret<String>`; the wrapper redacts Debug and credentials never
+  enter exported config, generic API JSON or logs.
 - Implement and validate each command through the CLI first so the underlying
   capabilities are easy to test; once stable, the future GPUI desktop consumes
   the same context-oriented Application API. This is an implementation order,

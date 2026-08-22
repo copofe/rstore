@@ -1,11 +1,9 @@
 //! Config import/export (DATA-015/016).
 //!
-//! A [`ConfigBundle`] is the portable JSON form of the registry: every
-//! connection and bucket, minus secrets — credential *references* travel,
-//! credential *values* never do (SEC-001). Importing re-adds entries through
-//! the ordinary services with conflict checks (`existing name → skipped`),
-//! an optional dry run, and no secret writes at all: credentials for the
-//! imported references must already resolve in the local chain.
+//! A ConfigBundle is the portable JSON form of the registry: every connection
+//! and bucket, with credential values omitted by serde (SEC-001). Importing
+//! re-adds entries through the ordinary services with conflict checks
+//! (existing name → skipped) and an optional dry run.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -114,9 +112,19 @@ impl DefaultConfigTransferService {
         }
     }
 
-    /// Serialise the registry without secrets (DATA-015).
+    /// Serialise the registry without credential values (DATA-015).
     pub async fn export(&self) -> Result<ConfigBundle> {
-        let list = self.connections.list().await?;
+        let list = self
+            .connections
+            .list()
+            .await?
+            .into_iter()
+            .map(|mut config| {
+                config.access_key = None;
+                config.secret_key = None;
+                config
+            })
+            .collect::<Vec<_>>();
         let mut buckets = Vec::new();
         let existing = self.buckets.list().await?;
         for config in &list {
@@ -195,7 +203,7 @@ impl DefaultConfigTransferService {
     }
 
     /// Execute or preview a previously derived plan. Existing names are
-    /// skipped, never overwritten, and secrets are untouched.
+    /// skipped and never overwritten.
     pub async fn import(&self, bundle: &ConfigBundle, dry_run: bool) -> Result<ImportReport> {
         let plan = self.plan(bundle).await?;
         let report = plan.report(dry_run);
@@ -240,7 +248,7 @@ impl DefaultConfigTransferService {
                         name: bucket.export.name.clone(),
                         config: bucket.export.config.clone(),
                     },
-                    true, // imported buckets skip the readability probe
+                    false, // imported buckets skip the readability probe
                 )
                 .await?;
         }
@@ -252,11 +260,12 @@ fn connection_input(config: &ConnectionConfig) -> crate::connection::AddConnecti
     crate::connection::AddConnectionInput {
         name: config.name.clone(),
         endpoint: config.endpoint.clone(),
+        public_base_url: config.public_base_url.clone(),
+        cdn_base_url: config.cdn_base_url.clone(),
         region: config.region.clone(),
         addressing_style: config.addressing_style,
         tls_verify: config.tls_verify,
-        secret_ref: config.secret_ref.as_ref().map(ToString::to_string),
-        // DATA-016: imports never carry credential values.
+        // DATA-016: credentials are intentionally not portable.
         credentials: None,
     }
 }

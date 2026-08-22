@@ -9,8 +9,8 @@ use std::io::{IsTerminal, Write};
 
 use rstore_application::CredentialInput;
 use rstore_domain::policy::ConflictPolicy;
+use rstore_domain::Secret;
 use rstore_domain::{Error, Result};
-use rstore_secrets::Secret;
 
 use crate::args::ConnectionAddArgs;
 
@@ -157,6 +157,10 @@ pub(super) fn read_edit_credential_input(
     args: &crate::args::ConnectionEditArgs,
     session: &Session,
 ) -> Result<Option<Secret<CredentialInput>>> {
+    if args.access_key.is_none() && args.secret_key.is_none() {
+        return Ok(None);
+    }
+
     read_credential_pair(
         args.access_key.as_deref(),
         args.secret_key.as_deref(),
@@ -320,6 +324,26 @@ mod credential_pair_tests {
             json,
             stdin_is_tty: tty,
         }
+    }
+
+    #[test]
+    fn edit_without_credential_flags_does_not_prompt() {
+        let args = crate::args::ConnectionEditArgs {
+            reference: "supabase".into(),
+            name: None,
+            endpoint: None,
+            public_base: Some("https://public.example.com".into()),
+            cdn_base: None,
+            region: None,
+            addressing_style: None,
+            tls_verify: None,
+            access_key: None,
+            secret_key: None,
+        };
+
+        assert!(read_edit_credential_input(&args, &session(false, true))
+            .unwrap()
+            .is_none());
     }
 
     fn pair(access: Option<&str>, secret: Option<&str>) -> Result<Option<Secret<CredentialInput>>> {

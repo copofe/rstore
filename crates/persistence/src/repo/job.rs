@@ -9,30 +9,18 @@ use time::OffsetDateTime;
 
 use crate::codec::{unix_secs, uuid_to_text, Bind, Insert, RowReader, Update};
 use crate::error::map_sqlx;
+use crate::tx::WriteGate;
 
 /// Persists jobs and their items.
 #[derive(Clone)]
 pub struct SqliteJobRepository {
-    pool: SqlitePool,
+    gate: WriteGate,
     read_pool: SqlitePool,
-    writer: crate::actor::SqliteWriter,
 }
 
 impl SqliteJobRepository {
-    pub fn new(pool: SqlitePool) -> Self {
-        Self::new_with_pools(pool.clone(), pool, crate::actor::SqliteWriter::new(64))
-    }
-
-    pub fn new_with_pools(
-        pool: SqlitePool,
-        read_pool: SqlitePool,
-        writer: crate::actor::SqliteWriter,
-    ) -> Self {
-        Self {
-            pool,
-            read_pool,
-            writer,
-        }
+    pub(crate) fn new(gate: WriteGate, read_pool: SqlitePool) -> Self {
+        Self { gate, read_pool }
     }
 
     async fn load_items<'e, E>(executor: E, id: JobId) -> Result<Vec<JobItem>>
@@ -103,24 +91,24 @@ const JOB_COLUMNS: &str = "id, kind, state, created_at, updated_at, error";
 #[async_trait]
 impl JobRepository for SqliteJobRepository {
     async fn create(&self, job: &Job) -> Result<()> {
-        let _write = self.writer.acquire().await?;
         let job = job.clone();
-        crate::tx::atomically(&self.pool, "job insert", |tx| {
-            Box::pin(async move {
-                Insert::into("transfer_jobs")
-                    .column("id", uuid_to_text(&job.id))
-                    .column("kind", job.kind.as_str())
-                    .column("state", job.state.as_str())
-                    .column("created_at", unix_secs(job.created_at))
-                    .column("updated_at", unix_secs(job.updated_at))
-                    .column("error", &job.error)
-                    .execute(&mut **tx)
-                    .await?;
-                Self::insert_items(tx, job.id, &job.items).await?;
-                Ok(())
+        self.gate
+            .write_unit("job insert", |tx| {
+                Box::pin(async move {
+                    Insert::into("transfer_jobs")
+                        .column("id", uuid_to_text(&job.id))
+                        .column("kind", job.kind.as_str())
+                        .column("state", job.state.as_str())
+                        .column("created_at", unix_secs(job.created_at))
+                        .column("updated_at", unix_secs(job.updated_at))
+                        .column("error", &job.error)
+                        .execute(&mut **tx)
+                        .await?;
+                    Self::insert_items(tx, job.id, &job.items).await?;
+                    Ok(())
+                })
             })
-        })
-        .await
+            .await
     }
 
     async fn get(&self, id: JobId) -> Result<Option<Job>> {
@@ -138,42 +126,42 @@ impl JobRepository for SqliteJobRepository {
     }
 
     async fn transition(&self, id: JobId, target: JobState, at: OffsetDateTime) -> Result<Job> {
-        let _write = self.writer.acquire().await?;
-        crate::tx::atomically(&self.pool, "job transition", |tx| {
-            Box::pin(async move {
-                let row = sqlx::query(&format!(
-                    "SELECT {JOB_COLUMNS} FROM transfer_jobs WHERE id = ?"
-                ))
-                .bind(uuid_to_text(&id))
-                .fetch_optional(&mut **tx)
-                .await
-                .map_err(map_sqlx)?;
-                let row = row.ok_or_else(|| Error::not_found(format!("job {id} not found")))?;
-                // Validate against the domain state machine before writing.
-                RowReader::new(row)
-                    .token::<JobState>("state", JobState::parse)?
-                    .transition(target)?;
-                let affected = Update::table("transfer_jobs")
-                    .set("state", target.as_str())
-                    .set("updated_at", unix_secs(at))
-                    .filter("id = ?", [Bind::Text(uuid_to_text(&id))])
-                    .execute(&mut **tx)
-                    .await?
-                    .rows_affected();
-                if affected == 0 {
-                    return Err(Error::not_found(format!("job {id} not found")));
-                }
-                let row = sqlx::query(&format!(
-                    "SELECT {JOB_COLUMNS} FROM transfer_jobs WHERE id = ?"
-                ))
-                .bind(uuid_to_text(&id))
-                .fetch_one(&mut **tx)
-                .await
-                .map_err(map_sqlx)?;
-                Self::load_one(row, &mut **tx).await
+        self.gate
+            .write_unit("job transition", |tx| {
+                Box::pin(async move {
+                    let row = sqlx::query(&format!(
+                        "SELECT {JOB_COLUMNS} FROM transfer_jobs WHERE id = ?"
+                    ))
+                    .bind(uuid_to_text(&id))
+                    .fetch_optional(&mut **tx)
+                    .await
+                    .map_err(map_sqlx)?;
+                    let row = row.ok_or_else(|| Error::not_found(format!("job {id} not found")))?;
+                    // Validate against the domain state machine before writing.
+                    RowReader::new(row)
+                        .token::<JobState>("state", JobState::parse)?
+                        .transition(target)?;
+                    let affected = Update::table("transfer_jobs")
+                        .set("state", target.as_str())
+                        .set("updated_at", unix_secs(at))
+                        .filter("id = ?", [Bind::Text(uuid_to_text(&id))])
+                        .execute(&mut **tx)
+                        .await?
+                        .rows_affected();
+                    if affected == 0 {
+                        return Err(Error::not_found(format!("job {id} not found")));
+                    }
+                    let row = sqlx::query(&format!(
+                        "SELECT {JOB_COLUMNS} FROM transfer_jobs WHERE id = ?"
+                    ))
+                    .bind(uuid_to_text(&id))
+                    .fetch_one(&mut **tx)
+                    .await
+                    .map_err(map_sqlx)?;
+                    Self::load_one(row, &mut **tx).await
+                })
             })
-        })
-        .await
+            .await
     }
 
     async fn commit_terminal(
@@ -188,50 +176,50 @@ impl JobRepository for SqliteJobRepository {
                 "settled commit needs a terminal or interrupted state",
             ));
         }
-        let _write = self.writer.acquire().await?;
         let items = items.to_vec();
-        crate::tx::atomically(&self.pool, "job terminal commit", |tx| {
-            Box::pin(async move {
-                let row = sqlx::query(&format!(
-                    "SELECT {JOB_COLUMNS} FROM transfer_jobs WHERE id = ?"
-                ))
-                .bind(uuid_to_text(&id))
-                .fetch_optional(&mut **tx)
-                .await
-                .map_err(map_sqlx)?;
-                let row = row.ok_or_else(|| Error::not_found(format!("job {id} not found")))?;
-                RowReader::new(row)
-                    .token::<JobState>("state", JobState::parse)?
-                    .transition(target)?;
-
-                sqlx::query("DELETE FROM transfer_job_items WHERE job_id = ?")
+        self.gate
+            .write_unit("job terminal commit", |tx| {
+                Box::pin(async move {
+                    let row = sqlx::query(&format!(
+                        "SELECT {JOB_COLUMNS} FROM transfer_jobs WHERE id = ?"
+                    ))
                     .bind(uuid_to_text(&id))
-                    .execute(&mut **tx)
+                    .fetch_optional(&mut **tx)
                     .await
                     .map_err(map_sqlx)?;
-                Self::insert_items(tx, id, &items).await?;
+                    let row = row.ok_or_else(|| Error::not_found(format!("job {id} not found")))?;
+                    RowReader::new(row)
+                        .token::<JobState>("state", JobState::parse)?
+                        .transition(target)?;
 
-                let affected = Update::table("transfer_jobs")
-                    .set("state", target.as_str())
-                    .set("updated_at", unix_secs(at))
-                    .filter("id = ?", [Bind::Text(uuid_to_text(&id))])
-                    .execute(&mut **tx)
-                    .await?
-                    .rows_affected();
-                if affected == 0 {
-                    return Err(Error::not_found(format!("job {id} not found")));
-                }
-                let row = sqlx::query(&format!(
-                    "SELECT {JOB_COLUMNS} FROM transfer_jobs WHERE id = ?"
-                ))
-                .bind(uuid_to_text(&id))
-                .fetch_one(&mut **tx)
-                .await
-                .map_err(map_sqlx)?;
-                Self::load_one(row, &mut **tx).await
+                    sqlx::query("DELETE FROM transfer_job_items WHERE job_id = ?")
+                        .bind(uuid_to_text(&id))
+                        .execute(&mut **tx)
+                        .await
+                        .map_err(map_sqlx)?;
+                    Self::insert_items(tx, id, &items).await?;
+
+                    let affected = Update::table("transfer_jobs")
+                        .set("state", target.as_str())
+                        .set("updated_at", unix_secs(at))
+                        .filter("id = ?", [Bind::Text(uuid_to_text(&id))])
+                        .execute(&mut **tx)
+                        .await?
+                        .rows_affected();
+                    if affected == 0 {
+                        return Err(Error::not_found(format!("job {id} not found")));
+                    }
+                    let row = sqlx::query(&format!(
+                        "SELECT {JOB_COLUMNS} FROM transfer_jobs WHERE id = ?"
+                    ))
+                    .bind(uuid_to_text(&id))
+                    .fetch_one(&mut **tx)
+                    .await
+                    .map_err(map_sqlx)?;
+                    Self::load_one(row, &mut **tx).await
+                })
             })
-        })
-        .await
+            .await
     }
 
     async fn list(&self) -> Result<Vec<Job>> {
@@ -249,10 +237,10 @@ impl JobRepository for SqliteJobRepository {
     }
 
     async fn delete(&self, id: JobId) -> Result<bool> {
-        let _write = self.writer.acquire().await?;
+        let _write = self.gate.permit().await?;
         let affected = sqlx::query("DELETE FROM transfer_jobs WHERE id = ?")
             .bind(uuid_to_text(&id))
-            .execute(&self.pool)
+            .execute(self.gate.pool())
             .await
             .map_err(map_sqlx)?
             .rows_affected();
@@ -261,20 +249,20 @@ impl JobRepository for SqliteJobRepository {
 
     /// Replace a job's item rows and persisted progress checkpoints.
     async fn replace_items(&self, id: JobId, items: &[JobItem]) -> Result<()> {
-        let _write = self.writer.acquire().await?;
         let items = items.to_vec();
-        crate::tx::atomically(&self.pool, "item update", |tx| {
-            Box::pin(async move {
-                sqlx::query("DELETE FROM transfer_job_items WHERE job_id = ?")
-                    .bind(uuid_to_text(&id))
-                    .execute(&mut **tx)
-                    .await
-                    .map_err(map_sqlx)?;
-                Self::insert_items(tx, id, &items).await?;
-                Ok(())
+        self.gate
+            .write_unit("item update", |tx| {
+                Box::pin(async move {
+                    sqlx::query("DELETE FROM transfer_job_items WHERE job_id = ?")
+                        .bind(uuid_to_text(&id))
+                        .execute(&mut **tx)
+                        .await
+                        .map_err(map_sqlx)?;
+                    Self::insert_items(tx, id, &items).await?;
+                    Ok(())
+                })
             })
-        })
-        .await
+            .await
     }
 
     /// JOB-015: jobs orphaned by a dead process are marked `interrupted` so
@@ -308,7 +296,7 @@ mod tests {
     #[tokio::test]
     async fn job_and_items_round_trip_with_transitions() {
         let db = Database::open_in_memory().await.unwrap();
-        let repo = SqliteJobRepository::new(db.pool().clone());
+        let repo = db.jobs();
         let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
 
         let mut job = Job::new(JobKind::Upload, JobId::new(), now);
@@ -386,7 +374,7 @@ mod tests {
     #[tokio::test]
     async fn stale_non_terminal_jobs_are_interrupted_via_domain_transitions() {
         let db = Database::open_in_memory().await.unwrap();
-        let repo = SqliteJobRepository::new(db.pool().clone());
+        let repo = db.jobs();
         let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
 
         let running = Job::new(JobKind::Download, JobId::new(), now);

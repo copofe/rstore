@@ -4,19 +4,19 @@
 //! concrete persistence/storage implementations. The application crate sees
 //! only `ApplicationDependencies`, so a future desktop binary can use the
 //! same core without importing SQLx or an AWS SDK.
+//!
+//! Startup has exactly two entry shapes: [`Runtime::open`] (no lock; tests and
+//! throwaway databases) and [`Runtime::open_locked`] (the full process-startup
+//! sequence every binary runs). Both assemble dependencies through the single
+//! assembly point `rstore_persistence::assemble`, which the test fixture shares.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use rstore_application::{
-    Application, ApplicationDependencies, CatalogDependencies, OutboxDispatcher,
-    RegistryDependencies, RuntimeDependencies, TransferDependencies,
-};
-use rstore_application_ports::{SecretSourceCounts, SecretSourceStats};
+use rstore_application::{Application, OutboxDispatcher};
 use rstore_domain::{Clock, Error, Result, SystemClock};
 use rstore_persistence::Database;
-use rstore_secrets::{ChainStore, EnvSecretStore, FileSecretStore, SecretStore};
+use rstore_platform::{AppDirs, AppLock, LockError};
 use rstore_storage_api::StorageFactory;
 use rstore_storage_s3::S3StorageFactory;
 use tokio::sync::broadcast;
@@ -24,26 +24,17 @@ use tokio::sync::broadcast;
 /// Inputs supplied by a binary-specific entry point.
 pub struct RuntimeConfig {
     pub db_path: PathBuf,
-    pub secrets: Arc<dyn SecretStore>,
-    pub secret_source_stats: Option<Arc<dyn SecretSourceStats>>,
     pub storage_factory: Option<Arc<dyn StorageFactory>>,
     pub clock: Arc<dyn Clock>,
 }
 
 impl RuntimeConfig {
-    pub fn new(db_path: impl Into<PathBuf>, secrets: Arc<dyn SecretStore>) -> Self {
+    pub fn new(db_path: impl Into<PathBuf>) -> Self {
         Self {
             db_path: db_path.into(),
-            secrets,
-            secret_source_stats: None,
             storage_factory: Some(Arc::new(S3StorageFactory::new())),
             clock: Arc::new(SystemClock),
         }
-    }
-
-    pub fn with_secret_source_stats(mut self, stats: Arc<dyn SecretSourceStats>) -> Self {
-        self.secret_source_stats = Some(stats);
-        self
     }
 
     pub fn with_storage_factory(mut self, factory: Arc<dyn StorageFactory>) -> Self {
@@ -57,8 +48,11 @@ impl RuntimeConfig {
     }
 }
 
-/// Concrete runtime owned by the process entry point.
+/// Concrete runtime owned by the process entry point. Holding the optional
+/// [`AppLock`] keeps the cross-process write lock (DATA-008) alive for the
+/// process lifetime; dropping the runtime releases it.
 pub struct Runtime {
+    _lock: Option<AppLock>,
     db: Database,
     application: Application,
     dispatcher: OutboxDispatcher,
@@ -66,59 +60,50 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    /// Open a runtime without taking the cross-process write lock. Intended
+    /// for tests and throwaway databases; binaries use [`Runtime::open_locked`].
     pub async fn open(config: RuntimeConfig) -> Result<Self> {
-        let secret_source_stats = config.secret_source_stats.ok_or_else(|| {
-            Error::config("no secret source inventory configured")
-                .with_context("layer", "bootstrap")
-        })?;
         let db = Database::open(&config.db_path).await?;
         let outbox = Arc::new(db.outbox());
         let dispatcher = OutboxDispatcher::new(outbox.clone());
         dispatcher.recover_processing(config.clock.now()).await?;
         let (notifications, _) = broadcast::channel(256);
-        let catalog = Arc::new(db.remote_objects());
-        let tags = Arc::new(db.tags());
-        let dependencies = ApplicationDependencies::new(
-            RegistryDependencies {
-                connections: Arc::new(db.connections()),
-                buckets: Arc::new(db.buckets()),
-                workspaces: Arc::new(db.workspaces()),
-                ignore_rules: Arc::new(db.ignore_rules()),
-                settings: Arc::new(db.settings()),
-                links: Arc::new(db.links()),
-                tags: tags.clone(),
-            },
-            CatalogDependencies {
-                catalog: catalog.clone(),
-                catalog_query: catalog,
-                index_runs: Arc::new(db.index_runs()),
-                catalog_tags: tags,
-            },
-            TransferDependencies {
-                jobs: Arc::new(db.jobs()),
-                multipart: Arc::new(db.multipart(config.clock.clone())),
-            },
-            RuntimeDependencies {
-                stats: Arc::new(db.clone()),
-                clock: config.clock,
-                secrets: config.secrets,
-                secret_source_stats,
-                storage_factory: config.storage_factory,
-                outbox: Some(outbox),
-                unit_of_work: Some(Arc::new(db.clone())),
-                repairs: Some(Arc::new(db.outbox())),
-                mutation_receipts: Some(Arc::new(db.mutation_receipts())),
-            },
-        );
+        let dependencies = rstore_persistence::assemble(&db, config.storage_factory, config.clock);
         let application = Application::from_dependencies(dependencies)
             .initialize()
             .await?;
         Ok(Self {
+            _lock: None,
             db,
             application,
             dispatcher,
             notifications,
         })
+    }
+
+    /// The full process-startup sequence (CONTEXT.md: 启动编排): create the
+    /// app directories, take the cross-process write lock (DATA-008), then
+    /// open the runtime over the resolved database path. The lock error
+    /// mapping lives here — and only here — so both entry points report the
+    /// same domain error for a busy runtime.
+    pub async fn open_locked(app_dirs: &AppDirs) -> Result<Self> {
+        app_dirs
+            .ensure_created()
+            .map_err(|error| Error::database("create data directories").with_source(error))?;
+        let lock = match AppLock::try_acquire(&app_dirs.lock_path) {
+            Ok(lock) => lock,
+            Err(LockError::Busy) => {
+                return Err(Error::lock_busy(
+                    "another rstore runtime holds the write lock",
+                ));
+            }
+            Err(LockError::Io(error)) => {
+                return Err(Error::database("acquire write lock").with_source(error));
+            }
+        };
+        let mut runtime = Self::open(RuntimeConfig::new(app_dirs.db_path.clone())).await?;
+        runtime._lock = Some(lock);
+        Ok(runtime)
     }
 
     pub fn application(&self) -> &Application {
@@ -151,48 +136,4 @@ impl Runtime {
     ) -> usize {
         self.notifications.send(notification).unwrap_or(0)
     }
-}
-
-/// Build the default CLI secret chain. The bootstrap owns the policy; callers
-/// can still inject a different `SecretStore` through `RuntimeConfig`.
-pub fn default_secret_store(config_dir: &Path) -> Arc<dyn SecretStore> {
-    Arc::new(ChainStore::new(vec![
-        Arc::new(EnvSecretStore),
-        Arc::new(FileSecretStore::new(config_dir.join("secrets.json"))),
-    ]))
-}
-
-/// The production credential-source inventory used by `doctor`. It is kept
-/// in Bootstrap next to the policy that selects the environment and file
-/// stores; the Application Core only sees the narrow stats port.
-struct DefaultSecretSourceStats {
-    env: EnvSecretStore,
-    file: FileSecretStore,
-}
-
-#[async_trait]
-impl SecretSourceStats for DefaultSecretSourceStats {
-    async fn counts(&self) -> Result<SecretSourceCounts> {
-        Ok(SecretSourceCounts {
-            env_refs: self.env.list_refs().await.unwrap_or_default().len(),
-            file_refs: self.file.list_refs().await.unwrap_or_default().len(),
-        })
-    }
-}
-
-pub fn default_secret_source_stats(config_dir: &Path) -> Arc<dyn SecretSourceStats> {
-    Arc::new(DefaultSecretSourceStats {
-        env: EnvSecretStore,
-        file: FileSecretStore::new(config_dir.join("secrets.json")),
-    })
-}
-
-/// Turn a missing runtime dependency into a stable configuration error at the
-/// composition boundary.
-pub fn require_storage_factory(
-    factory: Option<Arc<dyn StorageFactory>>,
-) -> Result<Arc<dyn StorageFactory>> {
-    factory.ok_or_else(|| {
-        Error::config("no storage adapter configured").with_context("layer", "bootstrap")
-    })
 }

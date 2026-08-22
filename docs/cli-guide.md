@@ -26,15 +26,17 @@ Bootstrap、Application API 和通知订阅的最小 Runtime 接入。这里的�
 # 注册连接（密钥推荐直接给，写入 Connection 配置；或交互提示输入）
 rstore connection add bucket_name \
   --endpoint http://localhost:9000 \
+  --public-base https://public.example.com \
+  --cdn-base https://cdn.example.com \
   --region auto \
   --access-key AK... --secret-key SK...
 
-# 验证：凭证解析、鉴权、ListBuckets 三步检查
+# 验证：检查本地凭据、鉴权、ListBuckets 三步
 rstore connection test bucket_name
 
 # 常用变体
 rstore connection list --filter prod        # 按名字/endpoint 模糊过滤
-rstore connection show bucket_name             # 看配置（永远不显示密钥）
+rstore connection show bucket_name             # 看配置（密钥仅显示脱敏首尾）
 rstore connection show bucket_name --capabilities   # 实测 list/分片/复制/预签名四项能力
 rstore connection edit bucket_name --region us-east-1
 rstore connection remove bucket_name --yes     # 只删本地注册；密钥一并清除；远端不动
@@ -42,22 +44,22 @@ rstore connection remove bucket_name --yes     # 只删本地注册；密钥一�
 
 **endpoint 细节**：
 
-- 带路径的 endpoint（如 Supabase 的 `https://<ref>.supabase.co/storage/v1/s3`）结尾的 `/` 会被自动补齐，但建议写全。
-- 部分网关要求 **path-style 寻址**：`connection add ... --addressing-style path`。症状是「连接测试通过、桶操作 404」。
+- 带路径的 endpoint（如 Supabase 的 `https://<ref>.storage.supabase.co/storage/v1/s3`）结尾的 `/` 会被自动补齐，但建议写全。
+- `addressing-style` 控制 S3 请求 URL 中桶名的位置：
+  - `auto`：交给 SDK/服务端选择；
+  - `path`：`https://endpoint/bucket/key`，Supabase 这类带路径的网关通常需要它；
+  - `virtual-host`：`https://bucket.endpoint/key`，要求 endpoint 的 DNS 和 TLS 证书支持桶名子域。
+  症状是「连接测试通过、桶操作 404」时，优先检查这里。
 - 云厂商对象存储用默认 `auto` 即可。
 
-**凭证的两种来源**（按优先级）：
+**凭证存储**：
 
-1. 环境变量，按 secret-ref 命名，支持多连接各用各的密钥：
-   ```sh
-   export RSTORE_SECRET_CONN_MY_MINIO__ACCESS_KEY='AK...'   # 双下划线
-   export RSTORE_SECRET_CONN_MY_MINIO__SECRET_KEY='SK...'
-   ```
-2. Connection 配置表（`connection add --access-key` 时写入本地 SQLite）。
-
-两者都没有时 `connection test` 会明确报缺凭证。
-
-`connection add` 时不给密钥也允许（比如打算纯用环境变量的 CI 场景），只会有个警告。
+- `connection add --access-key --secret-key` 会把凭证直接写入 Connection
+  配置表（本地 SQLite）。
+- 交互式终端省略两个参数时会隐藏提示输入；非交互或 `--json` 模式不会提示。
+- `connection show` 只显示首尾字符，中间用星号遮蔽；凭证原文不进入配置导出、
+  JSON 或日志。
+- 不给密钥也允许注册连接，但 `connection test` 和远端操作会明确报缺凭证。
 
 ### 2. 注册桶
 
@@ -244,17 +246,28 @@ rstore url media/report.pdf --signed           # 省略 --ttl 用桶的默认 TT
 
 `url` 逐条独立成败：一条引用失败不影响其余（人类输出一行一条链接，可直接管道），部分失败退出 13。
 
-**链接档案**（base 与权限都在桶上配，`bucket show` 也会显示这五项）：
+**链接配置**：连接保存 public/CDN base 的默认值，桶可以分别覆盖这两个值；权限和默认
+TTL 始终属于桶。`bucket show` 只显示每种 base 的最终配置值；继承连接默认值时，标签会
+追加 `(connection)`：
 
 ```sh
+rstore connection edit supabase \
+  --public-base https://<ref>.supabase.co/storage/v1/object/public \
+  --cdn-base https://assets.example.com
 rstore bucket link show bucket_name/media
-rstore bucket link set bucket_name/media --cdn-base https://cdn.example.com \
+rstore bucket link set bucket_name/media \
+  --public-base https://public.example.com/media \
+  --cdn-base https://cdn.example.com/media \
   --allow-presigned --default-ttl 15m
-rstore bucket link set bucket_name/media --public-base ""   # 空串清除该 base
-# 同样五个 flag 也能直接跟在 bucket edit 后面 —— 两条入口、同一条路径
+# 同样五个 bucket link flag 也能直接跟在 bucket edit 后面
 ```
 
-公开 URL 的 base 优先级：桶的 CDN base > 桶的 public base > 连接 endpoint。预签名需要桶和适配器支持，不支持时报 `capability_unsupported`（退出码 11）。
+公开 URL 的最终 base 优先级为：桶 CDN 覆盖 > 连接 CDN 默认 > 桶 public 覆盖 > 连接
+public 默认 > 连接 endpoint。rstore 不根据 provider 名称猜测或改写地址；例如 Supabase
+需要显式配置 `--public-base https://<ref>.supabase.co/storage/v1/object/public`。
+CDN base 适合填写自己的 CDN、反向代理或自定义域名。用空字符串传入 bucket 的
+`--public-base`/`--cdn-base` 可清除对应的桶级覆盖。预签名需要桶和适配器支持，不支持时报
+`capability_unsupported`（退出码 11）。
 
 ### 10. 任务管理
 
@@ -274,7 +287,7 @@ rstore task pause 2 / rstore task resume 2     # 持久化状态转移；前台�
 ### 11. 诊断、配置与迁移
 
 ```sh
-rstore doctor          # 数据库/适配器、连接数（未测计数）、凭证来源、待处理 outbox/repair、中断任务
+rstore doctor          # 数据库/适配器、连接数（未测计数）、待处理 outbox/repair、中断任务
 rstore config show     # 数据/配置/缓存/日志目录和 db 路径
 
 # 机器迁移/备份注册表（永远不含密钥）
@@ -284,7 +297,7 @@ rstore config import bundle.json --dry-run    # 预览
 rstore config import bundle.json              # 重名跳过，绝不覆盖
 ```
 
-迁移后密钥要重新录入（`connection add --access-key ...` 或环境变量）——密钥不随 bundle 走是设计行为。
+迁移后密钥要重新录入（`connection edit NAME --access-key ... --secret-key ...`）——密钥不随 bundle 走是设计行为。
 
 ### 12. 脚本化速查
 
@@ -305,18 +318,18 @@ set -e; rstore upload ...               # 部分失败退出码 13，脚本可�
 
 | 命令 | 作用 | 关键参数 |
 |---|---|---|
-| `connection add <NAME>` | 注册连接 | `--endpoint` `--region` `--addressing-style {auto,path,virtual-host}` `--access-key` `--secret-key` `--secret-ref` `--tls-verify` |
+| `connection add <NAME>` | 注册连接 | `--endpoint` `--public-base` `--cdn-base` `--region` `--addressing-style {auto,path,virtual-host}` `--access-key` `--secret-key` `--tls-verify` |
 | `connection list` | 列连接 | `--filter <子串>`（名字/endpoint，不分大小写） |
-| `connection show <REF>` | 连接详情 | 不显示密钥；`--capabilities` 实测 list/分片/复制/预签名 |
+| `connection show <REF>` | 连接详情 | 显示脱敏后的 AK/SK；`--capabilities` 实测 list/分片/复制/预签名 |
 | `connection test <REF>` | 三步探测 | `--write-test`（含写探针） |
-| `connection edit <REF>` | 改可变字段 | `--name` `--endpoint` `--region` `--addressing-style` `--secret-ref`（+重新给密钥） |
+| `connection edit <REF>` | 改可变字段 | `--name` `--endpoint` `--public-base` `--cdn-base` `--region` `--addressing-style`（+重新给密钥） |
 | `connection remove <REF>` | 删除注册 | `--yes`；连带删除该 Connection 配置中的凭证 |
 | `bucket discover <CONN>` | 列远端可见桶 | |
 | `bucket add <CONN> <NAME>` | 注册桶 | `--display-name` `--read-only` `--allow-delete` `--index-enabled` `--conflict` `--skip-verify` |
 | `bucket list` | 已注册桶 | |
-| `bucket show <REF>` / `bucket edit <REF>` | 查看/调整本地设置 | show 含链接档案；edit：`--display-name` `--read-only` `--allow-delete` `--index-enabled` `--conflict` `--concurrency` + 链接档案五 flag |
+| `bucket show <REF>` / `bucket edit <REF>` | 查看/调整本地设置 | show 含 public/CDN base（继承连接默认值时标记 connection）；edit：`--display-name` `--read-only` `--allow-delete` `--index-enabled` `--conflict` `--concurrency` + public/CDN/链接权限五 flag |
 | `bucket remove <REF>` | 删本地注册 | `--yes` |
-| `bucket link show <REF>` / `bucket link set <REF>` | 链接档案 | `--public-base` `--cdn-base` `--allow-public-url` `--allow-presigned` `--default-ttl`；只改给出的项，空串清除 base |
+| `bucket link show <REF>` / `bucket link set <REF>` | 桶链接档案 | `--public-base` `--cdn-base` `--allow-public-url` `--allow-presigned` `--default-ttl`；只改给出的项 |
 | `bucket ignore add/list/remove <REF> <DIR>` | 索引忽略目录 | |
 | `workspace create <NAME>` | 建工作区 | `--description` |
 | `workspace list/show/edit/remove` | 管理 | remove 需 `--yes` |
@@ -354,7 +367,7 @@ set -e; rstore upload ...               # 部分失败退出码 13，脚本可�
 | 内容 | 位置 |
 |---|---|
 | 连接/桶/workspace/标签定义/索引/任务 | `catalog.db`（SQLite，WAL），见 `rstore config show` |
-| 凭证 | Connection 配置表（SQLite），或环境变量覆盖 |
+| 凭证 | Connection 配置表（SQLite） |
 | 日志 | `<config>/log/`（滚动） |
 
 ### 常见问题
@@ -364,4 +377,4 @@ set -e; rstore upload ...               # 部分失败退出码 13，脚本可�
 - **非交互下删除/确认报错** → 破坏性操作加 `--yes`（含 `index rebuild`）；`ask` 冲突策略加 `--yes`（视为 overwrite）或换 `--conflict`。
 - **自签证书 / `--tls-verify=false`** → 该开关目前只存储设置、尚未接入校验器；证书仍按系统默认校验。
 - **Ctrl+C 之后** → 任务存为 interrupted，重跑原命令即续传；`task list` 可查。
-- **换机器** → `config export/import` 迁注册表，密钥重新录入。
+- **换机器** → `config export/import` 迁注册表；导出文件不含凭证，导入后重新录入密钥。

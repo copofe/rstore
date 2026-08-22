@@ -379,14 +379,33 @@ mod tests {
     use rstore_test_support::FakeStorage;
     use std::sync::Arc;
 
+    /// Real S3 minimum for non-final multipart parts — the same floor the
+    /// FakeStorage completion check enforces.
+    const PART: u64 = 5 * 1024 * 1024;
+
     fn engine(storage: Arc<FakeStorage>) -> TransferEngine {
         TransferEngine::new(
             storage,
             Arc::new(NoopMultipartStore),
             TransferConfig {
-                // Tiny thresholds so tests exercise multipart without big files.
-                multipart_threshold: 10,
-                part_size: 10,
+                // Never multipart: single-put tests stay small and fast.
+                multipart_threshold: u64::MAX,
+                part_size: PART,
+                download_chunk: 4,
+            },
+        )
+    }
+
+    fn multipart_engine(
+        storage: Arc<FakeStorage>,
+        checkpoints: Arc<dyn MultipartStore>,
+    ) -> TransferEngine {
+        TransferEngine::new(
+            storage,
+            checkpoints,
+            TransferConfig {
+                multipart_threshold: PART,
+                part_size: PART,
                 download_chunk: 4,
             },
         )
@@ -547,9 +566,11 @@ mod tests {
     #[tokio::test]
     async fn multipart_upload_assembles_object() {
         let storage = Arc::new(FakeStorage::new());
-        let engine = engine(storage.clone());
-        // 25 bytes over threshold 10 → 3 parts of ≤10 bytes.
-        let payload: Vec<u8> = (0..25u8).collect();
+        let engine = multipart_engine(storage.clone(), Arc::new(NoopMultipartStore));
+        // Two full parts plus a tail, at the real S3 part floor.
+        let payload: Vec<u8> = (0..(PART * 2 + 5) as usize)
+            .map(|i| (i % 251) as u8)
+            .collect();
         let source = temp_file("big.bin", &payload);
         let cancel = CancellationToken::new();
 
@@ -565,10 +586,10 @@ mod tests {
             .upload(&req, &rstore_transfer_sink(), &cancel)
             .await
             .unwrap();
-        assert_eq!(out.bytes, 25);
+        assert_eq!(out.bytes as usize, payload.len());
 
         let meta = storage.stat("media", &key("big.bin")).await.unwrap();
-        assert_eq!(meta.size, 25);
+        assert_eq!(meta.size as usize, payload.len());
         let body = storage.read("media", &key("big.bin"), None).await.unwrap();
         assert_eq!(&body[..], &payload[..]);
     }
@@ -579,8 +600,9 @@ mod tests {
     async fn multipart_resume_produces_byte_exact_object() {
         use std::sync::Mutex;
 
-        // 40 bytes, parts of 10 → 4 parts. Simulate a run interrupted after
-        // the first 2 parts (checkpointed in a store backed by real state).
+        // Two full parts at the real S3 floor plus a tail. Simulate a run
+        // interrupted after the first 2 parts (checkpointed in a store
+        // backed by real state).
         type StoreState = Option<(String, Vec<UploadedPart>, FileFingerprint)>;
         #[derive(Default, Clone)]
         struct SharedStore {
@@ -633,7 +655,9 @@ mod tests {
             }
         }
 
-        let payload: Vec<u8> = (0..40u8).collect();
+        let payload: Vec<u8> = (0..(PART * 2 + 1024) as usize)
+            .map(|i| (i % 251) as u8)
+            .collect();
         let source = temp_file("resume.bin", &payload);
         let fingerprint = FileFingerprint::of(&std::fs::metadata(&source).unwrap());
         let store = SharedStore::default();
@@ -648,25 +672,37 @@ mod tests {
                 UploadedPart {
                     part_number: 1,
                     etag: "etag-1".into(),
-                    size: 10,
+                    size: PART,
                 },
                 UploadedPart {
                     part_number: 2,
                     etag: "etag-2".into(),
-                    size: 10,
+                    size: PART,
                 },
             ],
             fingerprint,
         ));
-        storage.seed_part("media", "resume.bin", "upload-1", 1, &payload[0..10]);
-        storage.seed_part("media", "resume.bin", "upload-1", 2, &payload[10..20]);
+        storage.seed_part(
+            "media",
+            "resume.bin",
+            "upload-1",
+            1,
+            &payload[0..PART as usize],
+        );
+        storage.seed_part(
+            "media",
+            "resume.bin",
+            "upload-1",
+            2,
+            &payload[PART as usize..(2 * PART) as usize],
+        );
 
         let engine = TransferEngine::new(
             storage.clone(),
             Arc::new(store.clone()),
             TransferConfig {
-                multipart_threshold: 10,
-                part_size: 10,
+                multipart_threshold: PART,
+                part_size: PART,
                 download_chunk: 4,
             },
         );
@@ -687,7 +723,7 @@ mod tests {
             .read("media", &key("resume.bin"), None)
             .await
             .unwrap();
-        assert_eq!(body.len(), 40, "assembled size must be exact");
+        assert_eq!(body.len(), payload.len(), "assembled size must be exact");
         assert_eq!(&body[..], &payload[..], "resumed bytes must be byte-exact");
         assert!(
             store.state.lock().unwrap().is_none(),
@@ -741,7 +777,9 @@ mod tests {
             }
         }
 
-        let payload: Vec<u8> = (0..30u8).collect();
+        let payload: Vec<u8> = (0..(PART * 2 + 1024) as usize)
+            .map(|i| (i % 251) as u8)
+            .collect();
         let source = temp_file("changed-source.bin", &payload);
         let checkpoint = StaleCheckpoint {
             pending: Mutex::new(Some(PendingUpload {
@@ -749,10 +787,10 @@ mod tests {
                 parts: vec![UploadedPart {
                     part_number: 1,
                     etag: "old-etag".into(),
-                    size: 10,
+                    size: PART,
                 }],
                 fingerprint: FileFingerprint {
-                    size: 10,
+                    size: PART,
                     modified_ns: None,
                 },
             })),
@@ -763,15 +801,17 @@ mod tests {
             "changed-source.bin",
             "old-upload",
             1,
-            b"old-source",
+            &(0..PART as usize)
+                .map(|i| (i % 13) as u8)
+                .collect::<Vec<u8>>(),
         );
         let engine = TransferEngine::new(
             storage.clone(),
             Arc::new(checkpoint),
             TransferConfig {
-                multipart_threshold: 10,
-                part_size: 10,
-                ..TransferConfig::default()
+                multipart_threshold: PART,
+                part_size: PART,
+                download_chunk: 4,
             },
         );
         let request = UploadRequest {
@@ -924,6 +964,134 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::Cancelled);
+    }
+
+    /// A run cancelled between parts unwinds immediately and leaves the
+    /// provider upload intact — the next run adopts it instead of
+    /// restarting (the offline half of the MinIO resume claim).
+    #[tokio::test]
+    async fn midflight_cancellation_keeps_the_provider_upload_for_resume() {
+        use std::sync::Mutex;
+
+        // Cancel the run after the first checkpointed part.
+        struct CancelAfterPart {
+            parts_done: Mutex<u32>,
+            token: CancellationToken,
+        }
+
+        #[async_trait::async_trait]
+        impl MultipartStore for CancelAfterPart {
+            async fn pending(&self, _c: &str, _b: &str, _k: &str) -> Result<Option<PendingUpload>> {
+                Ok(None)
+            }
+            async fn started(
+                &self,
+                _c: &str,
+                _b: &str,
+                _k: &str,
+                _upload_id: &str,
+                _fingerprint: &FileFingerprint,
+            ) -> Result<()> {
+                Ok(())
+            }
+            async fn part_done(
+                &self,
+                _c: &str,
+                _b: &str,
+                _k: &str,
+                _part: &UploadedPart,
+            ) -> Result<()> {
+                let mut done = self.parts_done.lock().unwrap();
+                *done += 1;
+                if *done == 1 {
+                    self.token.cancel();
+                }
+                Ok(())
+            }
+            async fn cleared(&self, _c: &str, _b: &str, _k: &str) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let cancel = CancellationToken::new();
+        let storage = Arc::new(FakeStorage::new());
+        let engine = multipart_engine(
+            storage.clone(),
+            Arc::new(CancelAfterPart {
+                parts_done: Mutex::new(0),
+                token: cancel.clone(),
+            }),
+        );
+        let payload: Vec<u8> = (0..(PART * 2 + 1024) as usize)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let source = temp_file("midflight.bin", &payload);
+        let req = UploadRequest {
+            bucket: "media".into(),
+            key: ObjectPath::new("midflight.bin").unwrap(),
+            source,
+            content_type: None,
+            conflict: ConflictPolicy::Overwrite,
+            connection: "conn_nas".into(),
+        };
+
+        let error = engine
+            .upload(&req, &rstore_transfer_sink(), &cancel)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::Cancelled);
+        assert_eq!(
+            storage.active_upload_count(),
+            1,
+            "the provider upload must survive for the next run to adopt"
+        );
+    }
+
+    /// A download cancelled after a staged chunk keeps the `.part` file, so
+    /// the next run resumes from it instead of restarting.
+    #[tokio::test]
+    async fn midflight_download_cancellation_keeps_the_staged_part() {
+        let storage = Arc::new(FakeStorage::new());
+        let engine = engine(storage.clone());
+        let payload: Vec<u8> = (0..64u8).collect();
+        storage.seed("media", "doc.bin", &payload, None);
+
+        let target = std::env::temp_dir().join(format!(
+            "rstore-transfer-test-{}-midflight-dl/doc.bin",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+
+        let cancel = CancellationToken::new();
+        storage.after_read({
+            let cancel = cancel.clone();
+            move || cancel.cancel()
+        });
+
+        let dl = DownloadRequest {
+            bucket: "media".into(),
+            key: ObjectPath::new("doc.bin").unwrap(),
+            target: target.clone(),
+            conflict: ConflictPolicy::Overwrite,
+        };
+        let error = engine
+            .download(&dl, &rstore_transfer_sink(), &cancel)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Cancelled);
+        assert!(
+            crate::part_file::staged_path(&target).exists(),
+            "staged bytes must survive for the resuming run"
+        );
+
+        let resumed = engine
+            .download(&dl, &rstore_transfer_sink(), &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), payload);
+        assert!(!crate::part_file::staged_path(&target).exists());
+        let _ = resumed;
     }
 
     fn rstore_transfer_sink() -> crate::progress::NullProgressSink {

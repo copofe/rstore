@@ -8,17 +8,17 @@ use rstore_domain::policy::ConflictPolicy;
 use rstore_test_support::FakeStorageFactory;
 use rstore_transfer::CancellationToken;
 
-use rstore_application::test_util::{app_with, app_with_clock, app_with_secrets_only};
+use rstore_application::test_util::{app_with, app_with_clock, app_with_empty_registry};
 use rstore_application::{
     Application, CreateTagInput, CreateWorkspaceInput, UpdateWorkspaceInput, WorkspaceRef,
 };
 
 use rstore_application::tag::TagRef;
 
-/// A fresh app: the `conn_nas` secret is pre-stored but nothing is
-/// registered, so an imported bundle re-creates the registry from scratch.
+/// A fresh app has no registered connections, so an imported bundle recreates
+/// the registry from scratch.
 async fn app() -> Application {
-    app_with_secrets_only(&["nas"]).await
+    app_with_empty_registry().await
 }
 
 async fn seeded_app() -> Application {
@@ -682,10 +682,12 @@ async fn tag_merge_moves_associations_and_removes_source() {
 // --- config import/export (DATA-015/016) -------------------------------------
 
 #[tokio::test]
-async fn config_bundle_round_trips_without_secrets() {
+async fn config_bundle_round_trips_without_credentials() {
     let seeded = seeded_app().await;
     let bundle = seeded.api().config().transfer().export().await.unwrap();
-    assert!(bundle.connections.iter().any(|c| c.name == "nas"));
+    let exported = bundle.connections.iter().find(|c| c.name == "nas").unwrap();
+    assert!(exported.access_key.is_none());
+    assert!(exported.secret_key.is_none());
     assert!(bundle.buckets.iter().any(|b| b.name == "media"));
     // The serialised form never carries credential values (SEC-001).
     let json = serde_json::to_value(&bundle).unwrap().to_string();
@@ -724,6 +726,15 @@ async fn config_bundle_round_trips_without_secrets() {
         .unwrap();
     assert_eq!(report.connections_added, 1);
     assert_eq!(report.buckets_added, 1);
+    let imported = fresh
+        .api()
+        .registry()
+        .connections()
+        .resolve(&rstore_application::ConnectionRef::Name("nas".into()))
+        .await
+        .unwrap();
+    assert!(imported.access_key.is_none());
+    assert!(imported.secret_key.is_none());
 
     // Dry run on the now-populated app skips everything and adds nothing.
     let dry = fresh

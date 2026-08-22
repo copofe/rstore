@@ -1,7 +1,9 @@
 //! Repository contract + migration tests (QA-003 / QA-017).
 
+use rstore_application_ports::{BucketStore, ConnectionStore, TagStore, WorkspaceStore};
+use rstore_catalog::TagStore as _;
 use rstore_domain::connection::{AddressingStyle, ConnectionConfig, Region};
-use rstore_domain::{ConnectionId, ErrorCode};
+use rstore_domain::{ConnectionId, ErrorCode, Secret};
 use rstore_persistence::Database;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use time::OffsetDateTime;
@@ -12,10 +14,13 @@ fn sample(name: &str) -> ConnectionConfig {
         id: ConnectionId::new(),
         name: name.into(),
         endpoint: "https://s3.example.com".into(),
+        public_base_url: Some("https://public.example.com".into()),
+        cdn_base_url: Some("https://cdn.example.com".into()),
         region: Region::Specific("us-east-1".into()),
         addressing_style: AddressingStyle::Path,
         tls_verify: true,
-        secret_ref: Some("conn_secret_ref".into()),
+        access_key: Some(Secret::new("AK".into())),
+        secret_key: Some(Secret::new("SK".into())),
         created_at: now,
         updated_at: now,
         last_tested_at: None,
@@ -45,9 +50,18 @@ async fn connection_crud_round_trip() {
         .unwrap();
     assert_eq!(fetched.id, cfg.id);
     assert_eq!(fetched.endpoint, cfg.endpoint);
+    assert_eq!(
+        fetched.public_base_url.as_deref(),
+        Some("https://public.example.com")
+    );
+    assert_eq!(
+        fetched.cdn_base_url.as_deref(),
+        Some("https://cdn.example.com")
+    );
     assert!(matches!(&fetched.region, Region::Specific(r) if r == "us-east-1"));
     assert_eq!(fetched.addressing_style, AddressingStyle::Path);
-    assert_eq!(fetched.secret_ref.as_deref(), Some("conn_secret_ref"));
+    assert_eq!(fetched.access_key.as_ref().unwrap().expose(), "AK");
+    assert_eq!(fetched.secret_key.as_ref().unwrap().expose(), "SK");
 
     // Update mutates and persists.
     cfg.endpoint = "https://s3.new.example.com".into();
@@ -159,10 +173,12 @@ async fn legacy_migration_history_is_upgraded() {
              id TEXT PRIMARY KEY,
              name TEXT NOT NULL UNIQUE,
              endpoint TEXT NOT NULL,
+             public_base_url TEXT,
              region TEXT NOT NULL DEFAULT 'auto',
              addressing_style TEXT NOT NULL DEFAULT 'auto',
              tls_verify INTEGER NOT NULL DEFAULT 1,
-             secret_ref TEXT,
+             access_key TEXT,
+             secret_key TEXT,
              created_at INTEGER NOT NULL,
              updated_at INTEGER NOT NULL,
              last_tested_at INTEGER,

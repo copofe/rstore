@@ -19,5 +19,7 @@ pub use model::{
     guess_content_type, BucketSummary, CopyRequest, DeleteOutcome, ListOptions, ListPage,
     ObjectEntry, ObjectMetadata, PresignRequest, PresignedUrl, PutOptions, ReadRange, UploadedPart,
 };
-pub use multipart::{FileFingerprint, MultipartStore, NoopMultipartStore, PendingUpload};
+pub use multipart::{
+    FileFingerprint, MultipartSession, MultipartStore, NoopMultipartStore, PendingUpload,
+};
 pub use storage::Storage;

@@ -320,7 +320,6 @@ mod tests {
     use rstore_domain::ErrorCode;
     use rstore_domain::SystemClock;
     use rstore_persistence::Database;
-    use rstore_secrets::{put_credentials, InMemorySecretStore};
     use rstore_test_support::FakeStorageFactory;
 
     use crate::connection::{AddConnectionInput, ConnectionService as _, DefaultConnectionService};
@@ -331,25 +330,14 @@ mod tests {
         Arc<FakeStorageFactory>,
     ) {
         let db = Database::open_in_memory().await.unwrap();
-        let secrets = Arc::new(InMemorySecretStore::new());
-        put_credentials(secrets.as_ref(), "conn_nas", "AK", "SK")
-            .await
-            .unwrap();
         let factory = Arc::new(FakeStorageFactory::new());
         factory.storage().seed_bucket("media");
         factory.storage().seed_bucket("backups");
-        let gateway = RemoteGateway::new(
-            Arc::new(db.connections()),
-            secrets.clone(),
-            Some(factory.clone()),
-        );
+        let gateway = RemoteGateway::new(Arc::new(db.connections()), Some(factory.clone()));
         let buckets =
             DefaultBucketService::new(Arc::new(db.buckets()), gateway, Arc::new(SystemClock));
-        let connections = DefaultConnectionService::new(
-            Arc::new(db.connections()),
-            Arc::new(SystemClock),
-            secrets,
-        );
+        let connections =
+            DefaultConnectionService::new(Arc::new(db.connections()), Arc::new(SystemClock));
         (buckets, connections, factory)
     }
 
@@ -360,11 +348,17 @@ mod tests {
             .add(AddConnectionInput {
                 name: "nas".into(),
                 endpoint: "http://localhost:9000".into(),
+                public_base_url: None,
+                cdn_base_url: None,
                 region: rstore_domain::Region::Auto,
                 addressing_style: rstore_domain::AddressingStyle::Path,
                 tls_verify: true,
-                secret_ref: Some("conn_nas".into()),
-                credentials: None,
+                credentials: Some(rstore_domain::Secret::new(
+                    crate::connection::CredentialInput {
+                        access_key: "AK".into(),
+                        secret_key: "SK".into(),
+                    },
+                )),
             })
             .await
             .unwrap();

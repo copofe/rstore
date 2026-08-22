@@ -270,3 +270,43 @@ impl ErrorCode {
 
 /// Convenience `Result` alias for the whole core.
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `ErrorCode::as_str` and the serde representation are two spellings of
+    /// one contract (envelope `code` field ↔ exit-code mapping). The
+    /// round-trip pins them together so a variant added to one side without
+    /// the other fails here instead of in a mismatched CLI envelope.
+    #[test]
+    fn error_code_as_str_matches_the_serde_token_in_both_directions() {
+        for code in [
+            ErrorCode::Unknown,
+            ErrorCode::InvalidInput,
+            ErrorCode::Config,
+            ErrorCode::Unauthorized,
+            ErrorCode::Forbidden,
+            ErrorCode::NetworkUnreachable,
+            ErrorCode::NotFound,
+            ErrorCode::Conflict,
+            ErrorCode::Checksum,
+            ErrorCode::Database,
+            ErrorCode::CapabilityUnsupported,
+            ErrorCode::Cancelled,
+            ErrorCode::Timeout,
+            ErrorCode::LockBusy,
+            ErrorCode::DatabaseBusy,
+            ErrorCode::LocalIo,
+        ] {
+            let json = serde_json::to_string(&code).unwrap();
+            assert_eq!(
+                json,
+                format!("\"{}\"", code.as_str()),
+                "as_str must equal the serde token"
+            );
+            let back: ErrorCode = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, code);
+        }
+    }
+}

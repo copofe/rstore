@@ -5,14 +5,13 @@ use std::sync::Arc;
 
 use rstore_application::Application;
 use rstore_cli::args::{
-    Cli, Command, FilesCommand, IgnoreCommand, IndexCommand, TagCommand, WorkspaceBucketCommand,
-    WorkspaceCommand,
+    Cli, Command, FilesCommand, IgnoreCommand, IndexCommand, RemoteCommand, TagCommand,
+    WorkspaceBucketCommand, WorkspaceCommand,
 };
 use rstore_cli::output::envelope;
 use rstore_domain::connection::{AddressingStyle, Region};
 use rstore_persistence::Database;
 use rstore_platform::resolve_app_dirs;
-use rstore_secrets::{put_credentials, InMemorySecretStore};
 use rstore_test_support::{FakeStorageFactory, TestClock};
 use rstore_transfer::CancellationToken;
 use time::OffsetDateTime;
@@ -42,10 +41,6 @@ async fn run(
 }
 
 async fn catalog_app() -> (Application, Arc<FakeStorageFactory>) {
-    let secrets = Arc::new(InMemorySecretStore::new());
-    put_credentials(secrets.as_ref(), "conn_cli_catalog", "AK", "SK")
-        .await
-        .unwrap();
     let factory = Arc::new(FakeStorageFactory::new());
     factory.storage().seed_bucket("media");
     factory
@@ -57,7 +52,6 @@ async fn catalog_app() -> (Application, Arc<FakeStorageFactory>) {
     let app = rstore_application_test_support::application_from_db(
         Database::open_in_memory().await.unwrap(),
     )
-    .with_secrets(secrets)
     .with_storage_factory(factory.clone())
     .with_clock(Arc::new(TestClock::fixed(now())));
     app.api()
@@ -66,11 +60,17 @@ async fn catalog_app() -> (Application, Arc<FakeStorageFactory>) {
         .add(rstore_application::AddConnectionInput {
             name: "nas".into(),
             endpoint: "http://localhost:9000".into(),
+            public_base_url: None,
+            cdn_base_url: None,
             region: Region::Auto,
             addressing_style: AddressingStyle::Path,
             tls_verify: true,
-            secret_ref: Some("conn_cli_catalog".into()),
-            credentials: None,
+            credentials: Some(rstore_domain::Secret::new(
+                rstore_application::CredentialInput {
+                    access_key: "AK".into(),
+                    secret_key: "SK".into(),
+                },
+            )),
         })
         .await
         .unwrap();
@@ -252,6 +252,57 @@ async fn catalog_flow_snapshot() {
     let env = envelope("files.show", &out, ts);
     assert_eq!(env["data"]["state"], "confirmed");
     assert_eq!(env["data"]["tags"][0], "Important");
+}
+
+#[tokio::test]
+async fn remote_cursor_hint_round_trips_opaque_provider_token() {
+    let (app, factory) = catalog_app().await;
+    factory
+        .storage()
+        .seed("media", "a/file name with 'quote'", b"a", None);
+    factory.storage().seed("media", "a/zz.txt", b"z", None);
+
+    let first = run_ok(
+        &app,
+        Command::Remote {
+            action: RemoteCommand::Ls {
+                uri: "nas/media/a/".into(),
+                cursor: None,
+                limit: 1,
+                update_catalog: false,
+            },
+        },
+    )
+    .await;
+    let hint = first
+        .human
+        .lines()
+        .find(|line| line.contains("-- more: --cursor "))
+        .expect("a truncated remote listing prints a cursor hint");
+    let cursor = hint
+        .split_whitespace()
+        .last()
+        .expect("cursor hint has a token")
+        .to_string();
+    assert!(cursor.starts_with("rstore-token-v1:"));
+    assert_eq!(
+        first.data.as_ref().unwrap()["next_cursor"].as_str(),
+        Some(cursor.as_str())
+    );
+
+    let second = run_ok(
+        &app,
+        Command::Remote {
+            action: RemoteCommand::Ls {
+                uri: "nas/media/a/".into(),
+                cursor: Some(cursor),
+                limit: 1,
+                update_catalog: false,
+            },
+        },
+    )
+    .await;
+    assert!(second.human.contains("zz.txt"));
 }
 
 #[tokio::test]

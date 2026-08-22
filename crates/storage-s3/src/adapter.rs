@@ -14,7 +14,9 @@ use rstore_storage_api::model::{
     BucketSummary, CopyRequest, DeleteOutcome, ListOptions, ListPage, ObjectEntry, ObjectMetadata,
     PresignMethod, PresignRequest, PresignedUrl, PutOptions, ReadRange, UploadedPart,
 };
-use rstore_storage_api::Storage;
+use rstore_storage_api::{MultipartSession, Storage};
+
+use crate::multipart::S3MultipartSession;
 use time::OffsetDateTime;
 
 use crate::error::map_sdk;
@@ -85,17 +87,17 @@ impl S3Storage {
         })
     }
 
-    /// Beyond the atomic limit: `UploadPartCopy` per 5 GiB range (each part
-    /// copies provider-side), then complete. A failed part-copy aborts the
-    /// provider upload best-effort — server-side parts are cheap to redo, so
-    /// there is nothing worth resuming.
+    /// Beyond the atomic limit: one multipart session of provider-side part
+    /// copies (`UploadPartCopy` per range), then complete — the same session
+    /// protocol every other multipart upload uses. A failed part-copy
+    /// abandons the session (warn-only): server-side parts are cheap to redo,
+    /// so there is nothing worth resuming.
     async fn copy_by_parts(
         &self,
         req: &CopyRequest,
-        copy_source: &str,
         source: &ObjectMetadata,
     ) -> Result<ObjectMetadata> {
-        let upload_id = self
+        let session = self
             .create_multipart(
                 &req.target_bucket,
                 &req.target_key,
@@ -105,63 +107,48 @@ impl S3Storage {
                 },
             )
             .await?;
-        let result = self
-            .copy_parts_loop(req, copy_source, &upload_id, source.size)
-            .await;
-        let parts = match result {
-            Ok(parts) => parts,
+        let result =
+            copy_parts_loop(session.as_ref(), req, source.size, self.single_copy_limit).await;
+        match result {
+            Ok(parts) => session.complete(&parts).await,
             Err(error) => {
-                if let Err(abort_error) = self
-                    .abort_multipart(&req.target_bucket, &req.target_key, &upload_id)
-                    .await
-                {
-                    tracing::warn!(error = %abort_error, "could not abort failed copy upload");
-                }
-                return Err(error);
+                session.abandon().await;
+                Err(error)
             }
-        };
-        self.complete_multipart(&req.target_bucket, &req.target_key, &upload_id, &parts)
-            .await
-    }
-
-    async fn copy_parts_loop(
-        &self,
-        req: &CopyRequest,
-        copy_source: &str,
-        upload_id: &str,
-        size: u64,
-    ) -> Result<Vec<UploadedPart>> {
-        let mut parts = Vec::new();
-        let mut offset = 0u64;
-        let mut part_number = 1u32;
-        while offset < size {
-            let end = (offset + self.single_copy_limit).min(size);
-            let out = self
-                .client
-                .upload_part_copy()
-                .bucket(&req.target_bucket)
-                .key(req.target_key.as_str())
-                .upload_id(upload_id)
-                .part_number(part_number as i32)
-                .copy_source(copy_source)
-                .copy_source_range(format!("bytes={}-{}", offset, end - 1))
-                .send()
-                .await
-                .map_err(map_sdk)?;
-            let etag = out
-                .copy_part_result()
-                .and_then(|r| r.e_tag().map(str::to_string))
-                .ok_or_else(|| Error::unknown("provider returned no copy-part etag"))?;
-            parts.push(UploadedPart {
-                part_number,
-                etag,
-                size: end - offset,
-            });
-            offset = end;
-            part_number += 1;
         }
-        Ok(parts)
     }
+}
+
+/// The part-copy walk, expressed against the session port: offset-driven
+/// bounded ranges of the source, one `copy_part` each.
+async fn copy_parts_loop(
+    session: &dyn MultipartSession,
+    req: &CopyRequest,
+    size: u64,
+    part_size: u64,
+) -> Result<Vec<UploadedPart>> {
+    let mut parts = Vec::new();
+    let mut offset = 0u64;
+    let mut part_number = 1u32;
+    while offset < size {
+        let end = (offset + part_size).min(size);
+        parts.push(
+            session
+                .copy_part(
+                    part_number,
+                    &req.source_bucket,
+                    &req.source_key,
+                    ReadRange {
+                        start: offset,
+                        end: Some(end),
+                    },
+                )
+                .await?,
+        );
+        offset = end;
+        part_number += 1;
+    }
+    Ok(parts)
 }
 
 #[async_trait]
@@ -319,7 +306,7 @@ impl Storage for S3Storage {
     }
 
     /// Server-side copy (STORE-016): one `CopyObject` action up to S3's
-    /// 5 GiB atomic limit, an `UploadPartCopy` loop beyond it — no object
+    /// 5 GiB atomic limit, a part-copy session beyond it — no object
     /// bytes transit the local device either way. The target's metadata is
     /// derived from the caller's source stat plus the provider's copy result
     /// (which carries the new ETag and modification time but no size).
@@ -328,7 +315,7 @@ impl Storage for S3Storage {
         if source.size <= self.single_copy_limit {
             self.copy_single(req, &copy_source, source).await
         } else {
-            self.copy_by_parts(req, &copy_source, source).await
+            self.copy_by_parts(req, source).await
         }
     }
 
@@ -352,7 +339,7 @@ impl Storage for S3Storage {
         bucket: &str,
         key: &ObjectPath,
         opts: &PutOptions,
-    ) -> Result<String> {
+    ) -> Result<Box<dyn MultipartSession>> {
         let mut req = self
             .client
             .create_multipart_upload()
@@ -365,92 +352,31 @@ impl Storage for S3Storage {
             req = req.cache_control(cc);
         }
         let out = req.send().await.map_err(map_sdk)?;
-        out.upload_id
-            .ok_or_else(|| Error::unknown("provider returned no upload id"))
+        let upload_id = out
+            .upload_id
+            .ok_or_else(|| Error::unknown("provider returned no upload id"))?;
+        Ok(Box::new(S3MultipartSession::new(
+            self.client.clone(),
+            bucket,
+            key,
+            upload_id,
+        )))
     }
 
-    async fn upload_part(
+    async fn adopt_multipart(
         &self,
         bucket: &str,
         key: &ObjectPath,
         upload_id: &str,
-        part_number: u32,
-        body: Bytes,
-    ) -> Result<UploadedPart> {
-        let size = body.len() as u64;
-        let out = self
-            .client
-            .upload_part()
-            .bucket(bucket)
-            .key(key.as_str())
-            .upload_id(upload_id)
-            .part_number(part_number as i32)
-            .body(ByteStream::from(body))
-            .send()
-            .await
-            .map_err(map_sdk)?;
-        let etag = out
-            .e_tag()
-            .map(str::to_string)
-            .ok_or_else(|| Error::unknown("provider returned no part etag"))?;
-        Ok(UploadedPart {
-            part_number,
-            etag,
-            size,
-        })
+    ) -> Result<Box<dyn MultipartSession>> {
+        Ok(Box::new(S3MultipartSession::new(
+            self.client.clone(),
+            bucket,
+            key,
+            upload_id.to_owned(),
+        )))
     }
 
-    async fn complete_multipart(
-        &self,
-        bucket: &str,
-        key: &ObjectPath,
-        upload_id: &str,
-        parts: &[UploadedPart],
-    ) -> Result<ObjectMetadata> {
-        let completed: Vec<aws_sdk_s3::types::CompletedPart> = parts
-            .iter()
-            .map(|p| {
-                aws_sdk_s3::types::CompletedPart::builder()
-                    .part_number(p.part_number as i32)
-                    .e_tag(&p.etag)
-                    .build()
-            })
-            .collect();
-        let out = self
-            .client
-            .complete_multipart_upload()
-            .bucket(bucket)
-            .key(key.as_str())
-            .upload_id(upload_id)
-            .multipart_upload(
-                aws_sdk_s3::types::CompletedMultipartUpload::builder()
-                    .set_parts(Some(completed))
-                    .build(),
-            )
-            .send()
-            .await
-            .map_err(map_sdk)?;
-        let mut meta = ObjectMetadata::from_parts(
-            key.as_str(),
-            out.e_tag().map(str::to_string),
-            parts,
-            OffsetDateTime::now_utc(),
-        );
-        meta.version_id = out.version_id().map(str::to_string);
-        Ok(meta)
-    }
-
-    async fn abort_multipart(&self, bucket: &str, key: &ObjectPath, upload_id: &str) -> Result<()> {
-        self.client
-            .abort_multipart_upload()
-            .bucket(bucket)
-            .key(key.as_str())
-            .upload_id(upload_id)
-            .send()
-            .await
-            .map_err(map_sdk)?;
-        Ok(())
-    }
     /// Generate a presigned URL locally (STORE-017 / LINK-005): the request is
     /// never sent, so no credentials touch the network and the signature
     /// query stays out of logs (LINK-012).
@@ -527,7 +453,7 @@ fn to_offset(dt: &SdkDateTime) -> Result<OffsetDateTime> {
 /// The `CopySource` header value: `/{bucket}/{key}` percent-encoded as S3
 /// requires (slashes stay literal — they are the path; everything outside
 /// the unreserved set encodes, including UTF-8 bytes beyond ASCII).
-fn copy_source_header(bucket: &str, key: &str) -> String {
+pub(crate) fn copy_source_header(bucket: &str, key: &str) -> String {
     fn encode_into(out: &mut String, part: &str) {
         for byte in part.bytes() {
             match byte {

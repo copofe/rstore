@@ -121,12 +121,14 @@ pub(super) async fn bucket(
             Ok(HandlerOutput::human(human).with_data(data))
         }
         crate::args::BucketCommand::Show { reference } => {
-            let bucket = svc.resolve(&BucketRef::parse(reference)).await?;
-            let profile = app
-                .access()
-                .links()
-                .profile_for(&BucketRef::parse(reference))
+            let bucket_ref = BucketRef::parse(reference);
+            let bucket = svc.resolve(&bucket_ref).await?;
+            let connection = app
+                .registry()
+                .connections()
+                .resolve(&ConnectionRef::Id(bucket.connection_id))
                 .await?;
+            let profile = app.access().links().profile_for(&bucket_ref).await?;
             let data = serde_json::json!({
                 "bucket": super::json_value(&bucket)?,
                 "link_profile": super::json_value(&profile)?,
@@ -134,24 +136,25 @@ pub(super) async fn bucket(
             let mut fields = super::format::Fields::new();
             fields
                 .header(format!("{} (id: {})", bucket.name, bucket.id))
-                .push("connection", bucket.connection_id)
+                .push("connection", &connection.name)
                 .push(
                     "display name",
                     bucket
                         .config
                         .display_name
                         .as_deref()
-                        .unwrap_or("(bucket name)"),
+                        .unwrap_or(bucket.name.as_str()),
                 )
                 .push("read-only", bucket.config.read_only)
                 .push("allow delete", bucket.config.allow_delete)
                 .push("indexed", bucket.config.index_enabled)
                 .push("conflict", bucket.config.default_conflict.as_str());
-            push_link_profile(&mut fields, &profile);
+            push_link_profile(&mut fields, &profile, &connection);
             Ok(HandlerOutput::human(fields.render()).with_data(data))
         }
         crate::args::BucketCommand::Edit(args) => {
-            let bucket = svc.resolve(&BucketRef::parse(&args.reference)).await?;
+            let bucket_ref = BucketRef::parse(&args.reference);
+            let bucket = svc.resolve(&bucket_ref).await?;
             let input = UpdateBucketInput {
                 display_name: args.display_name.as_ref().map(|name| {
                     if name.is_empty() {
@@ -180,7 +183,7 @@ pub(super) async fn bucket(
                 Some(
                     app.access()
                         .links()
-                        .set_profile(&BucketRef::parse(&args.reference), link_input(&args.link)?)
+                        .set_profile(&bucket_ref, link_input(&args.link)?)
                         .await?,
                 )
             } else {
@@ -216,8 +219,8 @@ pub(super) async fn bucket(
     }
 }
 
-/// `bucket link show|set` — the per-bucket link profile (public/CDN bases,
-/// presign permissions, default TTL).
+/// `bucket link show|set` — the per-bucket public/CDN overrides, presign
+/// permissions, and default TTL; connection values are the defaults.
 async fn link(
     action: &crate::args::LinkProfileCommand,
     app: &rstore_application::ApplicationApi,
@@ -226,10 +229,16 @@ async fn link(
     match action {
         LinkProfileCommand::Show { bucket } => {
             let reference = rstore_application::BucketRef::parse(bucket);
+            let resolved_bucket = app.registry().buckets().resolve(&reference).await?;
+            let connection = app
+                .registry()
+                .connections()
+                .resolve(&ConnectionRef::Id(resolved_bucket.connection_id))
+                .await?;
             let profile = app.access().links().profile_for(&reference).await?;
             let data = super::json_value(&profile)?;
             let mut fields = super::format::Fields::new();
-            push_link_profile(&mut fields, &profile);
+            push_link_profile(&mut fields, &profile, &connection);
             Ok(HandlerOutput::human(fields.render()).with_data(data))
         }
         LinkProfileCommand::Set { bucket, link } => {
@@ -249,14 +258,13 @@ async fn link(
 }
 
 /// The one flags → [`rstore_application::LinkProfileInput`] translation —
-/// `bucket edit --public-base …` and `bucket link set --public-base …` are
-/// the same operation through two entrances and cannot drift apart.
+/// `bucket edit` and `bucket link set` share the same bucket link settings.
 fn link_input(
     flags: &crate::args::LinkProfileFlags,
 ) -> Result<rstore_application::LinkProfileInput, rstore_domain::Error> {
     Ok(rstore_application::LinkProfileInput {
-        public_base_url: flags.public_base.clone().filter(|s| !s.is_empty()),
-        cdn_base_url: flags.cdn_base.clone().filter(|s| !s.is_empty()),
+        public_base_url: flags.public_base.clone(),
+        cdn_base_url: flags.cdn_base.clone(),
         allow_public_url: flags.allow_public_url,
         allow_presigned: flags.allow_presigned,
         default_ttl_seconds: match &flags.default_ttl {
@@ -266,24 +274,28 @@ fn link_input(
     })
 }
 
-/// The one link-profile detail grammar — `bucket show`'s trailing block and
-/// `bucket link show` render the same five rows.
+/// Render the configured public/CDN bases. A connection default is marked in
+/// the label; a bucket override keeps the shorter base name.
 fn push_link_profile(
     fields: &mut super::format::Fields,
     profile: &rstore_domain::link::LinkProfile,
+    connection: &rstore_domain::ConnectionConfig,
 ) {
+    push_base(
+        fields,
+        "public base",
+        profile.public_base_url.as_deref(),
+        connection.public_base_url.as_deref(),
+        "(not configured; endpoint used)",
+    );
+    push_base(
+        fields,
+        "cdn base",
+        profile.cdn_base_url.as_deref(),
+        connection.cdn_base_url.as_deref(),
+        "(not configured)",
+    );
     fields
-        .push(
-            "public base",
-            profile
-                .public_base_url
-                .as_deref()
-                .unwrap_or("(derived from the connection endpoint)"),
-        )
-        .push(
-            "cdn base",
-            profile.cdn_base_url.as_deref().unwrap_or("(none)"),
-        )
         .push(
             "public urls",
             if profile.allow_public_url {
@@ -301,4 +313,24 @@ fn push_link_profile(
             },
         )
         .push("default ttl", format!("{}s", profile.default_ttl_seconds));
+}
+
+fn push_base(
+    fields: &mut super::format::Fields,
+    label: &str,
+    bucket_base: Option<&str>,
+    connection_base: Option<&str>,
+    empty_value: &str,
+) {
+    match (bucket_base, connection_base) {
+        (Some(base), _) => {
+            fields.push(label, base);
+        }
+        (None, Some(base)) => {
+            fields.push(&format!("{label} (connection)"), base);
+        }
+        (None, None) => {
+            fields.push(label, empty_value);
+        }
+    }
 }

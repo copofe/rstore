@@ -2,4 +2,3 @@
 
 pub use crate::bucket::{Bucket, BucketConfig};
 pub use crate::connection::{AddressingStyle, ConnectionConfig, ConnectionTestStatus, Region};
-pub use crate::credential::CredentialRef;

@@ -1,21 +1,20 @@
 //! Composition root for the application layer (CORE-003).
 //!
-//! Bootstrap supplies infrastructure-neutral ports, clocks, secrets and the
-//! storage factory; this module wires them into the Application Core services.
+//! Bootstrap supplies infrastructure-neutral ports, clocks and the storage
+//! factory; this module wires them into the Application Core services.
 //! The concrete S3 adapter is selected outside this crate.
 //!
 //! Wiring happens exactly once, when the raw dependencies are set (the
 //! `with_*` builder methods re-wire on their way through construction).
 //! Accessors hand out the cached handles and never re-assemble the dependency
-//! graph; callers reach services through them, not through the raw `db` /
-//! `clock` / `secrets` dependencies.
+//! graph; callers reach services through them, not through the raw database /
+//! clock dependencies.
 
 use std::sync::Arc;
 
 use rstore_catalog::{CatalogQuery, RemoteObjectRepository};
 
 use rstore_domain::{Clock, Result};
-use rstore_secrets::SecretStore;
 use rstore_storage_api::StorageFactory;
 
 use crate::bucket::DefaultBucketService;
@@ -27,20 +26,7 @@ use crate::ports::ApplicationDependencies;
 /// clone the `Arc` handle, so the dependency graph is never re-assembled.
 pub struct Application {
     dependencies: ApplicationDependencies,
-    connections: Arc<dyn crate::connection::ConnectionService>,
-    diagnostics: Arc<crate::diagnostics::ConnectionDiagnostics>,
-    buckets: Arc<dyn crate::bucket::BucketService>,
-    remote: Arc<dyn crate::remote::RemoteService>,
-    jobs: Arc<dyn crate::job::JobService>,
-    transfers: Arc<crate::transfer::DefaultTransferService>,
-    copies: Arc<crate::copy::DefaultCopyService>,
-    links: Arc<crate::link::DefaultLinkService>,
-    config_io: Arc<crate::config_bundle::DefaultConfigTransferService>,
-    workspaces: Arc<dyn crate::workspace::WorkspaceService>,
-    tags: Arc<dyn crate::tag::TagService>,
-    indexer: Arc<dyn crate::indexer::IndexService>,
-    files: Arc<dyn crate::files::FilesService>,
-    health: Arc<crate::health::HealthService>,
+    services: crate::api::Services,
 }
 
 impl Application {
@@ -57,14 +43,8 @@ impl Application {
     /// application. Keeping this separate makes construction deterministic
     /// while retaining the existing interrupted-job recovery rule.
     pub async fn initialize(self) -> Result<Self> {
-        self.jobs.mark_stale_interrupted().await?;
+        self.services.jobs.mark_stale_interrupted().await?;
         Ok(self)
-    }
-
-    /// Replace the secret store (tests / credential backends) and re-wire.
-    pub fn with_secrets(mut self, secrets: Arc<dyn SecretStore>) -> Self {
-        self.dependencies.replace_secrets(secrets);
-        self.rewire()
     }
 
     /// Attach the storage adapter factory (the binary injects the S3 one) and
@@ -96,7 +76,6 @@ impl Application {
     fn wire(dependencies: ApplicationDependencies) -> Self {
         let gateway = RemoteGateway::new(
             dependencies.registry.connections.clone(),
-            dependencies.runtime.secrets.clone(),
             dependencies.runtime.storage_factory.clone(),
         );
         let buckets: Arc<dyn crate::bucket::BucketService> = Arc::new(DefaultBucketService::new(
@@ -108,9 +87,7 @@ impl Application {
         let files_catalog = dependencies.catalog.catalog_query.clone();
         let mutations = Arc::new(crate::mutation::MutationCoordinator::new(
             dependencies.runtime.unit_of_work.clone(),
-            dependencies.runtime.outbox.clone(),
             dependencies.runtime.repairs.clone(),
-            dependencies.runtime.mutation_receipts.clone(),
             catalog.clone(),
             dependencies.catalog.catalog_tags.clone(),
             dependencies.runtime.clock.clone(),
@@ -126,11 +103,9 @@ impl Application {
             Arc::new(DefaultConnectionService::new(
                 dependencies.registry.connections.clone(),
                 dependencies.runtime.clock.clone(),
-                dependencies.runtime.secrets.clone(),
             ));
         let diagnostics = Arc::new(crate::diagnostics::ConnectionDiagnostics::new(
             dependencies.registry.connections.clone(),
-            dependencies.runtime.secrets.clone(),
             gateway.clone(),
             dependencies.registry.settings.clone(),
             dependencies.runtime.clock.clone(),
@@ -208,24 +183,27 @@ impl Application {
             dependencies.runtime.stats.clone(),
             dependencies.registry.connections.clone(),
             job_repo,
-            dependencies.runtime.secret_source_stats.clone(),
         ));
+        let repairs = dependencies.runtime.repairs.clone();
         Self {
             dependencies,
-            connections,
-            diagnostics,
-            buckets,
-            remote,
-            jobs,
-            transfers,
-            copies,
-            links,
-            config_io,
-            workspaces,
-            tags,
-            indexer,
-            files,
-            health,
+            services: crate::api::Services {
+                connections,
+                diagnostics,
+                buckets,
+                remote,
+                jobs,
+                transfers,
+                copies,
+                links,
+                config_io,
+                workspaces,
+                tags,
+                indexer,
+                files,
+                health,
+                repairs,
+            },
         }
     }
 
@@ -244,66 +222,27 @@ impl Application {
     /// Stable context-oriented application surface for CLI and desktop.
     pub fn api(&self) -> crate::api::ApplicationApi {
         crate::api::ApplicationApi::new(
-            self.connections.clone(),
-            self.buckets.clone(),
-            self.workspaces.clone(),
-            self.tags.clone(),
-            self.indexer.clone(),
-            self.files.clone(),
-            self.remote.clone(),
-            self.transfers.clone(),
-            self.copies.clone(),
-            self.links.clone(),
-            self.diagnostics.clone(),
-            self.health.clone(),
-            self.jobs.clone(),
-            self.config_io.clone(),
+            self.services.clone(),
             self.dependencies
                 .runtime
                 .storage_factory
                 .as_ref()
                 .map(|f| f.name()),
-            self.dependencies.runtime.repairs.clone(),
         )
     }
 
     #[cfg(test)]
     pub(crate) fn transfer_service(&self) -> Arc<crate::transfer::DefaultTransferService> {
-        Arc::clone(&self.transfers)
+        self.services.transfers.clone()
     }
 
     #[cfg(test)]
     pub(crate) fn copy_service(&self) -> Arc<crate::copy::DefaultCopyService> {
-        Arc::clone(&self.copies)
+        self.services.copies.clone()
     }
 
     #[cfg(test)]
     pub(crate) fn link_service(&self) -> Arc<crate::link::DefaultLinkService> {
-        Arc::clone(&self.links)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rstore_persistence::Database;
-    use rstore_secrets::{put_credentials, InMemorySecretStore};
-
-    #[tokio::test]
-    async fn builder_changes_are_visible_through_the_wired_services() {
-        // A `with_*` swap after construction must reach the cached handles:
-        // wiring is re-run, so the accessor shares the new dependency.
-        let db = Database::open_in_memory().await.unwrap();
-        let secrets = Arc::new(InMemorySecretStore::new());
-        put_credentials(secrets.as_ref(), "conn_x", "AK", "SK")
-            .await
-            .unwrap();
-        let app = crate::test_util::application_from_db(db).with_secrets(secrets);
-        let resolvable = app
-            .api()
-            .diagnostics()
-            .secret_ref_resolvable("conn_x")
-            .await;
-        assert!(resolvable);
+        self.services.links.clone()
     }
 }

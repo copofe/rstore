@@ -240,7 +240,7 @@ pub enum ConnectionCommand {
         #[arg(long, short = 'f')]
         filter: Option<String>,
     },
-    /// Show details for a connection (by name or `conn_…` id). Never prints secrets.
+    /// Show details for a connection, including masked credentials.
     Show {
         reference: String,
         /// Include the probed capability report.
@@ -273,6 +273,12 @@ pub struct ConnectionEditArgs {
     pub name: Option<String>,
     #[arg(long)]
     pub endpoint: Option<String>,
+    /// Base URL for public objects; an empty value clears it.
+    #[arg(long)]
+    pub public_base: Option<String>,
+    /// Default CDN/proxy delivery base; an empty value clears it.
+    #[arg(long)]
+    pub cdn_base: Option<String>,
     /// Region (`auto` or explicit like `us-east-1`).
     #[arg(long)]
     pub region: Option<String>,
@@ -282,10 +288,7 @@ pub struct ConnectionEditArgs {
     /// TLS certificate verification (tri-state: absent = unchanged).
     #[arg(long)]
     pub tls_verify: Option<bool>,
-    /// Reference key under which credentials are stored.
-    #[arg(long)]
-    pub secret_ref: Option<String>,
-    /// Replace stored credentials.
+    /// Replace the credentials stored on the connection.
     #[arg(long)]
     pub access_key: Option<String>,
     #[arg(long)]
@@ -297,8 +300,8 @@ pub struct ConnectionEditArgs {
 pub enum BucketCommand {
     /// List buckets visible on the remote.
     Discover { connection: String },
-    /// Show or edit the bucket's link profile (public/CDN bases,
-    /// presign permissions, default TTL).
+    /// Show or edit the bucket's link profile (public/CDN overrides, presign
+    /// permissions, default TTL).
     Link {
         #[command(subcommand)]
         action: LinkProfileCommand,
@@ -372,8 +375,8 @@ pub struct BucketEditArgs {
     /// Per-bucket transfer concurrency override; 0 clears it.
     #[arg(long)]
     pub concurrency: Option<u32>,
-    /// Link-profile flags shared with `bucket link set`; only the given
-    /// flags change.
+    /// Link-profile flags shared with `bucket link set`; only the given flags
+    /// change.
     #[command(flatten)]
     pub link: LinkProfileFlags,
 }
@@ -382,11 +385,10 @@ pub struct BucketEditArgs {
 /// one spelling of the five editable profile knobs (LKT-flags).
 #[derive(Args, Debug, Default)]
 pub struct LinkProfileFlags {
-    /// Base for public URLs (e.g. a CDN or the provider's public-object
-    /// route); an empty value clears it.
+    /// Public-object base override for this bucket; an empty value clears it.
     #[arg(long)]
     pub public_base: Option<String>,
-    /// CDN override, preferred over the public base when set.
+    /// Optional CDN/custom-domain base, preferred over the public base when set.
     #[arg(long)]
     pub cdn_base: Option<String>,
     /// Allow plain public URLs for this bucket.
@@ -418,6 +420,12 @@ pub struct ConnectionAddArgs {
     /// S3 API endpoint URL.
     #[arg(long)]
     pub endpoint: String,
+    /// Base URL for public objects; an empty value leaves it unset.
+    #[arg(long)]
+    pub public_base: Option<String>,
+    /// Default CDN/proxy delivery base; an empty value leaves it unset.
+    #[arg(long)]
+    pub cdn_base: Option<String>,
     /// Region (`auto` or an explicit region like `us-east-1`).
     #[arg(long, default_value = "auto")]
     pub region: String,
@@ -427,9 +435,6 @@ pub struct ConnectionAddArgs {
     /// Disable TLS certificate verification (not recommended).
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub tls_verify: bool,
-    /// Reference key under which credentials are stored (default: derived from the name).
-    #[arg(long)]
-    pub secret_ref: Option<String>,
     /// Access key. Prompted with hidden input on a TTY when omitted;
     /// required explicitly with `--json`.
     #[arg(long)]
@@ -519,7 +524,7 @@ pub enum TaskCommand {
 pub enum ConfigCommand {
     /// Show resolved application directories and configuration.
     Show,
-    /// Export the registry (connections + buckets, never secrets) as JSON.
+    /// Export the registry (connections + buckets, never credentials) as JSON.
     /// Prints to stdout or writes `--out`.
     Export {
         /// Write to this path instead of stdout.
@@ -527,7 +532,7 @@ pub enum ConfigCommand {
         out: Option<String>,
     },
     /// Import a previously exported bundle. Existing names are
-    /// skipped, secrets are never touched; `--dry-run` adds nothing.
+    /// skipped, stored credentials are never changed; `--dry-run` adds nothing.
     Import {
         /// Path to a bundle produced by `config export`.
         path: String,

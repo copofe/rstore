@@ -20,10 +20,19 @@ pub(super) async fn remote(
         } => {
             let shown = uri.clone();
             let uri = super::expand_remote(app, uri).await?;
-            let page = svc
-                .ls(&uri, cursor.clone(), *limit, *update_catalog)
-                .await?;
-            let data = super::json_value(&page)?;
+            let cursor = cursor
+                .as_deref()
+                .map(super::format::decode_opaque_token)
+                .transpose()?;
+            let page = svc.ls(&uri, cursor, *limit, *update_catalog).await?;
+            let next_cursor = page
+                .next_cursor
+                .as_deref()
+                .map(super::format::encode_opaque_token);
+            let mut data = super::json_value(&page)?;
+            if let Some(cursor) = &next_cursor {
+                data["next_cursor"] = serde_json::Value::String(cursor.clone());
+            }
             let mut table = super::format::Table::new(
                 &["TYPE", "SIZE", "NAME"],
                 &[
@@ -46,9 +55,7 @@ pub(super) async fn remote(
             let human = super::format::dir_listing(
                 shown.trim_end_matches('/'),
                 "  (empty)",
-                page.next_cursor
-                    .as_deref()
-                    .map(|cursor| ("--cursor", cursor)),
+                next_cursor.as_deref().map(|cursor| ("--cursor", cursor)),
                 table,
             );
             let mut out = HandlerOutput::human(human).with_data(data);

@@ -10,7 +10,6 @@ use serde_json::Value;
 use time::OffsetDateTime;
 
 use crate::contexts::BoundedContext;
-use crate::id::{BucketId, ConnectionId, JobId, RemoteObjectId, TagId, TypedId, WorkspaceId};
 use crate::locator::RemoteLocator;
 
 /// Version of the serialized domain-event payload contract.
@@ -18,77 +17,33 @@ pub const DOMAIN_EVENT_SCHEMA_VERSION: u32 = 1;
 
 /// A business fact produced by an aggregate or an application orchestration
 /// that has completed an aggregate-level mutation.
+///
+/// Variants are admitted only once a producer exists: an unwitnessed variant
+/// is dead vocabulary, so the enum currently carries exactly one fact — the
+/// durable remote-mutation completion written to the outbox alongside its
+/// receipt. Registry/catalog/job facts return with their projection
+/// consumers (the resident dispatch loop), not before.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum DomainEvent {
-    ConnectionRegistered {
-        connection_id: ConnectionId,
-    },
-    BucketUpdated {
-        bucket_id: BucketId,
-    },
-    WorkspaceBucketAdded {
-        workspace_id: WorkspaceId,
-        bucket_id: BucketId,
-    },
-    TagCreated {
-        workspace_id: WorkspaceId,
-        tag_id: TagId,
-    },
-    RemoteObjectConfirmed {
-        locator: RemoteLocator,
-        object_id: RemoteObjectId,
-    },
-    RemoteObjectTombstoned {
-        locator: RemoteLocator,
-        object_id: RemoteObjectId,
-    },
     /// Application orchestration fact for a remote mutation whose durable
     /// receipt is ready for projection/repair handling.
     RemoteMutationCompleted {
         locator: RemoteLocator,
         operation: String,
     },
-    JobStarted {
-        job_id: JobId,
-    },
-    JobInterrupted {
-        job_id: JobId,
-    },
-    JobCompleted {
-        job_id: JobId,
-    },
 }
 
 impl DomainEvent {
     pub fn context(&self) -> BoundedContext {
         match self {
-            Self::ConnectionRegistered { .. } | Self::BucketUpdated { .. } => {
-                BoundedContext::Registry
-            }
-            Self::WorkspaceBucketAdded { .. }
-            | Self::TagCreated { .. }
-            | Self::RemoteObjectConfirmed { .. }
-            | Self::RemoteObjectTombstoned { .. } => BoundedContext::Catalog,
             Self::RemoteMutationCompleted { .. } => BoundedContext::Transfer,
-            Self::JobStarted { .. } | Self::JobInterrupted { .. } | Self::JobCompleted { .. } => {
-                BoundedContext::Transfer
-            }
         }
     }
 
     pub fn event_type(&self) -> &'static str {
         match self {
-            Self::ConnectionRegistered { .. } => "connection_registered",
-            Self::BucketUpdated { .. } => "bucket_updated",
-            Self::WorkspaceBucketAdded { .. } => "workspace_bucket_added",
-            Self::TagCreated { .. } => "tag_created",
-            Self::RemoteObjectConfirmed { .. } => "remote_object_confirmed",
-            Self::RemoteObjectTombstoned { .. } => "remote_object_tombstoned",
             Self::RemoteMutationCompleted { .. } => "remote_mutation_completed",
-            Self::JobStarted { .. } => "job_started",
-            Self::JobInterrupted { .. } => "job_interrupted",
-            Self::JobCompleted { .. } => "job_completed",
         }
     }
 
@@ -115,31 +70,13 @@ impl DomainEvent {
 
     fn aggregate_type(&self) -> &'static str {
         match self {
-            Self::ConnectionRegistered { .. } => "connection",
-            Self::BucketUpdated { .. } => "bucket",
-            Self::WorkspaceBucketAdded { .. } | Self::TagCreated { .. } => "workspace",
-            Self::RemoteObjectConfirmed { .. } | Self::RemoteObjectTombstoned { .. } => {
-                "remote_object"
-            }
             Self::RemoteMutationCompleted { .. } => "remote_mutation",
-            Self::JobStarted { .. } | Self::JobInterrupted { .. } | Self::JobCompleted { .. } => {
-                "job"
-            }
         }
     }
 
     fn aggregate_id(&self) -> String {
         match self {
-            Self::ConnectionRegistered { connection_id } => connection_id.as_uuid().to_string(),
-            Self::BucketUpdated { bucket_id } => bucket_id.as_uuid().to_string(),
-            Self::WorkspaceBucketAdded { workspace_id, .. }
-            | Self::TagCreated { workspace_id, .. } => workspace_id.as_uuid().to_string(),
-            Self::RemoteObjectConfirmed { object_id, .. }
-            | Self::RemoteObjectTombstoned { object_id, .. } => object_id.as_uuid().to_string(),
             Self::RemoteMutationCompleted { locator, .. } => locator.to_string(),
-            Self::JobStarted { job_id }
-            | Self::JobInterrupted { job_id }
-            | Self::JobCompleted { job_id } => job_id.as_uuid().to_string(),
         }
     }
 }
@@ -166,15 +103,21 @@ mod tests {
 
     #[test]
     fn envelope_contains_ordering_and_context_metadata() {
-        let connection_id = ConnectionId::new();
-        let event = DomainEvent::ConnectionRegistered { connection_id };
+        let locator = RemoteLocator::new(
+            crate::id::ConnectionId::new(),
+            crate::id::BucketId::new(),
+            crate::remote::ObjectPath::new("docs/object.bin").unwrap(),
+        );
+        let event = DomainEvent::RemoteMutationCompleted {
+            locator,
+            operation: "upload".into(),
+        };
         let envelope = event.envelope(uuid::Uuid::new_v4(), 3, OffsetDateTime::UNIX_EPOCH);
 
-        assert_eq!(envelope.context, BoundedContext::Registry);
-        assert_eq!(envelope.aggregate_type, "connection");
-        assert_eq!(envelope.aggregate_id, connection_id.as_uuid().to_string());
+        assert_eq!(envelope.context, BoundedContext::Transfer);
+        assert_eq!(envelope.aggregate_type, "remote_mutation");
         assert_eq!(envelope.aggregate_version, 3);
-        assert_eq!(envelope.event_type, "connection_registered");
+        assert_eq!(envelope.event_type, "remote_mutation_completed");
         assert_eq!(envelope.schema_version, DOMAIN_EVENT_SCHEMA_VERSION);
     }
 }

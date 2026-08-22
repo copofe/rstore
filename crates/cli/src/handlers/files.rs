@@ -285,3 +285,46 @@ fn parse_sort(spec: &str) -> Result<FileSort, Error> {
     };
     Ok(FileSort { field, order })
 }
+
+// --- catalog gc (IDX-020): catalog maintenance beside index/files ---------
+
+pub(super) async fn catalog(
+    action: &crate::args::CatalogCommand,
+    app: &rstore_application::ApplicationApi,
+) -> HandlerResult {
+    match action {
+        crate::args::CatalogCommand::Gc { dry_run, retention } => {
+            let retention_override = match retention {
+                Some(raw) => Some(parse_retention(raw)?),
+                None => None,
+            };
+            let report = app
+                .catalog()
+                .indexer()
+                .gc(retention_override, *dry_run)
+                .await?;
+            let data = super::json_value(&report)?;
+            let human = format!(
+                "{} {} tombstone(s) past retention ({}s); {} retained\n",
+                if *dry_run { "would purge" } else { "purged" },
+                report.expired,
+                report.retention_seconds,
+                report.retained,
+            );
+            Ok(HandlerOutput::human(human).with_data(data))
+        }
+    }
+}
+
+/// Parse a retention span: plain seconds or `30m`/`1h`/`2d`/`1w` units,
+/// bounded to a year (the retention setting, TAG-026 — unlike presign TTLs
+/// this can far exceed seven days).
+fn parse_retention(raw: &str) -> rstore_domain::Result<u64> {
+    rstore_domain::duration::parse_span(
+        raw,
+        "smhdw",
+        365 * 86_400,
+        "retention (seconds, or 30m/1h/2d/1w)",
+        "365d",
+    )
+}

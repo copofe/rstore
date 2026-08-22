@@ -2,8 +2,7 @@
 
 use async_trait::async_trait;
 use rstore_application_ports::{
-    ConsumerCheckpoint, ConsumerCheckpointStore, OutboxEvent, OutboxStore, RemoteMutationReceipt,
-    RepairItem, RepairRepository,
+    OutboxEvent, OutboxStore, RemoteMutationReceipt, RepairItem, RepairRepository,
 };
 use rstore_domain::{Error, Result};
 use sqlx::sqlite::{SqlitePool, SqliteRow};
@@ -12,31 +11,19 @@ use time::OffsetDateTime;
 
 use crate::codec::{unix_secs, RowReader};
 use crate::error::map_sqlx;
+use crate::tx::WriteGate;
 
 const MAX_ATTEMPTS: i64 = 8;
 
 #[derive(Clone)]
 pub struct OutboxRepository {
-    pool: SqlitePool,
+    gate: WriteGate,
     read_pool: SqlitePool,
-    writer: crate::actor::SqliteWriter,
 }
 
 impl OutboxRepository {
-    pub fn new(pool: SqlitePool) -> Self {
-        Self::new_with_pools(pool.clone(), pool, crate::actor::SqliteWriter::new(64))
-    }
-
-    pub fn new_with_pools(
-        pool: SqlitePool,
-        read_pool: SqlitePool,
-        writer: crate::actor::SqliteWriter,
-    ) -> Self {
-        Self {
-            pool,
-            read_pool,
-            writer,
-        }
+    pub(crate) fn new(gate: WriteGate, read_pool: SqlitePool) -> Self {
+        Self { gate, read_pool }
     }
 
     async fn append_event(
@@ -134,115 +121,29 @@ impl OutboxRepository {
         crate::repo::receipt::insert_receipt(&mut **tx, receipt).await
     }
 
-    pub(crate) async fn append_and_repair(&self, event: &OutboxEvent, error: &str) -> Result<()> {
-        let _write = self.writer.acquire().await?;
-        let now = OffsetDateTime::now_utc();
-        let event = event.clone();
-        let error = error.to_owned();
-        crate::tx::atomically(&self.pool, "outbox repair", move |tx| {
-            Box::pin(async move {
-                Self::append_event(tx, &event).await?;
-                sqlx::query(
-                    "UPDATE outbox_events SET status = 'repair_required', last_error = ? \
-                     WHERE event_id = ?",
-                )
-                .bind(&error)
-                .bind(&event.event_id)
-                .execute(&mut **tx)
-                .await
-                .map_err(map_sqlx)?;
-                sqlx::query(
-                    "INSERT INTO repair_items \
-                     (id, event_id, kind, status, aggregate_type, aggregate_id, operation, \
-                      attempts, last_error, next_attempt_at, created_at, updated_at) \
-                     VALUES (?, ?, 'outbox_delivery', 'repair_required', ?, ?, ?, 1, ?, ?, ?, ?) \
-                     ON CONFLICT(id) DO UPDATE SET status = 'repair_required', \
-                         attempts = repair_items.attempts + 1, last_error = excluded.last_error, \
-                         next_attempt_at = excluded.next_attempt_at, updated_at = excluded.updated_at",
-                )
-                .bind(format!("repair_{}", event.event_id))
-                .bind(&event.event_id)
-                .bind(&event.aggregate_type)
-                .bind(&event.aggregate_id)
-                .bind(&event.event_type)
-                .bind(&error)
-                .bind(unix_secs(now))
-                .bind(unix_secs(now))
-                .bind(unix_secs(now))
-                .execute(&mut **tx)
-                .await
-                .map_err(map_sqlx)?;
-                Ok(())
-            })
-        })
-        .await
-    }
-
     pub(crate) async fn append_mutation(
         &self,
         receipt: &RemoteMutationReceipt,
         event: &OutboxEvent,
     ) -> Result<()> {
-        let _write = self.writer.acquire().await?;
         let receipt = receipt.clone();
         let event = event.clone();
-        crate::tx::atomically(&self.pool, "remote mutation", move |tx| {
-            Box::pin(async move {
-                Self::append_receipt(tx, &receipt).await?;
-                Self::append_event(tx, &event).await?;
-                Ok(())
+        self.gate
+            .write_unit("remote mutation", move |tx| {
+                Box::pin(async move {
+                    Self::append_receipt(tx, &receipt).await?;
+                    Self::append_event(tx, &event).await?;
+                    Ok(())
+                })
             })
-        })
-        .await
-    }
-}
-
-#[async_trait]
-impl ConsumerCheckpointStore for OutboxRepository {
-    async fn checkpoint(&self, consumer_id: &str) -> Result<Option<ConsumerCheckpoint>> {
-        let row = sqlx::query(
-            "SELECT consumer_id, last_event_id, last_event_at, updated_at \
-             FROM consumer_checkpoints WHERE consumer_id = ?",
-        )
-        .bind(consumer_id)
-        .fetch_optional(&self.read_pool)
-        .await
-        .map_err(map_sqlx)?;
-        row.map(|row| {
-            let reader = RowReader::new(row);
-            Ok(ConsumerCheckpoint {
-                consumer_id: reader.text("consumer_id")?,
-                last_event_id: reader.opt_text("last_event_id")?,
-                last_event_at: reader.opt_timestamp("last_event_at")?,
-                updated_at: reader.timestamp("updated_at")?,
-            })
-        })
-        .transpose()
-    }
-
-    async fn save_checkpoint(&self, checkpoint: &ConsumerCheckpoint) -> Result<()> {
-        let _write = self.writer.acquire().await?;
-        sqlx::query(
-            "INSERT INTO consumer_checkpoints \
-             (consumer_id, last_event_id, last_event_at, updated_at) VALUES (?, ?, ?, ?) \
-             ON CONFLICT(consumer_id) DO UPDATE SET last_event_id = excluded.last_event_id, \
-                 last_event_at = excluded.last_event_at, updated_at = excluded.updated_at",
-        )
-        .bind(&checkpoint.consumer_id)
-        .bind(&checkpoint.last_event_id)
-        .bind(checkpoint.last_event_at.map(unix_secs))
-        .bind(unix_secs(checkpoint.updated_at))
-        .execute(&self.pool)
-        .await
-        .map_err(map_sqlx)?;
-        Ok(())
+            .await
     }
 }
 
 #[async_trait]
 impl RepairRepository for OutboxRepository {
     async fn insert(&self, item: &RepairItem) -> Result<()> {
-        let _write = self.writer.acquire().await?;
+        let _write = self.gate.permit().await?;
         let now = OffsetDateTime::now_utc();
         sqlx::query(
             "INSERT INTO repair_items \
@@ -265,7 +166,7 @@ impl RepairRepository for OutboxRepository {
         .bind(unix_secs(item.next_attempt_at))
         .bind(unix_secs(now))
         .bind(unix_secs(now))
-        .execute(&self.pool)
+        .execute(self.gate.pool())
         .await
         .map_err(map_sqlx)?;
         Ok(())
@@ -276,12 +177,12 @@ impl RepairRepository for OutboxRepository {
     }
 
     async fn resolve(&self, id: &str, at: OffsetDateTime) -> Result<bool> {
-        let _write = self.writer.acquire().await?;
+        let _write = self.gate.permit().await?;
         let affected =
             sqlx::query("UPDATE repair_items SET status = 'resolved', updated_at = ? WHERE id = ?")
                 .bind(unix_secs(at))
                 .bind(id)
-                .execute(&self.pool)
+                .execute(self.gate.pool())
                 .await
                 .map_err(map_sqlx)?
                 .rows_affected();
@@ -292,84 +193,85 @@ impl RepairRepository for OutboxRepository {
 #[async_trait]
 impl OutboxStore for OutboxRepository {
     async fn append(&self, event: &OutboxEvent) -> Result<()> {
-        let _write = self.writer.acquire().await?;
         let event = event.clone();
-        crate::tx::atomically(&self.pool, "outbox append", move |tx| {
-            Box::pin(async move { Self::append_event(tx, &event).await.map(|_| ()) })
-        })
-        .await
+        self.gate
+            .write_unit("outbox append", move |tx| {
+                Box::pin(async move { Self::append_event(tx, &event).await.map(|_| ()) })
+            })
+            .await
     }
 
     async fn claim_due(&self, now: OffsetDateTime, limit: u32) -> Result<Vec<OutboxEvent>> {
-        let _write = self.writer.acquire().await?;
-        crate::tx::atomically(&self.pool, "outbox claim", move |tx| {
-            Box::pin(async move {
-                let rows = sqlx::query(
-                    "SELECT event_id, context, aggregate_type, aggregate_id, aggregate_version, \
-                            event_type, schema_version, occurred_at, payload_json, attempts \
-                     FROM outbox_events \
-                     WHERE status = 'pending' AND available_at <= ? \
-                     ORDER BY aggregate_id, aggregate_version, occurred_at, event_id LIMIT ?",
-                )
-                .bind(unix_secs(now))
-                .bind(i64::from(limit))
-                .fetch_all(&mut **tx)
-                .await
-                .map_err(map_sqlx)?;
-
-                let mut events = Vec::with_capacity(rows.len());
-                for row in rows {
-                    let mut event = row_to_event(row)?;
-                    sqlx::query(
-                        "UPDATE outbox_events SET status = 'processing', attempts = attempts + 1 \
-                         WHERE event_id = ?",
-                    )
-                    .bind(&event.event_id)
-                    .execute(&mut **tx)
-                    .await
-                    .map_err(map_sqlx)?;
-                    event.attempts = event.attempts.saturating_add(1);
-                    sqlx::query(
-                        "INSERT INTO outbox_attempts \
-                         (event_id, attempt_no, attempted_at, outcome) \
-                         SELECT event_id, attempts, ?, 'claimed' FROM outbox_events WHERE event_id = ?",
+        self.gate
+            .write_unit("outbox claim", move |tx| {
+                Box::pin(async move {
+                    let rows = sqlx::query(
+                        "SELECT event_id, context, aggregate_type, aggregate_id, aggregate_version, \
+                                event_type, schema_version, occurred_at, payload_json, attempts \
+                         FROM outbox_events \
+                         WHERE status = 'pending' AND available_at <= ? \
+                         ORDER BY aggregate_id, aggregate_version, occurred_at, event_id LIMIT ?",
                     )
                     .bind(unix_secs(now))
-                    .bind(&event.event_id)
-                    .execute(&mut **tx)
+                    .bind(i64::from(limit))
+                    .fetch_all(&mut **tx)
                     .await
                     .map_err(map_sqlx)?;
-                    events.push(event);
-                }
-                Ok(events)
+
+                    let mut events = Vec::with_capacity(rows.len());
+                    for row in rows {
+                        let mut event = row_to_event(row)?;
+                        sqlx::query(
+                            "UPDATE outbox_events SET status = 'processing', attempts = attempts + 1 \
+                             WHERE event_id = ?",
+                        )
+                        .bind(&event.event_id)
+                        .execute(&mut **tx)
+                        .await
+                        .map_err(map_sqlx)?;
+                        event.attempts = event.attempts.saturating_add(1);
+                        sqlx::query(
+                            "INSERT INTO outbox_attempts \
+                             (event_id, attempt_no, attempted_at, outcome) \
+                             SELECT event_id, attempts, ?, 'claimed' FROM outbox_events WHERE event_id = ?",
+                        )
+                        .bind(unix_secs(now))
+                        .bind(&event.event_id)
+                        .execute(&mut **tx)
+                        .await
+                        .map_err(map_sqlx)?;
+                        events.push(event);
+                    }
+                    Ok(events)
+                })
             })
-        })
-        .await
+            .await
     }
 
     async fn recover_processing(&self, now: OffsetDateTime) -> Result<u64> {
-        let _write = self.writer.acquire().await?;
+        let _write = self.gate.permit().await?;
         let affected = sqlx::query(
             "UPDATE outbox_events SET status = 'pending', available_at = ?, \
              last_error = COALESCE(last_error, 'recovered after process restart') \
              WHERE status = 'processing'",
         )
         .bind(unix_secs(now))
-        .execute(&self.pool)
+        .execute(self.gate.pool())
         .await
         .map_err(map_sqlx)?
         .rows_affected();
         Ok(affected)
     }
 
-    async fn acknowledge(&self, event_id: &str) -> Result<()> {
-        let _write = self.writer.acquire().await?;
+    async fn acknowledge(&self, event_id: &str, at: OffsetDateTime) -> Result<()> {
+        let _write = self.gate.permit().await?;
         let affected = sqlx::query(
-            "UPDATE outbox_events SET status = 'published', published_at = unixepoch(), \
+            "UPDATE outbox_events SET status = 'published', published_at = ?, \
              last_error = NULL WHERE event_id = ?",
         )
+        .bind(unix_secs(at))
         .bind(event_id)
-        .execute(&self.pool)
+        .execute(self.gate.pool())
         .await
         .map_err(map_sqlx)?
         .rows_affected();
@@ -387,59 +289,90 @@ impl OutboxStore for OutboxRepository {
         next_attempt_at: OffsetDateTime,
         error: &str,
     ) -> Result<()> {
-        let _write = self.writer.acquire().await?;
-        let row = sqlx::query(
-            "SELECT attempts, aggregate_type, aggregate_id, event_type \
-             FROM outbox_events WHERE event_id = ?",
-        )
-        .bind(event_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(map_sqlx)?
-        .ok_or_else(|| Error::not_found(format!("outbox event `{event_id}` not found")))?;
-        let attempts = row.try_get::<i64, _>("attempts").map_err(map_sqlx)?;
-        if attempts >= MAX_ATTEMPTS {
-            let event = sqlx::query(
-                "SELECT event_id, context, aggregate_type, aggregate_id, aggregate_version, \
-                        event_type, schema_version, occurred_at, payload_json, attempts \
-                 FROM outbox_events WHERE event_id = ?",
-            )
-            .bind(event_id)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(map_sqlx)?;
-            drop(_write);
-            return self.append_and_repair(&row_to_event(event)?, error).await;
-        }
-
         let event_id = event_id.to_owned();
         let error = error.to_owned();
-        crate::tx::atomically(&self.pool, "outbox retry", move |tx| {
-            Box::pin(async move {
-                sqlx::query(
-                    "UPDATE outbox_events SET status = 'pending', available_at = ?, last_error = ? \
-                     WHERE event_id = ?",
-                )
-                .bind(unix_secs(next_attempt_at))
-                .bind(&error)
-                .bind(&event_id)
-                .execute(&mut **tx)
-                .await
-                .map_err(map_sqlx)?;
-                sqlx::query(
-                    "UPDATE outbox_attempts SET outcome = 'retrying', error = ? \
-                     WHERE event_id = ? AND attempt_no = ?",
-                )
-                .bind(&error)
-                .bind(&event_id)
-                .bind(attempts)
-                .execute(&mut **tx)
-                .await
-                .map_err(map_sqlx)?;
-                Ok(())
+        self.gate
+            .write_unit("outbox retry", move |tx| {
+                Box::pin(async move {
+                    // The attempts check and the following writes share one
+                    // transaction snapshot: no other unit can interleave
+                    // between reading the counter and acting on it.
+                    let row = sqlx::query(
+                        "SELECT event_id, context, aggregate_type, aggregate_id, aggregate_version, \
+                                event_type, schema_version, occurred_at, payload_json, attempts \
+                         FROM outbox_events WHERE event_id = ?",
+                    )
+                    .bind(&event_id)
+                    .fetch_optional(&mut **tx)
+                    .await
+                    .map_err(map_sqlx)?
+                    .ok_or_else(|| {
+                        Error::not_found(format!("outbox event `{event_id}` not found"))
+                    })?;
+                    let event = row_to_event(row)?;
+                    let attempts = i64::from(event.attempts);
+                    if attempts >= MAX_ATTEMPTS {
+                        // Exhausted delivery: dead-letter the event and open a
+                        // repair item in the same unit.
+                        let now = OffsetDateTime::now_utc();
+                        Self::append_event(tx, &event).await?;
+                        sqlx::query(
+                            "UPDATE outbox_events SET status = 'repair_required', last_error = ? \
+                             WHERE event_id = ?",
+                        )
+                        .bind(&error)
+                        .bind(&event.event_id)
+                        .execute(&mut **tx)
+                        .await
+                        .map_err(map_sqlx)?;
+                        sqlx::query(
+                            "INSERT INTO repair_items \
+                             (id, event_id, kind, status, aggregate_type, aggregate_id, operation, \
+                              attempts, last_error, next_attempt_at, created_at, updated_at) \
+                             VALUES (?, ?, 'outbox_delivery', 'repair_required', ?, ?, ?, 1, ?, ?, ?, ?) \
+                             ON CONFLICT(id) DO UPDATE SET status = 'repair_required', \
+                                 attempts = repair_items.attempts + 1, last_error = excluded.last_error, \
+                                 next_attempt_at = excluded.next_attempt_at, updated_at = excluded.updated_at",
+                        )
+                        .bind(format!("repair_{}", event.event_id))
+                        .bind(&event.event_id)
+                        .bind(&event.aggregate_type)
+                        .bind(&event.aggregate_id)
+                        .bind(&event.event_type)
+                        .bind(&error)
+                        .bind(unix_secs(now))
+                        .bind(unix_secs(now))
+                        .bind(unix_secs(now))
+                        .execute(&mut **tx)
+                        .await
+                        .map_err(map_sqlx)?;
+                        return Ok(());
+                    }
+
+                    sqlx::query(
+                        "UPDATE outbox_events SET status = 'pending', available_at = ?, last_error = ? \
+                         WHERE event_id = ?",
+                    )
+                    .bind(unix_secs(next_attempt_at))
+                    .bind(&error)
+                    .bind(&event_id)
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(map_sqlx)?;
+                    sqlx::query(
+                        "UPDATE outbox_attempts SET outcome = 'retrying', error = ? \
+                         WHERE event_id = ? AND attempt_no = ?",
+                    )
+                    .bind(&error)
+                    .bind(&event_id)
+                    .bind(attempts)
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(map_sqlx)?;
+                    Ok(())
+                })
             })
-        })
-        .await
+            .await
     }
 
     async fn repairs(&self, limit: u32) -> Result<Vec<RepairItem>> {
@@ -525,7 +458,10 @@ mod tests {
         let mut claimed_item = item.clone();
         claimed_item.attempts = 1;
         assert_eq!(claimed, vec![claimed_item]);
-        outbox.acknowledge("evt-1").await.unwrap();
+        outbox
+            .acknowledge("evt-1", OffsetDateTime::UNIX_EPOCH)
+            .await
+            .unwrap();
         assert!(outbox
             .claim_due(OffsetDateTime::UNIX_EPOCH, 10)
             .await
@@ -537,14 +473,17 @@ mod tests {
     #[tokio::test]
     async fn failed_outbox_unit_rolls_back_event_and_aggregate_version() {
         let db = Database::open_in_memory().await.unwrap();
+        let outbox = db.outbox();
         let item = event("evt-rollback");
-        let result: Result<()> = crate::tx::atomically(db.pool(), "outbox test", |tx| {
-            Box::pin(async move {
-                OutboxRepository::append_event(tx, &item).await?;
-                Err(Error::conflict("force outbox rollback"))
+        let result: Result<()> = outbox
+            .gate
+            .write_unit("outbox test", |tx| {
+                Box::pin(async move {
+                    OutboxRepository::append_event(tx, &item).await?;
+                    Err(Error::conflict("force outbox rollback"))
+                })
             })
-        })
-        .await;
+            .await;
 
         assert_eq!(result.unwrap_err().code, rstore_domain::ErrorCode::Conflict);
         let event_count: i64 = sqlx::query_scalar(

@@ -7,6 +7,12 @@ use crate::output::HandlerOutput;
 use rstore_application::{AddConnectionInput, ConnectionRef, UpdateConnectionInput};
 use rstore_domain::connection::{AddressingStyle, Region};
 
+fn masked_credential(value: Option<&rstore_domain::Secret<String>>) -> String {
+    value
+        .map(|secret| rstore_domain::mask_secret(secret.expose()))
+        .unwrap_or_else(|| "(none)".to_string())
+}
+
 // --- connection -----------------------------------------------------------
 
 pub(super) async fn connection(
@@ -20,30 +26,21 @@ pub(super) async fn connection(
             let credentials = read_credential_input(args, session)?;
             let mut warnings = Vec::new();
             if credentials.is_none() {
-                // Only warn when the credential chain cannot resolve the
-                // reference either (env vars may already carry it).
-                let secret_ref = args
-                    .secret_ref
-                    .clone()
-                    .unwrap_or_else(|| rstore_secrets::default_secret_ref(&args.name));
-                let resolvable = app.diagnostics().secret_ref_resolvable(&secret_ref).await;
-                if !resolvable {
-                    warnings.push(
-                        "no credentials provided; remote operations will fail until they are set \
-                         (re-add with --access-key/--secret-key, `connection edit`, or export \
-                         RSTORE_SECRET_* variables)"
-                            .to_string(),
-                    );
-                }
+                warnings.push(
+                    "no credentials provided; remote operations will fail until they are set \
+                     with --access-key/--secret-key or `connection edit`"
+                        .to_string(),
+                );
             }
             let config = svc
                 .add(AddConnectionInput {
                     name: args.name.clone(),
                     endpoint: args.endpoint.clone(),
+                    public_base_url: args.public_base.clone(),
+                    cdn_base_url: args.cdn_base.clone(),
                     region: Region::parse_token(&args.region),
                     addressing_style: AddressingStyle::parse(&args.addressing_style)?,
                     tls_verify: args.tls_verify,
-                    secret_ref: args.secret_ref.clone(),
                     credentials,
                 })
                 .await?;
@@ -93,18 +90,28 @@ pub(super) async fn connection(
             reference,
             capabilities,
         } => {
-            let config = svc.resolve(&ConnectionRef::parse(reference)).await?;
+            let reference = ConnectionRef::parse(reference);
+            let config = svc.resolve(&reference).await?;
             let capability_report = if *capabilities {
-                Some(
-                    app.diagnostics()
-                        .capabilities(&ConnectionRef::parse(reference))
-                        .await?,
-                )
+                Some(app.diagnostics().capabilities(&reference).await?)
             } else {
                 None
             };
+            let access_key = masked_credential(config.access_key.as_ref());
+            let secret_key = masked_credential(config.secret_key.as_ref());
+            let mut data = super::json_value(&config)?;
+            if let serde_json::Value::Object(fields) = &mut data {
+                fields.insert(
+                    "access_key".into(),
+                    serde_json::Value::String(access_key.clone()),
+                );
+                fields.insert(
+                    "secret_key".into(),
+                    serde_json::Value::String(secret_key.clone()),
+                );
+            }
             let data = super::merge_field(
-                super::json_value(&config)?,
+                data,
                 "capabilities",
                 capability_report
                     .as_ref()
@@ -116,17 +123,22 @@ pub(super) async fn connection(
                 .header(&config.name)
                 .push("id", config.id)
                 .push("endpoint", &config.endpoint)
+                .push(
+                    "public base",
+                    config
+                        .public_base_url
+                        .as_deref()
+                        .unwrap_or("(not configured)"),
+                )
+                .push(
+                    "cdn base",
+                    config.cdn_base_url.as_deref().unwrap_or("(not configured)"),
+                )
                 .push("region", config.region.as_token())
                 .push("addressing", config.addressing_style.as_str())
                 .push("tls verify", config.tls_verify)
-                .push(
-                    "secret ref",
-                    config
-                        .secret_ref
-                        .as_ref()
-                        .map(rstore_domain::CredentialRef::as_str)
-                        .unwrap_or("(none)"),
-                )
+                .push("access key", access_key)
+                .push("secret key", secret_key)
                 .push("last tested", {
                     match (config.last_tested_at, config.last_test_status) {
                         (Some(at), Some(status)) => {
@@ -199,13 +211,14 @@ pub(super) async fn connection(
             let input = UpdateConnectionInput {
                 name: args.name.clone(),
                 endpoint: args.endpoint.clone(),
+                public_base_url: args.public_base.clone(),
+                cdn_base_url: args.cdn_base.clone(),
                 region: args.region.as_deref().map(Region::parse_token),
                 addressing_style: match &args.addressing_style {
                     Some(token) => Some(AddressingStyle::parse(token)?),
                     None => None,
                 },
                 tls_verify: args.tls_verify,
-                secret_ref: args.secret_ref.clone(),
                 credentials,
             };
             let config = svc.update(existing.id, input).await?;

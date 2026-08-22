@@ -23,6 +23,33 @@ use crate::workspace::WorkspaceService;
 use rstore_application_ports::RepairRepository;
 use rstore_domain::Result;
 
+/// Every wired service handle in one bundle.
+///
+/// Adding a service touches exactly three places: a field here, its
+/// construction in `app::wire`, and the group struct that exposes it —
+/// instead of also threading it through a positional constructor and a
+/// re-listing `api()` call.
+#[derive(Clone)]
+pub(crate) struct Services {
+    pub(crate) connections: Arc<dyn ConnectionService>,
+    pub(crate) diagnostics: Arc<ConnectionDiagnostics>,
+    pub(crate) buckets: Arc<dyn BucketService>,
+    pub(crate) remote: Arc<dyn RemoteService>,
+    pub(crate) jobs: Arc<dyn JobService>,
+    pub(crate) transfers: Arc<DefaultTransferService>,
+    pub(crate) copies: Arc<DefaultCopyService>,
+    pub(crate) links: Arc<DefaultLinkService>,
+    pub(crate) config_io: Arc<DefaultConfigTransferService>,
+    pub(crate) workspaces: Arc<dyn WorkspaceService>,
+    pub(crate) tags: Arc<dyn TagService>,
+    pub(crate) indexer: Arc<dyn IndexService>,
+    pub(crate) files: Arc<dyn FilesService>,
+    pub(crate) health: Arc<HealthService>,
+    pub(crate) repairs: Arc<dyn RepairRepository>,
+}
+
+/// How many repair items `JobApi::pending_repairs` surfaces per query.
+const PENDING_REPAIRS_LIMIT: u32 = 100;
 #[derive(Clone)]
 pub struct ApplicationApi {
     registry: RegistryApi,
@@ -35,50 +62,39 @@ pub struct ApplicationApi {
 }
 
 impl ApplicationApi {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        connections: Arc<dyn ConnectionService>,
-        buckets: Arc<dyn BucketService>,
-        workspaces: Arc<dyn WorkspaceService>,
-        tags: Arc<dyn TagService>,
-        indexer: Arc<dyn IndexService>,
-        files: Arc<dyn FilesService>,
-        remote: Arc<dyn RemoteService>,
-        transfers: Arc<DefaultTransferService>,
-        copies: Arc<DefaultCopyService>,
-        links: Arc<DefaultLinkService>,
-        diagnostics: Arc<ConnectionDiagnostics>,
-        health: Arc<HealthService>,
-        jobs: Arc<dyn JobService>,
-        config_io: Arc<DefaultConfigTransferService>,
-        storage_adapter: Option<&'static str>,
-        repairs: Option<Arc<dyn RepairRepository>>,
-    ) -> Self {
+    pub(crate) fn new(services: Services, storage_adapter: Option<&'static str>) -> Self {
         Self {
             registry: RegistryApi {
-                connections,
-                buckets: buckets.clone(),
+                connections: services.connections.clone(),
+                buckets: services.buckets.clone(),
             },
             catalog: CatalogApi {
-                workspaces,
-                tags,
-                indexer,
-                files,
+                workspaces: services.workspaces.clone(),
+                tags: services.tags.clone(),
+                indexer: services.indexer.clone(),
+                files: services.files.clone(),
             },
             transfer: TransferApi {
-                buckets: buckets.clone(),
-                remote,
-                transfers,
-                copies,
+                remote: services.remote.clone(),
+                transfers: services.transfers.clone(),
+                copies: services.copies.clone(),
+                buckets: services.buckets.clone(),
             },
-            access: AccessApi { links },
+            access: AccessApi {
+                links: services.links.clone(),
+            },
             diagnostics: DiagnosticsApi {
-                diagnostics,
-                health,
+                diagnostics: services.diagnostics.clone(),
+                health: services.health.clone(),
                 storage_adapter,
             },
-            jobs: JobApi { jobs, repairs },
-            config: ConfigApi { config_io },
+            jobs: JobApi {
+                jobs: services.jobs.clone(),
+                repairs: services.repairs.clone(),
+            },
+            config: ConfigApi {
+                config_io: services.config_io.clone(),
+            },
         }
     }
 
@@ -266,20 +282,12 @@ pub struct DiagnosticsApi {
 }
 
 impl DiagnosticsApi {
-    pub fn connections(&self) -> Arc<ConnectionDiagnostics> {
-        self.diagnostics.clone()
-    }
-
     pub fn health(&self) -> Arc<HealthService> {
         self.health.clone()
     }
 
     pub fn storage_adapter(&self) -> Option<&'static str> {
         self.storage_adapter
-    }
-
-    pub async fn secret_ref_resolvable(&self, secret_ref: &str) -> bool {
-        self.diagnostics.secret_ref_resolvable(secret_ref).await
     }
 
     pub async fn capabilities(
@@ -301,7 +309,7 @@ impl DiagnosticsApi {
 #[derive(Clone)]
 pub struct JobApi {
     jobs: Arc<dyn JobService>,
-    repairs: Option<Arc<dyn RepairRepository>>,
+    repairs: Arc<dyn RepairRepository>,
 }
 
 impl JobApi {
@@ -334,10 +342,9 @@ impl JobApi {
     }
 
     pub async fn pending_repairs(&self) -> Result<Vec<rstore_application_ports::RepairItem>> {
-        match &self.repairs {
-            Some(repairs) => repairs.list(100).await,
-            None => Ok(Vec::new()),
-        }
+        // Bounded so `task list` cannot stream an unbounded repair log; the
+        // full log stays queryable through `doctor`/repair tooling.
+        self.repairs.list(PENDING_REPAIRS_LIMIT).await
     }
 }
 

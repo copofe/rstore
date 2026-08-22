@@ -1,8 +1,9 @@
 //! Repository for index runs, scan checkpoints and catalog revisions (IDX-).
 
+use async_trait::async_trait;
 use std::str::FromStr;
 
-use rstore_application_ports::{IndexPageCommit, IndexRunCommit};
+use rstore_application_ports::{IndexCheckpoint, IndexPageCommit, IndexRunCommit, IndexRunStore};
 use rstore_domain::id::{BucketId, IndexRunId};
 use rstore_domain::workspace::{IndexRun, IndexRunState};
 use rstore_domain::{Error, Result};
@@ -12,40 +13,24 @@ use time::OffsetDateTime;
 
 use crate::codec::{unix_secs, uuid_to_text, Bind, Insert, RowReader, Update};
 use crate::error::map_sqlx;
-
-/// A persisted scan cursor (IDX-002/006): where a paged listing left off.
-#[derive(Debug, Clone)]
-pub struct ScanCheckpoint {
-    pub continuation_token: Option<String>,
-    pub updated_at: OffsetDateTime,
-}
+use crate::tx::WriteGate;
 
 #[derive(Clone)]
 pub struct IndexRunRepository {
-    pool: SqlitePool,
+    gate: WriteGate,
     read_pool: SqlitePool,
-    writer: crate::actor::SqliteWriter,
 }
 
 impl IndexRunRepository {
-    pub fn new(pool: SqlitePool) -> Self {
-        Self::new_with_pools(pool.clone(), pool, crate::actor::SqliteWriter::new(64))
+    pub(crate) fn new(gate: WriteGate, read_pool: SqlitePool) -> Self {
+        Self { gate, read_pool }
     }
+}
 
-    pub fn new_with_pools(
-        pool: SqlitePool,
-        read_pool: SqlitePool,
-        writer: crate::actor::SqliteWriter,
-    ) -> Self {
-        Self {
-            pool,
-            read_pool,
-            writer,
-        }
-    }
-
-    pub async fn create(&self, run: &IndexRun) -> Result<()> {
-        let _write = self.writer.acquire().await?;
+#[async_trait]
+impl IndexRunStore for IndexRunRepository {
+    async fn create(&self, run: &IndexRun) -> Result<()> {
+        let _write = self.gate.permit().await?;
         Insert::into("index_runs")
             .column("id", run.id.to_string())
             .column("bucket_id", uuid_to_text(&run.bucket_id))
@@ -54,13 +39,13 @@ impl IndexRunRepository {
             .column("finished_at", run.finished_at.map(unix_secs))
             .column("objects_seen", run.objects_seen as i64)
             .column("error_count", run.error_count as i64)
-            .execute(&self.pool)
+            .execute(self.gate.pool())
             .await?;
         Ok(())
     }
 
     /// Apply a state transition and/or progress counters (IDX-005).
-    pub async fn update(
+    async fn update(
         &self,
         id: IndexRunId,
         state: Option<IndexRunState>,
@@ -68,7 +53,7 @@ impl IndexRunRepository {
         objects_seen: u64,
         error_count: u64,
     ) -> Result<()> {
-        let _write = self.writer.acquire().await?;
+        let _write = self.gate.permit().await?;
         Update::table("index_runs")
             .set_sql("state = COALESCE(?, state)", state.map(|s| s.as_str()))
             .set_sql(
@@ -78,12 +63,12 @@ impl IndexRunRepository {
             .set("objects_seen", objects_seen as i64)
             .set("error_count", error_count as i64)
             .filter("id = ?", [Bind::Text(id.to_string())])
-            .execute(&self.pool)
+            .execute(self.gate.pool())
             .await?;
         Ok(())
     }
 
-    pub async fn get(&self, id: IndexRunId) -> Result<Option<IndexRun>> {
+    async fn get(&self, id: IndexRunId) -> Result<Option<IndexRun>> {
         let row = sqlx::query(
             "SELECT id, bucket_id, state, started_at, finished_at, objects_seen, error_count \
              FROM index_runs WHERE id = ?",
@@ -96,7 +81,7 @@ impl IndexRunRepository {
     }
 
     /// The most recent run per bucket (IDX-014).
-    pub async fn latest_per_bucket(&self) -> Result<Vec<IndexRun>> {
+    async fn latest_per_bucket(&self) -> Result<Vec<IndexRun>> {
         let rows = sqlx::query(
             "SELECT id, bucket_id, state, started_at, finished_at, objects_seen, error_count \
              FROM index_runs ir \
@@ -112,7 +97,7 @@ impl IndexRunRepository {
     }
 
     /// Load the scan cursor for a bucket (IDX-007: resume from it).
-    pub async fn checkpoint(&self, bucket: BucketId) -> Result<Option<ScanCheckpoint>> {
+    async fn checkpoint(&self, bucket: BucketId) -> Result<Option<IndexCheckpoint>> {
         let row = sqlx::query(
             "SELECT continuation_token, updated_at FROM index_checkpoints WHERE bucket_id = ?",
         )
@@ -122,7 +107,7 @@ impl IndexRunRepository {
         .map_err(map_sqlx)?;
         row.map(|r| {
             let reader = RowReader::new(r);
-            Ok(ScanCheckpoint {
+            Ok(IndexCheckpoint {
                 continuation_token: reader.opt_text("continuation_token")?,
                 updated_at: reader.timestamp("updated_at")?,
             })
@@ -130,13 +115,13 @@ impl IndexRunRepository {
         .transpose()
     }
 
-    pub async fn save_checkpoint(
+    async fn save_checkpoint(
         &self,
         bucket: BucketId,
         token: Option<&str>,
         at: OffsetDateTime,
     ) -> Result<()> {
-        let _write = self.writer.acquire().await?;
+        let _write = self.gate.permit().await?;
         Insert::into("index_checkpoints")
             .column("bucket_id", uuid_to_text(&bucket))
             .column("continuation_token", token)
@@ -146,7 +131,7 @@ impl IndexRunRepository {
                  continuation_token = excluded.continuation_token, \
                  updated_at = excluded.updated_at",
             )
-            .execute(&self.pool)
+            .execute(self.gate.pool())
             .await?;
         Ok(())
     }
@@ -154,8 +139,7 @@ impl IndexRunRepository {
     /// Publish one remote page, its resume cursor and run counters together.
     /// The catalog row writes use this repository's transaction so a reader
     /// never observes a page without the progress that acknowledges it.
-    pub async fn publish_page(&self, commit: &IndexPageCommit) -> Result<()> {
-        let _write = self.writer.acquire().await?;
+    async fn publish_page(&self, commit: &IndexPageCommit) -> Result<()> {
         let objects = commit.objects.clone();
         let run = commit.run;
         let bucket = commit.bucket;
@@ -163,61 +147,61 @@ impl IndexRunRepository {
         let at = commit.at;
         let objects_seen = commit.objects_seen;
         let error_count = commit.error_count;
-        crate::tx::atomically(&self.pool, "index page", |tx| {
-            Box::pin(async move {
-                for object in &objects {
-                    super::remote_object::SqliteRemoteObjectRepository::upsert_with_executor(
-                        &mut **tx, object,
-                    )
-                    .await?;
-                }
-                if let Some(token) = token {
-                    Insert::into("index_checkpoints")
-                        .column("bucket_id", uuid_to_text(&bucket))
-                        .column("continuation_token", token)
-                        .column("updated_at", unix_secs(at))
-                        .suffix(
-                            "ON CONFLICT(bucket_id) DO UPDATE SET \
-                             continuation_token = excluded.continuation_token, \
-                             updated_at = excluded.updated_at",
+        self.gate
+            .write_unit("index page", |tx| {
+                Box::pin(async move {
+                    for object in &objects {
+                        super::remote_object::SqliteRemoteObjectRepository::upsert_with_executor(
+                            &mut **tx, object,
                         )
+                        .await?;
+                    }
+                    if let Some(token) = token {
+                        Insert::into("index_checkpoints")
+                            .column("bucket_id", uuid_to_text(&bucket))
+                            .column("continuation_token", token)
+                            .column("updated_at", unix_secs(at))
+                            .suffix(
+                                "ON CONFLICT(bucket_id) DO UPDATE SET \
+                                 continuation_token = excluded.continuation_token, \
+                                 updated_at = excluded.updated_at",
+                            )
+                            .execute(&mut **tx)
+                            .await?;
+                    } else {
+                        sqlx::query("DELETE FROM index_checkpoints WHERE bucket_id = ?")
+                            .bind(uuid_to_text(&bucket))
+                            .execute(&mut **tx)
+                            .await
+                            .map_err(map_sqlx)?;
+                    }
+                    let result = Update::table("index_runs")
+                        .set("objects_seen", objects_seen as i64)
+                        .set("error_count", error_count as i64)
+                        .filter("id = ?", [Bind::Text(run.to_string())])
                         .execute(&mut **tx)
                         .await?;
-                } else {
-                    sqlx::query("DELETE FROM index_checkpoints WHERE bucket_id = ?")
-                        .bind(uuid_to_text(&bucket))
-                        .execute(&mut **tx)
-                        .await
-                        .map_err(map_sqlx)?;
-                }
-                let result = Update::table("index_runs")
-                    .set("objects_seen", objects_seen as i64)
-                    .set("error_count", error_count as i64)
-                    .filter("id = ?", [Bind::Text(run.to_string())])
-                    .execute(&mut **tx)
-                    .await?;
-                if result.rows_affected() == 0 {
-                    return Err(Error::not_found(format!("index run {run} not found")));
-                }
-                Ok(())
+                    if result.rows_affected() == 0 {
+                        return Err(Error::not_found(format!("index run {run} not found")));
+                    }
+                    Ok(())
+                })
             })
-        })
-        .await
+            .await
     }
 
-    pub async fn clear_checkpoint(&self, bucket: BucketId) -> Result<()> {
-        let _write = self.writer.acquire().await?;
+    async fn clear_checkpoint(&self, bucket: BucketId) -> Result<()> {
+        let _write = self.gate.permit().await?;
         sqlx::query("DELETE FROM index_checkpoints WHERE bucket_id = ?")
             .bind(uuid_to_text(&bucket))
-            .execute(&self.pool)
+            .execute(self.gate.pool())
             .await
             .map_err(map_sqlx)?;
         Ok(())
     }
 
     /// Commit the run state and, on success, the catalog revision together.
-    pub async fn finish(&self, commit: &IndexRunCommit) -> Result<Option<i64>> {
-        let _write = self.writer.acquire().await?;
+    async fn finish(&self, commit: &IndexRunCommit) -> Result<Option<i64>> {
         let run = commit.run;
         let bucket = commit.bucket;
         let state = commit.state;
@@ -225,48 +209,50 @@ impl IndexRunRepository {
         let objects_seen = commit.objects_seen;
         let error_count = commit.error_count;
         let at = commit.at;
-        crate::tx::atomically(&self.pool, "index run finish", |tx| {
-            Box::pin(async move {
-                let result = Update::table("index_runs")
-                    .set("state", state.as_str())
-                    .set_sql(
-                        "finished_at = COALESCE(?, finished_at)",
-                        finished_at.map(unix_secs),
-                    )
-                    .set("objects_seen", objects_seen as i64)
-                    .set("error_count", error_count as i64)
-                    .filter("id = ?", [Bind::Text(run.to_string())])
-                    .execute(&mut **tx)
-                    .await?;
-                if result.rows_affected() == 0 {
-                    return Err(Error::not_found(format!("index run {run} not found")));
-                }
-                if state != IndexRunState::Succeeded {
-                    return Ok(None);
-                }
+        self.gate
+            .write_unit("index run finish", |tx| {
+                Box::pin(async move {
+                    let result = Update::table("index_runs")
+                        .set("state", state.as_str())
+                        .set_sql(
+                            "finished_at = COALESCE(?, finished_at)",
+                            finished_at.map(unix_secs),
+                        )
+                        .set("objects_seen", objects_seen as i64)
+                        .set("error_count", error_count as i64)
+                        .filter("id = ?", [Bind::Text(run.to_string())])
+                        .execute(&mut **tx)
+                        .await?;
+                    if result.rows_affected() == 0 {
+                        return Err(Error::not_found(format!("index run {run} not found")));
+                    }
+                    if state != IndexRunState::Succeeded {
+                        return Ok(None);
+                    }
 
-                Insert::into("catalog_revisions")
-                    .column("bucket_id", uuid_to_text(&bucket))
-                    .column("revision", 1_i64)
-                    .column("last_refreshed_at", unix_secs(at))
-                    .suffix(
-                        "ON CONFLICT(bucket_id) DO UPDATE SET revision = revision + 1, \
-                         last_refreshed_at = excluded.last_refreshed_at",
-                    )
-                    .execute(&mut **tx)
-                    .await?;
-                let row = sqlx::query("SELECT revision FROM catalog_revisions WHERE bucket_id = ?")
-                    .bind(uuid_to_text(&bucket))
-                    .fetch_one(&mut **tx)
-                    .await
-                    .map_err(map_sqlx)?;
-                Ok(Some(row.get::<i64, _>(0)))
+                    Insert::into("catalog_revisions")
+                        .column("bucket_id", uuid_to_text(&bucket))
+                        .column("revision", 1_i64)
+                        .column("last_refreshed_at", unix_secs(at))
+                        .suffix(
+                            "ON CONFLICT(bucket_id) DO UPDATE SET revision = revision + 1, \
+                             last_refreshed_at = excluded.last_refreshed_at",
+                        )
+                        .execute(&mut **tx)
+                        .await?;
+                    let row =
+                        sqlx::query("SELECT revision FROM catalog_revisions WHERE bucket_id = ?")
+                            .bind(uuid_to_text(&bucket))
+                            .fetch_one(&mut **tx)
+                            .await
+                            .map_err(map_sqlx)?;
+                    Ok(Some(row.get::<i64, _>(0)))
+                })
             })
-        })
-        .await
+            .await
     }
 
-    pub async fn revision(&self, bucket: BucketId) -> Result<Option<(i64, OffsetDateTime)>> {
+    async fn revision(&self, bucket: BucketId) -> Result<Option<(i64, OffsetDateTime)>> {
         let row = sqlx::query(
             "SELECT revision, last_refreshed_at FROM catalog_revisions WHERE bucket_id = ?",
         )

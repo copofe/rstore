@@ -38,38 +38,22 @@ where
     Ok(())
 }
 
+/// Read access to mutation receipts. Receipts are written only through the
+/// outbox transaction path (`insert_receipt` above, reached via
+/// `UnitOfWork::commit`); this repository exists for reads.
 #[derive(Clone)]
 pub struct SqliteRemoteMutationRepository {
-    pool: SqlitePool,
     read_pool: SqlitePool,
-    writer: crate::actor::SqliteWriter,
 }
 
 impl SqliteRemoteMutationRepository {
-    pub fn new(pool: SqlitePool) -> Self {
-        Self::new_with_pools(pool.clone(), pool, crate::actor::SqliteWriter::new(64))
-    }
-
-    pub fn new_with_pools(
-        pool: SqlitePool,
-        read_pool: SqlitePool,
-        writer: crate::actor::SqliteWriter,
-    ) -> Self {
-        Self {
-            pool,
-            read_pool,
-            writer,
-        }
+    pub(crate) fn new(read_pool: SqlitePool) -> Self {
+        Self { read_pool }
     }
 }
 
 #[async_trait]
 impl RemoteMutationRepository for SqliteRemoteMutationRepository {
-    async fn record(&self, receipt: &RemoteMutationReceipt) -> Result<()> {
-        let _write = self.writer.acquire().await?;
-        insert_receipt(&self.pool, receipt).await
-    }
-
     async fn get(&self, receipt_id: &str) -> Result<Option<RemoteMutationReceipt>> {
         let row = sqlx::query(
             "SELECT receipt_id, job_id, operation, locator_json, remote_version, remote_etag, \

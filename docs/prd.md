@@ -25,11 +25,13 @@ CLI 是当前完整的自动化入口。实现上先通过 CLI 验证底层能�
 
 ### 3.1 Registry
 
-- Connection 保存名称、endpoint、region、addressing style、TLS policy 和凭据字段。
+- Connection 保存名称、S3 API endpoint、public/CDN delivery base 的默认值、region、addressing style、TLS policy 和凭据字段。
 - Bucket 保存连接归属、名称、读写策略、索引策略、并发配置和冲突默认值。
-- LinkProfile 保存公开 URL、CDN URL、presign 权限和默认 TTL。
-- Credential 值由 SecretStore 解析，并与 Connection 配置一同存储在 SQLite；不能进入导出
-  配置、API JSON 或日志。
+- LinkProfile 保存桶级 public/CDN delivery base 覆盖、presign 权限和默认 TTL。
+- 链接 base 的生效顺序为：桶 CDN 覆盖 > 连接 CDN 默认 > 桶 public 覆盖 > 连接
+  public 默认 > 原生 S3 endpoint；rstore 不按 provider 猜测地址。
+- Credential 值直接存储在 Connection 的 SQLite 配置行中；内存中使用
+  `Secret<T>` 保护，不能进入导出配置、通用 API JSON 或日志。连接详情只显示脱敏预览。
 
 ### 3.2 Catalog
 
@@ -54,9 +56,9 @@ CLI 是当前完整的自动化入口。实现上先通过 CLI 验证底层能�
 
 ### 3.4 AccessDiagnostics
 
-- Connection test 负责凭据解析、连接探测和可选写探针。
+- Connection test 检查凭据是否已存储，执行连接探测和可选写探针。
 - Capability probe 检查 list、multipart、copy 和 presign。
-- `doctor` 汇总连接、Adapter、凭据配置状态、Job、Outbox 和 Repair 状态。
+- `doctor` 汇总连接健康、Adapter、Job、Outbox 和 Repair 状态。
 - 不支持的能力返回明确的 `CapabilityUnsupported` 错误。
 
 ## 4. CLI 命令
@@ -133,8 +135,8 @@ Outbox 事件具备 event_id 幂等、aggregate 顺序、退避重试、失败�
 
 ## 7. 安全
 
-- Secret 值通过 `Secret<T>` 和 `SecretStore` 管理，与 Connection 配置一同存储在 SQLite；
-  不进入导出配置、API JSON 或日志。
+- Secret 值通过 `Secret<T>` 管理，与 Connection 配置一同存储在 SQLite；不进入导出配置、
+  通用 API JSON 或日志。CLI 的 `connection show` 只显示 AK/SK 的首尾字符，中间使用星号。
 - TLS 默认开启。
 - `--tls-verify=false` 当前只保存设置，尚未让 S3 适配器使用自定义证书校验器。
 - 日志、JSON、错误上下文和诊断输出不得泄露 Secret 或签名 URL。

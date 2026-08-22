@@ -1,15 +1,14 @@
 //! The storage factory seam (STORE-001).
 //!
 //! The application core calls [`StorageFactory`] to turn a
-//! [`ConnectionConfig`] plus resolved credentials into a connected
-//! [`Storage`]. The concrete factory (S3) lives in `rstore-storage-s3` and is
-//! injected by the binary — this crate stays free of any SDK dependency.
+//! [`ConnectionConfig`] plus its stored credentials into a connected [`Storage`].
+//! The concrete factory (S3) lives in `rstore-storage-s3` and is injected by
+//! the binary — this crate stays free of any SDK dependency.
 
 use std::sync::Arc;
 
 use rstore_domain::connection::ConnectionConfig;
-use rstore_domain::Result;
-use rstore_secrets::Secret;
+use rstore_domain::{Result, Secret};
 
 use crate::Storage;
 

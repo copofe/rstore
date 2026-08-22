@@ -25,13 +25,8 @@ fn transfer_cli(command: Command) -> Cli {
 
 async fn batch_app() -> (Application, Arc<FakeStorageFactory>) {
     let db = Database::open_in_memory().await.unwrap();
-    let secrets = Arc::new(rstore_secrets::InMemorySecretStore::new());
-    rstore_secrets::put_credentials(secrets.as_ref(), "conn_nas", "AK", "SK")
-        .await
-        .unwrap();
     let factory = Arc::new(FakeStorageFactory::new());
     let app = rstore_application_test_support::application_from_db(db)
-        .with_secrets(secrets)
         .with_storage_factory(factory.clone());
     app.api()
         .registry()
@@ -39,11 +34,17 @@ async fn batch_app() -> (Application, Arc<FakeStorageFactory>) {
         .add(AddConnectionInput {
             name: "nas".into(),
             endpoint: "http://localhost:9000".into(),
+            public_base_url: None,
+            cdn_base_url: None,
             region: Region::Auto,
             addressing_style: AddressingStyle::Path,
             tls_verify: true,
-            secret_ref: Some("conn_nas".into()),
-            credentials: None,
+            credentials: Some(rstore_domain::Secret::new(
+                rstore_application::CredentialInput {
+                    access_key: "AK".into(),
+                    secret_key: "SK".into(),
+                },
+            )),
         })
         .await
         .unwrap();

@@ -11,6 +11,7 @@
 
 use std::cmp::Ordering;
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rstore_domain::remote::RemoteObject;
 use rstore_domain::{Error, Result, TypedId};
 
@@ -63,6 +64,9 @@ pub fn order_key(o: &RemoteObject, field: SortField) -> (SortKey, String, String
 }
 
 /// The cursor encoding a walk resumes from: the last served row's order key.
+///
+/// The payload is URL-safe Base64 so a cursor can be copied from the human CLI
+/// output without losing the field separators to terminal control handling.
 pub fn cursor_of(o: &RemoteObject, field: SortField) -> String {
     let (value, path, id) = order_key(o, field);
     encode(&value, &path, &id)
@@ -73,14 +77,16 @@ fn encode(value: &SortKey, path: &str, id: &str) -> String {
         SortKey::Num(n) => n.to_string(),
         SortKey::Text(t) => t.clone(),
     };
-    format!("{value}\u{1f}{path}\u{1f}{id}")
+    URL_SAFE_NO_PAD.encode(format!("{value}\u{1f}{path}\u{1f}{id}"))
 }
 
 /// Decode a cursor into its order key, parsing the value numerically for
 /// numeric fields (the same classification both adapters bind by). A cursor
 /// is opaque to callers; only this module gives it structure.
 pub fn decode(cursor: &str, field: SortField) -> Result<(SortKey, String, String)> {
-    let mut parts = cursor.splitn(3, '\u{1f}');
+    let bytes = URL_SAFE_NO_PAD.decode(cursor).map_err(|_| bad_cursor())?;
+    let raw = String::from_utf8(bytes).map_err(|_| bad_cursor())?;
+    let mut parts = raw.splitn(3, '\u{1f}');
     let (value, path, id) = match (parts.next(), parts.next(), parts.next()) {
         (Some(v), Some(p), Some(i)) => (v.to_string(), p.to_string(), i.to_string()),
         _ => return Err(bad_cursor()),
@@ -96,4 +102,33 @@ pub fn decode(cursor: &str, field: SortField) -> Result<(SortKey, String, String
 
 fn bad_cursor() -> Error {
     Error::invalid_input("invalid pagination cursor")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_is_printable_and_round_trips() {
+        let cursor = encode(
+            &SortKey::Num(1_746_109_278),
+            "upload/IMG-20250501220719790.webp",
+            "d79b45a2-473f-4ef4-a5a1-32797e00a676",
+        );
+
+        assert!(!cursor.chars().any(char::is_control));
+        assert_eq!(
+            decode(&cursor, SortField::Modified).unwrap(),
+            (
+                SortKey::Num(1_746_109_278),
+                "upload/IMG-20250501220719790.webp".to_string(),
+                "d79b45a2-473f-4ef4-a5a1-32797e00a676".to_string(),
+            )
+        );
+        assert!(decode(
+            "1746109278\u{1f}upload/file.webp\u{1f}d79b45a2-473f-4ef4-a5a1-32797e00a676",
+            SortField::Modified,
+        )
+        .is_err());
+    }
 }

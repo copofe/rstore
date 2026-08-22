@@ -6,7 +6,13 @@
 //! they describe remote object-store semantics rather than local application
 //! records.
 
+pub mod deps;
+
 use async_trait::async_trait;
+pub use deps::{
+    ApplicationDependencies, CatalogDependencies, RegistryDependencies, RuntimeDependencies,
+    TransferDependencies,
+};
 use rstore_domain::connection::{ConnectionConfig, ConnectionTestStatus};
 use rstore_domain::id::{BucketId, ConnectionId, IndexRunId, RemoteObjectId, TagId, WorkspaceId};
 use rstore_domain::remote::RemoteObject;
@@ -58,31 +64,6 @@ pub struct IndexRunCommit {
     pub objects_seen: u64,
     pub error_count: u64,
     pub at: OffsetDateTime,
-}
-
-/// Counts of references held by the configured credential sources.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SecretSourceCounts {
-    pub env_refs: usize,
-    pub file_refs: usize,
-}
-
-/// Read-only inventory seam used by `doctor` without coupling the application
-/// core to a concrete environment or file-backed secret store.
-#[async_trait]
-pub trait SecretSourceStats: Send + Sync {
-    async fn counts(&self) -> Result<SecretSourceCounts>;
-}
-
-/// Empty source inventory for adapters and tests that do not expose
-/// environment/file credential counts.
-pub struct EmptySecretSourceStats;
-
-#[async_trait]
-impl SecretSourceStats for EmptySecretSourceStats {
-    async fn counts(&self) -> Result<SecretSourceCounts> {
-        Ok(SecretSourceCounts::default())
-    }
 }
 
 /// Registry persistence port for connections.
@@ -200,8 +181,14 @@ pub trait LinkProfileStore: Send + Sync {
 }
 
 /// Workspace tag definitions and association port.
+///
+/// A subtrait of the catalog seam's narrow [`rstore_catalog::TagStore`]:
+/// `attach` and `associations_for_object` (MOVE-015 tag preservation) are
+/// declared once there, not duplicated here — every wide-port implementor is
+/// automatically a catalog-seam adapter. Callers of the inherited methods
+/// need `rstore_catalog::TagStore` in scope.
 #[async_trait]
-pub trait TagStore: Send + Sync {
+pub trait TagStore: Send + Sync + rstore_catalog::TagStore {
     async fn insert(&self, tag: &Tag) -> Result<()>;
     async fn list(&self, workspace: WorkspaceId) -> Result<Vec<TagSummary>>;
     async fn get(&self, workspace: WorkspaceId, name: &str) -> Result<Option<Tag>>;
@@ -214,13 +201,6 @@ pub trait TagStore: Send + Sync {
         description: Option<&str>,
     ) -> Result<()>;
     async fn delete(&self, id: TagId) -> Result<bool>;
-    async fn attach(
-        &self,
-        workspace: WorkspaceId,
-        object_id: RemoteObjectId,
-        tag: TagId,
-        at: OffsetDateTime,
-    ) -> Result<()>;
     async fn detach(
         &self,
         workspace: WorkspaceId,
@@ -232,10 +212,6 @@ pub trait TagStore: Send + Sync {
         workspace: WorkspaceId,
         object_id: RemoteObjectId,
     ) -> Result<Vec<String>>;
-    async fn associations_for_object(
-        &self,
-        object_id: RemoteObjectId,
-    ) -> Result<Vec<(WorkspaceId, TagId)>>;
     async fn merge_associations(
         &self,
         workspace: WorkspaceId,
@@ -290,24 +266,13 @@ pub struct RemoteMutationReceipt {
     pub payload: Option<serde_json::Value>,
 }
 
+/// Read access to durable remote-mutation receipts. Receipts are written
+/// exclusively through [`UnitOfWork::commit`](UnitOfWork) (receipt + outbox
+/// fact, one local unit) — there is deliberately no standalone write on this
+/// port. Reads serve repair tooling and diagnostics.
 #[async_trait]
 pub trait RemoteMutationRepository: Send + Sync {
-    async fn record(&self, receipt: &RemoteMutationReceipt) -> Result<()>;
     async fn get(&self, receipt_id: &str) -> Result<Option<RemoteMutationReceipt>>;
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConsumerCheckpoint {
-    pub consumer_id: String,
-    pub last_event_id: Option<String>,
-    pub last_event_at: Option<OffsetDateTime>,
-    pub updated_at: OffsetDateTime,
-}
-
-#[async_trait]
-pub trait ConsumerCheckpointStore: Send + Sync {
-    async fn checkpoint(&self, consumer_id: &str) -> Result<Option<ConsumerCheckpoint>>;
-    async fn save_checkpoint(&self, checkpoint: &ConsumerCheckpoint) -> Result<()>;
 }
 
 /// Reliable outbox/repair port. The first implementation is SQLite-backed;
@@ -317,7 +282,7 @@ pub trait OutboxStore: Send + Sync {
     async fn append(&self, event: &OutboxEvent) -> Result<()>;
     async fn claim_due(&self, now: OffsetDateTime, limit: u32) -> Result<Vec<OutboxEvent>>;
     async fn recover_processing(&self, now: OffsetDateTime) -> Result<u64>;
-    async fn acknowledge(&self, event_id: &str) -> Result<()>;
+    async fn acknowledge(&self, event_id: &str, at: OffsetDateTime) -> Result<()>;
     async fn retry(
         &self,
         event_id: &str,
@@ -351,13 +316,11 @@ pub trait UnitOfWork: Send + Sync {
     async fn commit(&self, operation: UnitOfWorkOperation) -> Result<()>;
 }
 
-/// Minimal serialisable write set used by the first outbox migration. More
-/// context-specific operations can be added without exposing SQLite types.
+/// Minimal serialisable write set. More context-specific operations can be
+/// added when a consumer exists — variants without a producer are dead
+/// vocabulary, so the set starts at exactly one operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum UnitOfWorkOperation {
-    OutboxOnly {
-        event: OutboxEvent,
-    },
     /// A completed remote mutation and its durable domain fact. Persistence
     /// must write both rows in one local transaction so a receipt can never
     /// exist without the event that lets a projection/repair worker find it.
@@ -365,8 +328,17 @@ pub enum UnitOfWorkOperation {
         receipt: RemoteMutationReceipt,
         event: OutboxEvent,
     },
-    RepairOnly {
-        event: OutboxEvent,
-        error: String,
-    },
+}
+
+/// Test double for the unit-of-work seam: accepts every operation without
+/// persisting anything. Production wiring (`bootstrap`, the SQLite-backed
+/// fixture) always supplies a real transactional implementation.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopUnitOfWork;
+
+#[async_trait]
+impl UnitOfWork for NoopUnitOfWork {
+    async fn commit(&self, _operation: UnitOfWorkOperation) -> Result<()> {
+        Ok(())
+    }
 }

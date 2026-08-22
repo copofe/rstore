@@ -8,7 +8,6 @@ license.workspace = true
 
 [dependencies]
 rstore-domain.workspace = true
-rstore-secrets.workspace = true
 rstore-storage-api.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
@@ -23,6 +22,10 @@ time.workspace = true
 aws-smithy-runtime-api = "1.9.2"
 rstore-test-support.workspace = true
 tokio.workspace = true
+# Engine-over-provider end-to-end test (README's interrupt-resume claim).
+rstore-transfer.workspace = true
+rstore-persistence.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

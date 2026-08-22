@@ -56,10 +56,13 @@ pub use copy::{validate_copy_target, CopyOptions, CopyPair};
 pub use diagnostics::{CapabilityReport, CheckResult, ConnectionDiagnostics, ConnectionTestReport};
 pub use files::{FileEntry, FilesPage, FilesService};
 pub use gateway::RemoteGateway;
-pub use health::{CredentialSourceCounts, HealthReport, HealthService};
+pub use health::{HealthReport, HealthService};
 pub use indexer::{BucketIndexStatus, IndexReport, IndexService};
 pub use job::{JobRef, JobService};
-pub use link::{parse_ttl, GeneratedLink, LinkFormat, LinkOutcome, LinkProfileInput, LinkRequest};
+pub use link::{
+    parse_ttl, resolve_link_base, GeneratedLink, LinkFormat, LinkOutcome, LinkProfileInput,
+    LinkRequest,
+};
 pub use notifications::{JobNotification, ProgressEvent};
 pub use outbox::{DispatchReport, OutboxDispatcher, OutboxHandler};
 pub use ports::{
@@ -70,7 +73,6 @@ pub use remote::{
     expand_reference, expand_references, LsEntry, LsResult, RemoteService, RemoteUri, RemoveItem,
     RemoveOutcome, RemoveReport,
 };
-pub use rstore_application_ports::EmptySecretSourceStats;
 pub use rstore_catalog::{FileFilter, FileSort, PageRequest, SortField, SortOrder};
 pub use tag::{CreateTagInput, MergeReport, TagBatchOutcome, TagRef, TagService, UpdateTagInput};
 pub use transfer::{

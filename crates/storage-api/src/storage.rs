@@ -7,8 +7,9 @@ use rstore_domain::Result;
 
 use crate::model::{
     BucketSummary, CopyRequest, DeleteOutcome, ListOptions, ListPage, ObjectMetadata,
-    PresignRequest, PresignedUrl, PutOptions, ReadRange, UploadedPart,
+    PresignRequest, PresignedUrl, PutOptions, ReadRange,
 };
+use crate::multipart::MultipartSession;
 
 /// Object-storage adapter contract.
 ///
@@ -69,35 +70,27 @@ pub trait Storage: Send + Sync {
     /// Delete a single object (STORE-014).
     async fn delete(&self, bucket: &str, key: &ObjectPath) -> Result<DeleteOutcome>;
 
-    /// Begin a multipart upload, returning the provider upload id.
+    /// Begin a multipart upload. The returned session owns the part / copy /
+    /// complete / abort lifetime — the protocol lives behind the session
+    /// trait, not as flat methods here, so every consumer (engine, relay,
+    /// server-side part copy) shares one state machine and one set of abort
+    /// dispositions.
     async fn create_multipart(
         &self,
         bucket: &str,
         key: &ObjectPath,
         opts: &PutOptions,
-    ) -> Result<String>;
+    ) -> Result<Box<dyn MultipartSession>>;
 
-    /// Upload one part (1-based `part_number`), returning its ETag.
-    async fn upload_part(
+    /// Bind a session to an already in-flight upload (a resumed checkpoint's
+    /// id). No provider call: adapters construct the same session type
+    /// around the given id.
+    async fn adopt_multipart(
         &self,
         bucket: &str,
         key: &ObjectPath,
         upload_id: &str,
-        part_number: u32,
-        body: Bytes,
-    ) -> Result<UploadedPart>;
-
-    /// Finalise the upload from the ordered completed parts.
-    async fn complete_multipart(
-        &self,
-        bucket: &str,
-        key: &ObjectPath,
-        upload_id: &str,
-        parts: &[UploadedPart],
-    ) -> Result<ObjectMetadata>;
-
-    /// Abort an in-progress upload (provider-side cleanup).
-    async fn abort_multipart(&self, bucket: &str, key: &ObjectPath, upload_id: &str) -> Result<()>;
+    ) -> Result<Box<dyn MultipartSession>>;
 
     /// Generate a presigned URL (STORE-017).
     async fn presign(&self, req: &PresignRequest) -> Result<PresignedUrl>;

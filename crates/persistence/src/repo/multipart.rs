@@ -13,36 +13,21 @@ use sqlx::sqlite::SqlitePool;
 
 use crate::codec::{Bind, Insert, RowReader};
 use crate::error::map_sqlx;
+use crate::tx::WriteGate;
 
 /// SQLite checkpoint store.
 #[derive(Clone)]
 pub struct SqliteMultipartStore {
-    pool: SqlitePool,
+    gate: WriteGate,
     read_pool: SqlitePool,
-    writer: crate::actor::SqliteWriter,
     clock: Arc<dyn Clock>,
 }
 
 impl SqliteMultipartStore {
-    pub fn new(pool: SqlitePool, clock: Arc<dyn Clock>) -> Self {
-        Self::new_with_pools(
-            pool.clone(),
-            pool,
-            crate::actor::SqliteWriter::new(64),
-            clock,
-        )
-    }
-
-    pub fn new_with_pools(
-        pool: SqlitePool,
-        read_pool: SqlitePool,
-        writer: crate::actor::SqliteWriter,
-        clock: Arc<dyn Clock>,
-    ) -> Self {
+    pub(crate) fn new(gate: WriteGate, read_pool: SqlitePool, clock: Arc<dyn Clock>) -> Self {
         Self {
-            pool,
+            gate,
             read_pool,
-            writer,
             clock,
         }
     }
@@ -132,7 +117,7 @@ impl MultipartStore for SqliteMultipartStore {
         upload_id: &str,
         fingerprint: &FileFingerprint,
     ) -> Result<()> {
-        let _write = self.writer.acquire().await?;
+        let _write = self.gate.permit().await?;
         let source_size = i64::try_from(fingerprint.size)
             .map_err(|e| Error::invalid_input("multipart source is too large").with_source(e))?;
         Insert::into("multipart_uploads")
@@ -144,7 +129,7 @@ impl MultipartStore for SqliteMultipartStore {
             .column("created_at", crate::codec::unix_secs(self.clock.now()))
             .column("source_size", source_size)
             .column("source_modified_ns", fingerprint.modified_ns)
-            .execute(&self.pool)
+            .execute(self.gate.pool())
             .await?;
         Ok(())
     }
@@ -160,7 +145,7 @@ impl MultipartStore for SqliteMultipartStore {
     }
 
     async fn cleared(&self, connection: &str, bucket: &str, key: &str) -> Result<()> {
-        let _write = self.writer.acquire().await?;
+        let _write = self.gate.permit().await?;
         sqlx::query(
             "DELETE FROM multipart_uploads
              WHERE connection_id = ? AND bucket = ? AND key = ?",
@@ -168,7 +153,7 @@ impl MultipartStore for SqliteMultipartStore {
         .bind(connection)
         .bind(bucket)
         .bind(key)
-        .execute(&self.pool)
+        .execute(self.gate.pool())
         .await
         .map_err(map_sqlx)?;
         Ok(())
@@ -183,7 +168,7 @@ impl SqliteMultipartStore {
         key: &str,
         part: &UploadedPart,
     ) -> Result<()> {
-        let _write = self.writer.acquire().await?;
+        let _write = self.gate.permit().await?;
         let part_size = i64::try_from(part.size)
             .map_err(|e| Error::invalid_input("multipart part is too large").with_source(e))?;
         let row_id = self
@@ -200,7 +185,7 @@ impl SqliteMultipartStore {
                 "ON CONFLICT(multipart_upload_id, part_number) DO UPDATE SET \
                  etag = excluded.etag, size = excluded.size",
             )
-            .execute(&self.pool)
+            .execute(self.gate.pool())
             .await?;
         Ok(())
     }
@@ -225,7 +210,7 @@ mod tests {
     async fn checkpoint_round_trips_fingerprint_parts_and_injected_time() {
         let db = crate::Database::open_in_memory().await.unwrap();
         let now = OffsetDateTime::from_unix_timestamp(1_700_000_123).unwrap();
-        let store = SqliteMultipartStore::new(db.pool().clone(), Arc::new(FixedClock(now)));
+        let store = db.multipart(Arc::new(FixedClock(now)));
         let fingerprint = FileFingerprint {
             size: 42,
             modified_ns: Some(1_700_000_123_456_789_000),
@@ -280,10 +265,7 @@ mod tests {
     #[tokio::test]
     async fn corrupt_checkpoint_is_an_error_not_a_missing_checkpoint() {
         let db = crate::Database::open_in_memory().await.unwrap();
-        let store = SqliteMultipartStore::new(
-            db.pool().clone(),
-            Arc::new(FixedClock(OffsetDateTime::UNIX_EPOCH)),
-        );
+        let store = db.multipart(Arc::new(FixedClock(OffsetDateTime::UNIX_EPOCH)));
         store
             .started(
                 "conn",

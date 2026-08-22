@@ -1,8 +1,9 @@
 //! Storage connection domain model (CON-/DATA-).
 //!
-//! [`ConnectionConfig`] holds only non-sensitive configuration. Secrets live in
-//! a [`SecretStore`](crate) and are referenced by `secret_ref`; they never
-//! appear here, in the database, or in logs (SEC-001).
+//! ConnectionConfig holds the complete local connection configuration,
+//! including credentials wrapped in Secret. Credential values are persisted
+//! with the connection but skipped by serde so they never enter export JSON or
+//! logs (SEC-001).
 //!
 //! The wire formats for [`Region`] and [`AddressingStyle`] live ON the enums
 //! here (locality): the CLI, the SQLite column, and JSON all go through these
@@ -13,7 +14,7 @@ use time::OffsetDateTime;
 
 use crate::error::{Error, Result};
 use crate::id::ConnectionId;
-use crate::CredentialRef;
+use crate::Secret;
 
 /// AWS region resolution.
 ///
@@ -133,7 +134,7 @@ impl ConnectionTestStatus {
     }
 }
 
-/// Non-sensitive configuration for a storage connection.
+/// Configuration for a storage connection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionConfig {
     pub id: ConnectionId,
@@ -141,12 +142,23 @@ pub struct ConnectionConfig {
     pub name: String,
     /// S3 API endpoint URL.
     pub endpoint: String,
+    /// Base URL for public objects exposed by this connection, when it differs
+    /// from the S3 API endpoint.
+    pub public_base_url: Option<String>,
+    /// Default accelerated/proxy delivery base for this connection.
+    pub cdn_base_url: Option<String>,
     pub region: Region,
     pub addressing_style: AddressingStyle,
     /// TLS certificate verification (default on — SEC-003).
     pub tls_verify: bool,
-    /// Optional key under which credentials are stored in the SecretStore.
-    pub secret_ref: Option<CredentialRef>,
+    /// Access key stored with this connection. It is omitted from serde
+    /// representations and must be explicitly masked for display.
+    #[serde(skip)]
+    pub access_key: Option<Secret<String>>,
+    /// Secret key stored with this connection. It is omitted from serde
+    /// representations and must be explicitly masked for display.
+    #[serde(skip)]
+    pub secret_key: Option<Secret<String>>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]

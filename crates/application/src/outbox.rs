@@ -59,7 +59,7 @@ impl OutboxDispatcher {
         for event in events {
             match handler.handle(&event).await {
                 Ok(()) => {
-                    self.store.acknowledge(&event.event_id).await?;
+                    self.store.acknowledge(&event.event_id, now).await?;
                     published += 1;
                 }
                 Err(error) => {

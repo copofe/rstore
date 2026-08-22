@@ -1,5 +1,7 @@
 //! Human-readable formatting shared by handler modules (CLI-003).
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
 pub(super) fn human_size(size: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut value = size as f64;
@@ -137,6 +139,31 @@ pub(super) fn listing(title: &str, empty: &str, table: Table) -> String {
 /// and `files list` hint the same way. `flag` names the caller's own option.
 pub(super) fn more(flag: &str, cursor: &str) -> String {
     format!("  -- more: {flag} {cursor}\n")
+}
+
+const OPAQUE_TOKEN_PREFIX: &str = "rstore-token-v1:";
+
+/// Wrap a provider-owned token in a printable CLI value. Provider tokens are
+/// opaque, so the CLI cannot assume they are safe to paste into a shell.
+pub(super) fn encode_opaque_token(token: &str) -> String {
+    format!(
+        "{OPAQUE_TOKEN_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(token.as_bytes())
+    )
+}
+
+/// Decode the printable CLI token before passing it to the provider.
+pub(super) fn decode_opaque_token(token: &str) -> rstore_domain::Result<String> {
+    let Some(encoded) = token.strip_prefix(OPAQUE_TOKEN_PREFIX) else {
+        return Err(rstore_domain::Error::invalid_input(
+            "invalid remote pagination cursor",
+        ));
+    };
+    let bytes = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| rstore_domain::Error::invalid_input("invalid remote pagination cursor"))?;
+    String::from_utf8(bytes)
+        .map_err(|_| rstore_domain::Error::invalid_input("invalid remote pagination cursor"))
 }
 
 /// A directory listing keeps its title when empty — an empty remote
@@ -327,5 +354,15 @@ mod tests {
              list : ok\n    \
              copy : ok\n"
         );
+    }
+
+    #[test]
+    fn opaque_tokens_are_printable_and_round_trip() {
+        let raw = "fake:folder/file name with 'quote'\n";
+        let encoded = encode_opaque_token(raw);
+
+        assert!(!encoded.chars().any(char::is_control));
+        assert_eq!(decode_opaque_token(&encoded).unwrap(), raw);
+        assert!(decode_opaque_token(raw).is_err());
     }
 }

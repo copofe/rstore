@@ -1,5 +1,7 @@
 //! Repository for workspaces and their bucket memberships (WSP-).
 
+use async_trait::async_trait;
+use rstore_application_ports::{WorkspaceStore, WorkspaceSummary};
 use rstore_domain::id::{BucketId, WorkspaceId};
 use rstore_domain::workspace::Workspace;
 use rstore_domain::{Error, Result};
@@ -8,43 +10,26 @@ use time::OffsetDateTime;
 
 use crate::codec::{unix_secs, uuid_to_text, Bind, Insert, RowReader, Update};
 use crate::error::map_sqlx;
+use crate::tx::WriteGate;
 
 const COLUMNS: &str = "id, name, description, created_at, updated_at";
 
-/// A workspace row plus its bucket-count summary (WSP-002). Internal to
-/// the repository layer; the application defines its own view type.
-#[derive(Debug, Clone)]
-pub struct WorkspaceRowWithCount {
-    pub workspace: Workspace,
-    pub bucket_count: u64,
-}
-
 #[derive(Clone)]
 pub struct WorkspaceRepository {
-    pool: SqlitePool,
+    gate: WriteGate,
     read_pool: SqlitePool,
-    writer: crate::actor::SqliteWriter,
 }
 
 impl WorkspaceRepository {
-    pub fn new(pool: SqlitePool) -> Self {
-        Self::new_with_pools(pool.clone(), pool, crate::actor::SqliteWriter::new(64))
+    pub(crate) fn new(gate: WriteGate, read_pool: SqlitePool) -> Self {
+        Self { gate, read_pool }
     }
+}
 
-    pub fn new_with_pools(
-        pool: SqlitePool,
-        read_pool: SqlitePool,
-        writer: crate::actor::SqliteWriter,
-    ) -> Self {
-        Self {
-            pool,
-            read_pool,
-            writer,
-        }
-    }
-
-    pub async fn insert(&self, workspace: &Workspace) -> Result<()> {
-        let _write = self.writer.acquire().await?;
+#[async_trait]
+impl WorkspaceStore for WorkspaceRepository {
+    async fn insert(&self, workspace: &Workspace) -> Result<()> {
+        let _write = self.gate.permit().await?;
         // Uniqueness (case-insensitive) is the schema's guarantee — the
         // UNIQUE index on lower(name); map_sqlx classifies the violation as
         // Conflict and this remap adds the name to the message.
@@ -54,7 +39,7 @@ impl WorkspaceRepository {
             .column("description", &workspace.description)
             .column("created_at", unix_secs(workspace.created_at))
             .column("updated_at", unix_secs(workspace.updated_at))
-            .execute(&self.pool)
+            .execute(self.gate.pool())
             .await
             .map_err(|e| {
                 if e.code == rstore_domain::ErrorCode::Conflict {
@@ -66,7 +51,7 @@ impl WorkspaceRepository {
         Ok(())
     }
 
-    pub async fn list(&self) -> Result<Vec<WorkspaceRowWithCount>> {
+    async fn list(&self) -> Result<Vec<WorkspaceSummary>> {
         let rows = sqlx::query(&format!(
             "SELECT {COLUMNS}, \
                     (SELECT COUNT(*) FROM workspace_buckets wb WHERE wb.workspace_id = workspaces.id) AS bucket_count \
@@ -78,7 +63,7 @@ impl WorkspaceRepository {
         rows.into_iter()
             .map(|row| {
                 let reader = RowReader::new(row);
-                Ok(WorkspaceRowWithCount {
+                Ok(WorkspaceSummary {
                     workspace: row_to_workspace(&reader)?,
                     bucket_count: reader.integer("bucket_count")? as u64,
                 })
@@ -87,7 +72,7 @@ impl WorkspaceRepository {
     }
 
     /// Catalog object count per member bucket for workspace stats (WSP-012).
-    pub async fn object_counts_by_bucket(
+    async fn object_counts_by_bucket(
         &self,
         workspace: WorkspaceId,
     ) -> Result<Vec<(BucketId, u64)>> {
@@ -112,7 +97,7 @@ impl WorkspaceRepository {
             .collect()
     }
 
-    pub async fn get(&self, id: WorkspaceId) -> Result<Option<Workspace>> {
+    async fn get(&self, id: WorkspaceId) -> Result<Option<Workspace>> {
         let row = sqlx::query(&format!("SELECT {COLUMNS} FROM workspaces WHERE id = ?"))
             .bind(uuid_to_text(&id))
             .fetch_optional(&self.read_pool)
@@ -122,7 +107,7 @@ impl WorkspaceRepository {
             .transpose()
     }
 
-    pub async fn get_by_name(&self, name: &str) -> Result<Option<Workspace>> {
+    async fn get_by_name(&self, name: &str) -> Result<Option<Workspace>> {
         let row = sqlx::query(&format!("SELECT {COLUMNS} FROM workspaces WHERE name = ?"))
             .bind(name)
             .fetch_optional(&self.read_pool)
@@ -132,14 +117,14 @@ impl WorkspaceRepository {
             .transpose()
     }
 
-    pub async fn update(
+    async fn update(
         &self,
         id: WorkspaceId,
         name: Option<&str>,
         description: Option<&str>,
         at: OffsetDateTime,
     ) -> Result<()> {
-        let _write = self.writer.acquire().await?;
+        let _write = self.gate.permit().await?;
         let existing = self
             .get(id)
             .await?
@@ -163,7 +148,7 @@ impl WorkspaceRepository {
             .set("description", &new_description)
             .set("updated_at", unix_secs(at))
             .filter("id = ?", [Bind::Text(uuid_to_text(&id))])
-            .execute(&self.pool)
+            .execute(self.gate.pool())
             .await
             .map_err(|e| {
                 if e.code == rstore_domain::ErrorCode::Conflict {
@@ -175,11 +160,11 @@ impl WorkspaceRepository {
         Ok(())
     }
 
-    pub async fn delete(&self, id: WorkspaceId) -> Result<bool> {
-        let _write = self.writer.acquire().await?;
+    async fn delete(&self, id: WorkspaceId) -> Result<bool> {
+        let _write = self.gate.permit().await?;
         let affected = sqlx::query("DELETE FROM workspaces WHERE id = ?")
             .bind(uuid_to_text(&id))
-            .execute(&self.pool)
+            .execute(self.gate.pool())
             .await
             .map_err(map_sqlx)?
             .rows_affected();
@@ -187,7 +172,7 @@ impl WorkspaceRepository {
     }
 
     /// Buckets in a workspace (WSP-006), ordered by connection then name.
-    pub async fn buckets(&self, id: WorkspaceId) -> Result<Vec<BucketId>> {
+    async fn buckets(&self, id: WorkspaceId) -> Result<Vec<BucketId>> {
         let rows = sqlx::query(
             "SELECT wb.bucket_id FROM workspace_buckets wb \
              JOIN buckets b ON b.id = wb.bucket_id \
@@ -207,30 +192,30 @@ impl WorkspaceRepository {
     }
 
     /// Add a bucket membership; duplicate pairs are a no-op (WSP-007).
-    pub async fn add_bucket(
+    async fn add_bucket(
         &self,
         workspace: WorkspaceId,
         bucket: BucketId,
         at: OffsetDateTime,
     ) -> Result<()> {
-        let _write = self.writer.acquire().await?;
+        let _write = self.gate.permit().await?;
         Insert::into("workspace_buckets")
             .column("workspace_id", uuid_to_text(&workspace))
             .column("bucket_id", uuid_to_text(&bucket))
             .column("added_at", unix_secs(at))
             .suffix("ON CONFLICT DO NOTHING")
-            .execute(&self.pool)
+            .execute(self.gate.pool())
             .await?;
         Ok(())
     }
 
-    pub async fn remove_bucket(&self, workspace: WorkspaceId, bucket: BucketId) -> Result<bool> {
-        let _write = self.writer.acquire().await?;
+    async fn remove_bucket(&self, workspace: WorkspaceId, bucket: BucketId) -> Result<bool> {
+        let _write = self.gate.permit().await?;
         let affected =
             sqlx::query("DELETE FROM workspace_buckets WHERE workspace_id = ? AND bucket_id = ?")
                 .bind(uuid_to_text(&workspace))
                 .bind(uuid_to_text(&bucket))
-                .execute(&self.pool)
+                .execute(self.gate.pool())
                 .await
                 .map_err(map_sqlx)?
                 .rows_affected();

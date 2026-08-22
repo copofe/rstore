@@ -6,14 +6,15 @@ expression: env
   "command": "connection.add",
   "data": {
     "addressing_style": "path",
+    "cdn_base_url": null,
     "created_at": "2023-11-14T22:13:20Z",
     "endpoint": "https://example.r2.cloudflarestorage.com",
     "id": "[id]",
     "last_test_status": null,
     "last_tested_at": null,
     "name": "prod-r2",
+    "public_base_url": null,
     "region": "auto",
-    "secret_ref": "conn_prod_r2",
     "tls_verify": true,
     "updated_at": "2023-11-14T22:13:20Z"
   },
@@ -23,6 +24,6 @@ expression: env
   },
   "ok": true,
   "warnings": [
-    "no credentials provided; remote operations will fail until they are set (re-add with --access-key/--secret-key, `connection edit`, or export RSTORE_SECRET_* variables)"
+    "no credentials provided; remote operations will fail until they are set with --access-key/--secret-key or `connection edit`"
   ]
 }

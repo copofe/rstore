@@ -1,8 +1,9 @@
 //! Command dispatch and per-domain handlers.
 //!
 //! Each domain owns one module (`connection`, `bucket`, `remote`, `task`,
-//! `transfer`, plus `misc` for config/doctor); interactive TTY policy lives in
-//! [`tty`] and shared formatting in [`format`]. Handlers produce a
+//! `transfer`, `url`, plus `misc` for config/doctor and `files` for index /
+//! files / catalog maintenance); interactive TTY policy lives in [`tty`] and
+//! shared formatting in [`format`]. Handlers produce a
 //! [`crate::output::HandlerOutput`] carrying both structured `data` and the
 //! pre-rendered human string — results go to stdout, diagnostics to stderr
 //! (CLI-006).
@@ -18,6 +19,7 @@ mod tag;
 mod task;
 mod transfer;
 mod tty;
+mod url;
 mod workspace;
 
 use rstore_domain::Result;
@@ -120,8 +122,8 @@ pub async fn run_api(
         Command::Index { action } => files::index(action, app, cancel, &session).await,
         Command::Files { action } => files::files(action, app, &session).await,
         Command::Tag { action } => tag::tag(action, app, &session).await,
-        Command::Url(args) => misc::url(args, app).await,
-        Command::Catalog { action } => misc::catalog(action, app).await,
+        Command::Url(args) => url::url(args, app).await,
+        Command::Catalog { action } => files::catalog(action, app).await,
         Command::Cp(args) => {
             transfer::copy_move(false, args, app, cancel, cli.quiet, &session).await
         }
@@ -202,10 +204,11 @@ mod tests {
             .add(AddConnectionInput {
                 name: "nas".into(),
                 endpoint: "http://localhost:9000".into(),
+                public_base_url: None,
+                cdn_base_url: None,
                 region: Region::Auto,
                 addressing_style: AddressingStyle::Path,
                 tls_verify: true,
-                secret_ref: None,
                 credentials: None,
             })
             .await
