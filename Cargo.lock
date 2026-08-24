@@ -2367,6 +2367,7 @@ dependencies = [
  "rstore-storage-s3",
  "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

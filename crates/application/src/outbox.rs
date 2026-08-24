@@ -104,8 +104,8 @@ impl OutboxDispatcher {
     }
 }
 
-/// A handler useful for tests and for a bootstrap that has no projection consumer configured
-/// yet. It acknowledges events without adding a second delivery side effect.
+/// A handler for tests and dispatcher unit exercises: acknowledges events
+/// without any delivery side effect.
 pub struct NoopOutboxHandler;
 
 #[async_trait]

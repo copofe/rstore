@@ -125,8 +125,8 @@ rules, and data-flow constraints.
 
 - Applying the stored `--tls-verify=false` setting to a custom S3 TLS
   verifier (the flag is persisted; the adapter still uses the system default).
-- A resident outbox consumer loop and projection handlers (`dispatch_once`
-  exists; nothing schedules it yet).
+- A *resident* outbox consumer loop (startup drain via `dispatch_once` and the
+  remote-verify projection exist; only a long-lived host process is missing).
 - GPUI desktop pages; the desktop composition contract is present and
   exercised.
 

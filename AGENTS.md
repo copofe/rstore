@@ -66,7 +66,9 @@
   View/Page/Report/Outcome，不暴露 SQLite、AWS SDK 或具体 Service 实现。
 - Domain Event 记录业务事实；进度和桌面通知属于运行时消息。
 - Outbox 支持幂等、重试、失败记录和 Repair 查询。
-- Outbox 当前提供可调用的单次 dispatch；入口尚未接入常驻消费循环或投影 Handler。
+- Outbox 的消费入口是启动时的一次性排水：Bootstrap 在取得写锁后把积压事件
+  交付给 RemoteVerifyHandler（远端复验，缺失入 repair，瞬时错误留队重试）。
+  常驻消费循环待长驻进程（桌面端）出现后再引入。
 - 不引入 Event Sourcing、微服务或完整桌面页面。
 
 ## 测试与交付

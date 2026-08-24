@@ -7,6 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+tracing.workspace = true
 rstore-application.workspace = true
 rstore-domain.workspace = true
 rstore-persistence.workspace = true

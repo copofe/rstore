@@ -27,7 +27,9 @@ reports.
 
 ## Deliberately deferred (documented, not debt)
 
-- Outbox resident consumer loop / projection handlers — introduced when a
-  consumer lands (`AGENTS.md` records this decision).
+- Outbox *resident* consumer loop — the first projection consumer
+  (`RemoteVerifyHandler`) and a startup drain via `Runtime::drain_outbox` are
+  wired; only the always-running task is left, and it needs a long-lived host
+  process (desktop) to justify existing.
 - `MultipartStore` living in `storage-api` — intentional placement so
   persistence never depends on transfer (documented in module headers).

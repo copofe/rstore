@@ -154,9 +154,11 @@ job intent
 ```
 
 Outbox events carry event-id idempotency, aggregate ordering, backoff retry,
-failure records, and repair state. No resident consumer loop or projection
-handler is wired yet. Progress events are runtime-only and never become
-domain events.
+failure records, and repair state. The first projection consumer re-verifies
+each settled mutation against the provider at startup (`RemoteVerifyHandler`
+through `Runtime::drain_outbox`): present objects acknowledge the fact, missing
+ones become repair rows, transient failures stay queued. Progress events are
+runtime-only and never become domain events.
 
 ## 7. Security
 

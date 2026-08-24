@@ -273,9 +273,11 @@ sequenceDiagram
 
 The outbox keeps `event_id` idempotency, per-aggregate version ordering, and
 attempt accounting; exhausted deliveries become repair rows in the same unit.
-Delivery currently happens through the callable dispatcher
-(`OutboxDispatcher::dispatch_once`); no resident consumer loop is wired yet,
-so an appended fact is durable but not yet projected.
+Delivery happens through `OutboxDispatcher::dispatch_once`; bootstrap drains
+the backlog once per process start into `RemoteVerifyHandler`, which re-stats
+the settled object — presence acknowledges, absence becomes a repair row,
+transient provider faults stay queued. No resident task schedules dispatch
+between starts yet; that waits for a long-lived host process (desktop).
 
 ## 5. Related documents
 

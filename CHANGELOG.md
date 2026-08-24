@@ -65,6 +65,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `-r` is accepted as the short form of `--recursive` on `rm`, `cp`, and `mv`
   as it already was on transfers.
 
+### Added
+
+- Outbox consumption is live: `RemoteVerifyHandler` re-stats every settled
+  remote mutation when a runtime opens. Presence acknowledges the stored fact,
+  absence records a repair item, transient provider faults stay queued for
+  backoff retry.
+
 ### Removed
 
 - Dead schema tables (`remote_object_revisions`, `index_errors`,
