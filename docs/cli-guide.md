@@ -1,29 +1,44 @@
-# rstore CLI 使用教程与参考
+# rstore CLI Guide and Reference
 
-rstore 是一个本地优先的 S3 兼容存储工作台：连接你自己的存储（MinIO、Cloudflare R2、Supabase Storage、阿里云 OSS 等），把桶索引成本地目录，并提供上传下载、复制移动、搜索打标、链接生成等日常操作。
+rstore is a local-first workbench for S3-compatible storage: connect your own
+endpoints (MinIO, Cloudflare R2, Supabase Storage, and others), index buckets
+into a local catalog, and run everyday object work — upload, download, copy,
+move, search, tagging, link generation.
 
-本文的命令树以 `crates/cli/src/args.rs` 为准；CLI 是当前完整的自动化入口，桌面端目前只有
-Bootstrap、Application API 和通知订阅的最小 Runtime 接入。这里的先实现 CLI、后实现桌面端
-是研发顺序，不表示产品或功能优先级。
-
-本文分两部分：前半是**教程**（按使用顺序），后半是**命令参考**。所有命令均以 `rstore <命令>` 调用；`rstore <命令> --help` 永远有最权威的参数说明。
+The command tree is defined in `crates/cli/src/args.rs`, which is the source
+of truth; `rstore <command> --help` always has the most authoritative flag
+list. The first half of this guide is a tutorial in usage order; the second
+half is the command reference.
 
 ---
 
-## 教程
+## Tutorial
 
-### 0. 约定
+### 0. Conventions
 
-- **短格式**（推荐）：所有接受远端位置的命令都可直接写 `<桶>/[前缀/]<key>`，如 `media/img/logo.png`；桶根就是 `media/` 或裸 `media`。桶名在多个连接间有歧义时写 `<连接>/<桶>/…`（如 `nas/media/img/`）。
-- **引用形式**：连接可用名字或 `conn_…` id，桶可用 `bkt_…` id、`<连接>/<名字>` 或裸名，任务可用 `job_…` id 或列表里的序号（`1` = 最新）。
-- **输出约定**：结果走 stdout；进度和日志走 stderr。加 `--json` 得到稳定的 JSON envelope（脚本用）。
-- **退出码**：`0` 成功；部分失败的批量操作 `13`；本地磁盘读写错误 `14`；Ctrl+C 中断 `130`；桶或适配器不支持预签名 `11`。其余错误码见 JSON envelope 的 `errors[].code`。
-- **破坏性操作**（`rm`、`bucket remove`、`connection remove` 等）：交互模式会逐次确认；脚本/管道里必须加 `--yes`。
+- **Short references** (recommended): every command that accepts a remote
+  location takes `<bucket>/[prefix/]<key>`, e.g. `media/img/logo.png`; the
+  bucket root is `media/` or bare `media`. When the bucket name is ambiguous
+  across connections, write `<connection>/<bucket>/…` (e.g.
+  `nas/media/img/`).
+- **Reference forms**: connections accept a name or a `conn_…` id; buckets
+  accept a `bkt_…` id, `<connection>/<name>`, or a bare unique name; tasks
+  accept a `job_…` id or the ordinal shown by `task list` (`1` = newest).
+- **Output discipline**: results go to stdout; progress and logs go to
+  stderr. Add `--json` for the machine-readable envelope.
+- **Exit codes**: `0` success; `13` a batch in which any item failed;
+  `130` interrupted by Ctrl+C; `14` local disk I/O failure; `11`
+  capability unsupported (e.g. presigning). Every other failure maps to the
+  code in the JSON envelope's `errors[].code`.
+- **Destructive operations** (`rm`, `bucket remove`, `connection remove`,
+  `catalog gc`, `tag merge`, `index rebuild`, …) confirm interactively;
+  scripts and pipelines must pass `--yes`.
 
-### 1. 连接存储
+### 1. Connecting storage
 
 ```sh
-# 注册连接（密钥推荐直接给，写入 Connection 配置；或交互提示输入）
+# Register a connection (credentials are stored with the connection config,
+# or entered interactively when omitted).
 rstore connection add bucket_name \
   --endpoint http://localhost:9000 \
   --public-base https://public.example.com \
@@ -31,62 +46,70 @@ rstore connection add bucket_name \
   --region auto \
   --access-key AK... --secret-key SK...
 
-# 验证：检查本地凭据、鉴权、ListBuckets 三步
+# Three-step check: stored credentials, authentication, ListBuckets.
 rstore connection test bucket_name
 
-# 常用变体
-rstore connection list --filter prod        # 按名字/endpoint 模糊过滤
-rstore connection show bucket_name             # 看配置（密钥仅显示脱敏首尾）
-rstore connection show bucket_name --capabilities   # 实测 list/分片/复制/预签名四项能力
+# Common variants.
+rstore connection list --filter prod          # fuzzy match on name/endpoint
+rstore connection show bucket_name            # secrets shown masked
+rstore connection show bucket_name --capabilities  # probe list/multipart/copy/presign
 rstore connection edit bucket_name --region us-east-1
-rstore connection remove bucket_name --yes     # 只删本地注册；密钥一并清除；远端不动
+rstore connection remove bucket_name --yes    # removes only the registration
 ```
 
-**endpoint 细节**：
+**Endpoint details**
 
-- 带路径的 endpoint（如 Supabase 的 `https://<ref>.storage.supabase.co/storage/v1/s3`）结尾的 `/` 会被自动补齐，但建议写全。
-- `addressing-style` 控制 S3 请求 URL 中桶名的位置：
-  - `auto`：交给 SDK/服务端选择；
-  - `path`：`https://endpoint/bucket/key`，Supabase 这类带路径的网关通常需要它；
-  - `virtual-host`：`https://bucket.endpoint/key`，要求 endpoint 的 DNS 和 TLS 证书支持桶名子域。
-  症状是「连接测试通过、桶操作 404」时，优先检查这里。
-- 云厂商对象存储用默认 `auto` 即可。
+- A trailing `/` on path-style endpoints (e.g. Supabase's
+  `https://<ref>.storage.supabase.co/storage/v1/s3`) is normalized, but write
+  the full URL anyway.
+- `--addressing-style` controls where the bucket name sits in request URLs:
+  - `auto` — let the SDK/service decide;
+  - `path` — `https://endpoint/bucket/key`; gateways like Supabase usually
+    require this;
+  - `virtual-host` — `https://bucket.endpoint/key`; requires DNS and a TLS
+    certificate covering the bucket subdomain.
+  If connection tests pass but bucket operations return 404, check this
+  first.
+- Managed clouds are fine on the default `auto`.
 
-**凭证存储**：
+**Credential storage**
 
-- `connection add --access-key --secret-key` 会把凭证直接写入 Connection
-  配置表（本地 SQLite）。
-- 交互式终端省略两个参数时会隐藏提示输入；非交互或 `--json` 模式不会提示。
-- `connection show` 只显示首尾字符，中间用星号遮蔽；凭证原文不进入配置导出、
-  JSON 或日志。
-- 不给密钥也允许注册连接，但 `connection test` 和远端操作会明确报缺凭证。
+- `--access-key/--secret-key` are written directly into the connection row of
+  the local SQLite catalog.
+- Interactive terminals prompt with hidden input when both flags are omitted;
+  non-interactive runs and `--json` never prompt.
+- `connection show` masks everything but the first and last characters.
+  Plaintext credentials never enter exports, JSON output, or logs.
+- Registering without credentials is allowed; tests and remote operations
+  then report the missing credentials explicitly.
 
-### 2. 注册桶
+### 2. Registering buckets
 
-rstore 只操作**显式注册过**的桶——这是防止指错桶的保护：
+Only explicitly registered buckets can be operated on — protection against
+pointing at the wrong bucket:
 
 ```sh
-# 自动发现：列出远端可见的桶
+# Discovery lists what the credentials can see.
 rstore bucket discover bucket_name
 
-# 注册（默认会探测桶可读性，失败只是警告不阻断）
+# Registration probes readability; a failed probe warns but does not block.
 rstore bucket add bucket_name media
 
-# 注册时的本地策略
-rstore bucket add bucket_name archive --read-only                  # 拒绝一切写入（上传/复制入站被挡）
-rstore bucket add bucket_name trash --allow-delete=false         # 禁止删除
-rstore bucket add bucket_name tmp --index-enabled=false        # 不参与索引
-rstore bucket add bucket_name cold --conflict skip              # 该桶默认冲突策略
+# Local policy at registration time.
+rstore bucket add bucket_name archive --read-only            # refuse writes
+rstore bucket add bucket_name trash --allow-delete=false     # forbid deletes
+rstore bucket add bucket_name tmp --index-enabled=false      # skip indexing
+rstore bucket add bucket_name cold --conflict skip           # default policy
 
-# 查看/调整
+# Inspect and adjust.
 rstore bucket list
 rstore bucket show bucket_name/media
 rstore bucket edit bucket_name/media --read-only=false
-rstore bucket edit bucket_name/media --concurrency 8    # 该桶传输并发覆盖（0 = 清除）
-rstore bucket remove bucket_name/media --yes   # 只删本地注册
+rstore bucket edit bucket_name/media --concurrency 8   # 0 clears the override
+rstore bucket remove bucket_name/media --yes           # removes only the registration
 ```
 
-**忽略目录**（索引时跳过，不进本地目录）：
+**Ignore rules** skip directories during indexing:
 
 ```sh
 rstore bucket ignore add bucket_name/media .trash
@@ -94,161 +117,161 @@ rstore bucket ignore list bucket_name/media
 rstore bucket ignore remove bucket_name/media .trash
 ```
 
-### 3. 直接操作远端（无需任何索引）
+### 3. Working against the live remote
 
 ```sh
-# 列目录（实时远端，分页）
-rstore remote ls media/
+rstore remote ls media/                          # paginated listing
 rstore remote ls media/img/ --limit 100
-rstore remote ls media/ --cursor <上一页给的token>   # 翻页
-rstore remote ls media/ --update-catalog            # 顺手写进本地目录
+rstore remote ls media/ --cursor <token>         # next page
+rstore remote ls media/ --update-catalog         # feed rows into the catalog
 
-# 看单个对象
 rstore remote stat media/img/logo.png
 ```
 
-### 4. 上传 / 下载
+### 4. Upload and download
 
 ```sh
-# 上传：目标是 桶/[前缀/]，源文件名落在前缀下
+# Upload: target is <bucket>/[prefix/]; the file name lands under the prefix.
 rstore upload ./report.pdf media/docs/
-rstore upload ./report.pdf media/      # 桶根（裸 media 等价）
-rstore upload ./src media/backup/ -r   # 递归，保持目录结构
-rstore upload a.txt b.txt media/       # 多文件
-rstore upload - media/ < files.txt     # 批量：stdin 一行一个本地路径
+rstore upload ./report.pdf media/                # bucket root
+rstore upload ./src media/backup/ -r             # recursive, keeps structure
+rstore upload a.txt b.txt media/                 # multiple sources
+rstore upload - media/ < files.txt               # batch: one local path per line
 
-# 连接限定形式（桶名有歧义时使用 <连接>/<桶>/）
+# Connection-qualified form when bucket names are ambiguous.
 rstore upload ./report.pdf bucket_name/media/docs/
 
-# 下载：远端源同规则（短格式或连接限定形式），目标本地路径
+# Download: same source rules, local directory or file target.
 rstore download media/img/logo.png ./out.png
-rstore download media/img/ ./img-backup -r   # 递归镜像
-rstore download - ./downloads < refs.txt     # 批量：stdin 一行一个远端引用
+rstore download media/img/ ./img-backup -r       # recursive mirror
+rstore download - ./downloads < refs.txt
 
-# 冲突策略（上传/下载/cp/mv 通用）
---conflict skip       # 跳过已存在
---conflict overwrite  # 覆盖
---conflict rename     # 自动改名（name-<随机8位>.ext）
---conflict ask        # 显式交互询问
-# 省略 --conflict 时：上传/cp/mv 用目标桶 `bucket add --conflict` 存的默认，
-# 没有存默认（或 download 写本地盘）时按 ask 处理
---yes                 # 非交互时把 ask 解析为 overwrite（否则报错）
+# Conflict policies (upload/download/cp/mv).
+--conflict skip        # keep the existing object
+--conflict overwrite   # replace it
+--conflict rename      # derive name-<random8>.ext
+--conflict ask         # interactive resolution
+# Omitted: uploads/cp/mv use the target bucket's stored default; anything
+# unresolved (including downloads writing to disk) behaves as ask.
+--yes                  # resolves ask as overwrite non-interactively
 
-# 其他
---dry-run             # 逐条预览（"would upload …"/"would download …"），不传输
---no-progress         # 关掉 stderr 进度条
+--dry-run              # per-item preview, nothing transferred
+--no-progress          # silence the stderr progress reporting
 ```
 
-大文件自动走分片上传、支持断点续传；**Ctrl+C 随时安全**——进度持久化为 `interrupted` 状态，重跑同一条命令即从 checkpoint 续传。
+Large files switch to multipart automatically and resume from checkpoints.
+Ctrl+C is safe at any point: progress persists as an interrupted job, and
+re-running the same command resumes.
 
-### 5. 复制 / 移动 / 删除
+### 5. Copy, move, delete
 
 ```sh
-# 同连接走服务端复制；跨连接自动中继（恒定内存，大对象走分片）
+# Same connection: server-side copy. Cross connection: bounded-memory relay.
 rstore cp media/a.txt backup/a.txt
-rstore cp media/a.txt backup/dir/     # 目录式目标，保留文件名
+rstore cp media/a.txt backup/dir/       # directory-style target keeps the name
 rstore mv media/old.bin media/archive/
 
-# 递归前缀
 rstore cp media/docs/ backup/docs/ -r
-rstore mv media/old/ media/arc/ -r --keep-tags   # 标签跟着走
+rstore mv media/old/ media/arc/ -r --keep-tags   # associations travel along
 
-# 批量：stdin（短格式或连接限定形式均可）
 printf '%s\n' media/a.txt media/b.txt | rstore cp - backup/
 
-# 删除（有精确计数的确认；删除后本地目录记 tombstone；rm 也是持久化 job，Ctrl+C 可中断）
+# Delete: confirmation shows the exact precomputed count; removals persist
+# tombstones into the catalog, and rm itself is an interruptible job.
 rstore rm media/tmp/junk.bin
-rstore rm media/tmp/ --recursive --yes       # 递归，非交互
-rstore rm media/tmp/ --recursive --dry-run   # 先看会删什么
+rstore rm media/tmp/ -r --yes
+rstore rm media/tmp/ -r --dry-run
 ```
 
-`mv` 的安全顺序：**复制 → 校验目标大小 → 才删源**。校验不过源文件保留。
+`mv` safety order: copy → verify target size → delete source. A failed
+verification leaves the source untouched.
 
-### 6. 索引与本地目录（可选增强层）
+### 6. Indexing and the local catalog
 
-索引把桶扫描进本地 SQLite 目录，是 `files` 搜索和 `tag` 的数据基础：
+Indexing scans buckets into the SQLite catalog; it feeds `files` and `tag`:
 
 ```sh
-# 按桶索引（注意：参数是桶，不是 workspace）
-rstore index start bucket_name/media
-rstore index status            # 各桶进度/checkpoint
-rstore index pause bucket_name/media   # 标记暂停（前台正在跑的扫描用 Ctrl+C）
-rstore index resume bucket_name/media  # 从 checkpoint 继续
-rstore index cancel bucket_name/media  # 取消，已完成的部分保留
+rstore index start bucket_name/media     # note: a bucket reference
+rstore index status                      # per-bucket progress/checkpoints
+rstore index pause bucket_name/media     # mark paused (Ctrl+C stops a live scan)
+rstore index resume bucket_name/media    # continue from the checkpoint
+rstore index cancel bucket_name/media    # stop; completed data stays
 
-# 维护
-rstore index refresh bucket_name/media   # 对账：远端已删的行标记 stale
-rstore index rebuild bucket_name/media --yes   # 清空重扫（标签定义保留）；会先确认
-rstore index stats                    # 目录规模概览
-rstore catalog gc --dry-run           # 清理过期删除记录（默认保留 30 天）
+rstore index refresh bucket_name/media   # reconcile: remote-gone rows go stale
+rstore index rebuild bucket_name/media --yes  # rescan (tag definitions survive)
+rstore index stats                       # catalog size overview
+rstore catalog gc --dry-run              # preview tombstone purge (30-day default)
 ```
 
-索引是**桶级**操作；workspace 只是检索视图——见下一节。不建 workspace 也能用 `remote ls --update-catalog` 喂数据，只是没有 `files`/`tag` 入口。
+Indexing is bucket-scoped; workspaces only scope retrieval (next section).
+Without a workspace you can still feed the catalog via
+`remote ls --update-catalog`, but `files`/`tags` need one.
 
-### 7. Workspace：圈定检索范围
+### 7. Workspaces: scoping retrieval
 
-workspace = 一组桶的命名视图。`files` 和 `tag` 都以它为作用域：
+A workspace is a named view over a set of member buckets; `files` and `tag`
+are workspace-scoped:
 
 ```sh
-rstore workspace create proj-a --description "A 项目的资产"
+rstore workspace create proj-a --description "Project A assets"
 rstore workspace bucket add proj-a bucket_name/media
 rstore workspace bucket add proj-a bucket_name/backup
 rstore workspace bucket list proj-a
 
 rstore workspace list
 rstore workspace show proj-a
-rstore workspace remove proj-a --yes   # 桶和远端数据不受影响
+rstore workspace remove proj-a --yes    # buckets and remote data untouched
 ```
 
-### 8. 搜索与打标
+### 8. Search and tags
 
 ```sh
-# 混合文件列表：跨成员桶，SQL 级过滤 + 游标分页
+# Mixed listing across member buckets: SQL-level filters + cursor paging.
 rstore files list proj-a
 rstore files list proj-a --bucket bucket_name/media --path docs/
 rstore files list proj-a --sort size:desc --limit 100
-rstore files list proj-a --after <cursor>          # 下一页
-rstore files list proj-a --untagged                # 只看没标签的
+rstore files list proj-a --after <cursor>
+rstore files list proj-a --untagged
 
-# 名称搜索（trigram 索引，大目录快）
-rstore files search proj-a logo
+rstore files search proj-a logo          # trigram name search
 
-# 单对象详情（含标签与新鲜度）
 rstore files show media/img/logo.png --workspace proj-a
 
-# 标签
 rstore tag create proj-a important --color ff0000
 rstore tag add proj-a media/img/logo.png --tag important
-rstore tag add proj-a - --tag draft < uris.txt     # 批量
-rstore tag add proj-a <uri> --tag a --tag b --replace   # 整组替换
-rstore tag detach proj-a <uri> --tag draft         # 省略 --tag = 全部摘掉
-rstore tag list proj-a                             # 含每个标签的对象计数
-rstore tag merge proj-a old-name new-name          # 合并，源标签消失
+rstore tag add proj-a - --tag draft < uris.txt        # batch
+rstore tag add proj-a <uri> --tag a --tag b --replace # replace the whole set
+rstore tag detach proj-a <uri> --tag draft            # omit --tag to clear all
+rstore tag list proj-a                                # includes object counts
+rstore tag merge proj-a old-name new-name --yes       # source tag disappears
 rstore tag remove proj-a draft --yes
 ```
 
-标签是 workspace 级的：同一个标签体系在 `proj-a` 和 `proj-b` 里互不影响。
+Tags are workspace-scoped: the same tag name in two projects never collides.
 
-### 9. 链接生成
+### 9. Link generation
 
 ```sh
-rstore url media/img/logo.png                # 公开 URL（按桶配置的 base）
+rstore url media/img/logo.png                    # public URL from bucket config
 rstore url media/img/logo.png --format markdown
-rstore url <uri> --format s3        # s3://bucket/key 形式
-rstore url <uri> --format path      # 桶内相对路径
-rstore url <uri> --format html --json   # 批量、机器可读
-rstore url - --format json < uris.txt    # stdin 批量（# 开头是注释）
+rstore url <uri> --format s3                     # s3://bucket/key
+rstore url <uri> --format path                   # bucket-relative path
+rstore url <uri> --format html --json            # batch, machine-readable
+rstore url - --format json < uris.txt            # stdin batch (# = comment)
 
-# 预签名（限时访问；最长 7 天）
+# Presigned URLs (time-limited, up to 7 days).
 rstore url media/report.pdf --signed --ttl 1h
-rstore url media/report.pdf --signed           # 省略 --ttl 用桶的默认 TTL
+rstore url media/report.pdf --signed             # bucket default TTL
 ```
 
-`url` 逐条独立成败：一条引用失败不影响其余（人类输出一行一条链接，可直接管道），部分失败退出 13。
+Each URI succeeds or fails independently — one bad reference does not affect
+the rest (human output stays one pipeable link per line; per-item errors go
+to stderr). Any failure exits 13.
 
-**链接配置**：连接保存 public/CDN base 的默认值，桶可以分别覆盖这两个值；权限和默认
-TTL 始终属于桶。`bucket show` 只显示每种 base 的最终配置值；继承连接默认值时，标签会
-追加 `(connection)`：
+**Link configuration**: connections store public/CDN base defaults and each
+bucket may override them; permissions and the default TTL belong to the
+bucket. `bucket show` displays the effective value and marks values inherited
+from the connection:
 
 ```sh
 rstore connection edit supabase \
@@ -259,122 +282,135 @@ rstore bucket link set bucket_name/media \
   --public-base https://public.example.com/media \
   --cdn-base https://cdn.example.com/media \
   --allow-presigned --default-ttl 15m
-# 同样五个 bucket link flag 也能直接跟在 bucket edit 后面
+# The same five flags also work after `bucket edit`.
 ```
 
-公开 URL 的最终 base 优先级为：桶 CDN 覆盖 > 连接 CDN 默认 > 桶 public 覆盖 > 连接
-public 默认 > 连接 endpoint。rstore 不根据 provider 名称猜测或改写地址；例如 Supabase
-需要显式配置 `--public-base https://<ref>.supabase.co/storage/v1/object/public`。
-CDN base 适合填写自己的 CDN、反向代理或自定义域名。用空字符串传入 bucket 的
-`--public-base`/`--cdn-base` 可清除对应的桶级覆盖。预签名需要桶和适配器支持，不支持时报
-`capability_unsupported`（退出码 11）。
+Effective public base precedence: bucket CDN override → connection CDN
+default → bucket public override → connection public default → connection
+endpoint. rstore never guesses provider-specific URL shapes; Supabase, for
+example, needs its public base configured explicitly. Passing an empty string
+to `--public-base`/`--cdn-base` clears the override. Presigning requires
+bucket and adapter support and reports `capability_unsupported` otherwise.
 
-### 10. 任务管理
+### 10. Task management
 
-每次 upload/download/cp/mv/rm 都是一个持久化 job：
+Every upload/download/cp/mv/rm is a persisted job:
 
 ```sh
-rstore task list                 # 新任务在前；有待修复项时附计数
-rstore task show 1               # 最新那个；或 job_xxx id
-rstore task show 1 --errors      # 带失败明细
-rstore task retry 1              # 失败/部分失败的 job 标记重跑
+rstore task list                 # newest first; repair counts when present
+rstore task show 1               # newest job, or a job_… id
+rstore task show 1 --errors      # include failure details
+rstore task retry 1              # re-arm a failed/partial job
 rstore task cancel 3
-rstore task pause 2 / rstore task resume 2     # 持久化状态转移；前台跑着的任务用 Ctrl+C
+rstore task pause 2 / rstore task resume 2
 ```
 
-想真正续传/重跑，重发原命令即可——upload/download 会从 checkpoint 继续；跨进程暂停另一个 rstore 里正在跑的任务尚未支持。
+To actually resume work, re-issue the original command — transfers continue
+from checkpoints. Pausing a live transfer inside another rstore process is
+not supported yet (the process lock serializes runtimes).
 
-### 11. 诊断、配置与迁移
+### 11. Diagnostics, configuration, migration
 
 ```sh
-rstore doctor          # 数据库/适配器、连接数（未测计数）、待处理 outbox/repair、中断任务
-rstore config show     # 数据/配置/缓存/日志目录和 db 路径
+rstore doctor          # adapter, connections (+untested), outbox/repairs, interrupts
+rstore config show     # data/config/cache/log directories and db path
 
-# 机器迁移/备份注册表（永远不含密钥）
+# Machine migration/backup of the registry — never contains credentials.
 rstore config export > bundle.json
 rstore config export --out bundle.json
-rstore config import bundle.json --dry-run    # 预览
-rstore config import bundle.json              # 重名跳过，绝不覆盖
+rstore config import bundle.json --dry-run    # preview
+rstore config import bundle.json              # duplicates are skipped, never overwritten
 ```
 
-迁移后密钥要重新录入（`connection edit NAME --access-key ... --secret-key ...`）——密钥不随 bundle 走是设计行为。
+After migrating, re-enter credentials with
+`connection edit NAME --access-key … --secret-key …` — excluding secrets from
+bundles is deliberate.
 
-### 12. 脚本化速查
+### 12. Scripting cheat sheet
 
 ```sh
-rstore ... --json | jq .data            # 结构化输出在 envelope 的 data 字段
-some-cmd | rstore rm -                  # stdin 批量 URI（# 开头是注释）
-some-cmd | rstore url - --format json   # url 同样吃 stdin 批量
-rstore ... --quiet                      # 只留结果
-rstore ... 2>/dev/null                  # 只看 stdout 结果、丢掉 stderr 诊断
-set -e; rstore upload ...               # 部分失败退出码 13，脚本可感知
+rstore ... --json | jq .data            # structured payload lives in data
+some-cmd | rstore rm -                  # stdin batch URIs (# starts a comment)
+some-cmd | rstore url - --format json
+rstore ... --quiet                      # results only
+rstore ... 2>/dev/null                  # stdout results, drop diagnostics
+set -e; rstore upload ...               # any item failure exits 13
 ```
 
 ---
 
-## 命令参考
+## Command reference
 
-全局选项（所有命令可用）：`--config <PATH>` 指定数据根目录；`--log-level <LEVEL>`（默认 `warn`）；`--json`；`-q/--quiet`。
+Global options on every command: `--config <PATH>` (data root), `--log-level
+<LEVEL>` (default `warn`), `--json`, `-q/--quiet`.
 
-| 命令 | 作用 | 关键参数 |
+| Command | Purpose | Key flags |
 |---|---|---|
-| `connection add <NAME>` | 注册连接 | `--endpoint` `--public-base` `--cdn-base` `--region` `--addressing-style {auto,path,virtual-host}` `--access-key` `--secret-key` `--tls-verify` |
-| `connection list` | 列连接 | `--filter <子串>`（名字/endpoint，不分大小写） |
-| `connection show <REF>` | 连接详情 | 显示脱敏后的 AK/SK；`--capabilities` 实测 list/分片/复制/预签名 |
-| `connection test <REF>` | 三步探测 | `--write-test`（含写探针） |
-| `connection edit <REF>` | 改可变字段 | `--name` `--endpoint` `--public-base` `--cdn-base` `--region` `--addressing-style`（+重新给密钥） |
-| `connection remove <REF>` | 删除注册 | `--yes`；连带删除该 Connection 配置中的凭证 |
-| `bucket discover <CONN>` | 列远端可见桶 | |
-| `bucket add <CONN> <NAME>` | 注册桶 | `--display-name` `--read-only` `--allow-delete` `--index-enabled` `--conflict` `--skip-verify` |
-| `bucket list` | 已注册桶 | |
-| `bucket show <REF>` / `bucket edit <REF>` | 查看/调整本地设置 | show 含 public/CDN base（继承连接默认值时标记 connection）；edit：`--display-name` `--read-only` `--allow-delete` `--index-enabled` `--conflict` `--concurrency` + public/CDN/链接权限五 flag |
-| `bucket remove <REF>` | 删本地注册 | `--yes` |
-| `bucket link show <REF>` / `bucket link set <REF>` | 桶链接档案 | `--public-base` `--cdn-base` `--allow-public-url` `--allow-presigned` `--default-ttl`；只改给出的项 |
-| `bucket ignore add/list/remove <REF> <DIR>` | 索引忽略目录 | |
-| `workspace create <NAME>` | 建工作区 | `--description` |
-| `workspace list/show/edit/remove` | 管理 | remove 需 `--yes` |
-| `workspace bucket add/remove <WS> <REF>` | 成员管理 | |
-| `workspace bucket list <WS>` | 成员列表 | |
-| `remote ls <URI>` | 实时列目录 | URI 支持短格式；`--cursor` `--limit` `--update-catalog` |
-| `remote stat <URI>` | 对象元数据 | |
-| `index start <BUCKET>` | 扫描入目录 | 断点续扫；参数是**桶引用** |
-| `index status/stats` | 状态/规模 | |
-| `index pause/resume/cancel <BUCKET>` | 扫描控制 | 参数是**桶引用** |
-| `index refresh <BUCKET>` | 对账标 stale | |
-| `index rebuild <BUCKET>` | 重扫 | 标签定义保留；破坏性确认，非交互需 `--yes` |
-| `files list <WS>` | 混合列表 | `--path` `--bucket`（可重复）`--sort <name|size|modified|type|bucket|connection>:<asc|desc>` `--limit` `--after` `--untagged` |
-| `files search <WS> <PATTERN>` | 名称搜索 | `--sort` `--limit` |
-| `files show <URI>` | 对象详情 | URI 支持短格式；`--workspace` |
-| `tag create <WS> <NAME>` | 建标签 | `--color` `--description` |
-| `tag list/edit/remove` | 管理 | remove 需 `--yes` |
-| `tag merge <WS> <SRC> <DST>` | 合并 | 源标签移除，关联去重迁移 |
-| `tag add <WS> <URIS.../- >` | 打标 | URI 支持短格式；`--tag`（可重复）`--replace`；`-` 读 stdin |
-| `tag detach <WS> <URIS.../- >` | 摘标 | URI 支持短格式；`--tag`；省略 = 全部 |
-| `upload <SOURCES...> <TARGET>` | 上传 | 目标支持短格式 `桶/[前缀/]`；`-r` `--conflict` `--dry-run` `--yes` `--no-progress`；`-` 读 stdin |
-| `download <SOURCES...> <TARGET>` | 下载 | 远端源支持短格式；多 URI 批量，一 URI 一子任务；其余同 upload |
-| `cp <SOURCES.../-> <TARGET>` | 复制 | 源和目标均支持短格式；`--conflict` `--dry-run` `--yes` `-r` `--keep-tags` |
-| `mv <SOURCES.../-> <TARGET>` | 移动 | 同上；删源前校验目标 |
-| `rm <URIS.../->` | 删除 | URI 支持短格式；`--recursive` `--dry-run` `--yes` |
-| `task list/show/pause/resume/retry/cancel` | 任务管理 | show 支持 `--errors`；引用支持序号 |
-| `url <URIS.../->` | 链接 | URI 支持短格式、`-` 读 stdin；逐条独立成败；`--format path/s3/url/markdown/html/json` `--signed` `--ttl` |
-| `catalog gc` | 清删除记录 | `--dry-run` `--retention 30m/1h/1d/2w/秒`（上限 365d） |
-| `config show/export/import` | 本地配置 | export `--out`；import `--dry-run`，重名跳过 |
-| `doctor` | 体检 | |
-| `version` | 版本 | |
+| `connection add <NAME>` | Register a connection | `--endpoint` `--public-base` `--cdn-base` `--region` `--addressing-style {auto,path,virtual-host}` `--access-key` `--secret-key` `--tls-verify` |
+| `connection list` | List connections | `--filter <substring>` (case-insensitive name/endpoint) |
+| `connection show <REF>` | Connection details | masked keys; `--capabilities` runs live probes |
+| `connection test <REF>` | Three-step test | `--write-test` adds a write probe |
+| `connection edit <REF>` | Edit mutable fields | `--name` `--endpoint` `--public-base` `--cdn-base` `--region` `--addressing-style` (plus re-entering keys) |
+| `connection remove <REF>` | Remove registration | `--yes`; deletes stored credentials too |
+| `bucket discover <CONN>` | List visible remote buckets | |
+| `bucket add <CONN> <NAME>` | Register a bucket | `--display-name` `--read-only` `--allow-delete` `--index-enabled` `--conflict` `--skip-verify` |
+| `bucket list` | Registered buckets | |
+| `bucket show <REF>` / `bucket edit <REF>` | View/adjust settings | edit accepts the registration flags plus `--concurrency` and the five link flags |
+| `bucket remove <REF>` | Remove registration | `--yes` |
+| `bucket link show/set <REF>` | Bucket link profile | `--public-base` `--cdn-base` `--allow-public-url` `--allow-presigned` `--default-ttl`; only given flags change |
+| `bucket ignore add/list/remove <REF> <DIR>` | Index ignore directories | |
+| `workspace create <NAME>` | Create a workspace | `--description` |
+| `workspace list/show/edit/remove` | Manage | remove requires `--yes` |
+| `workspace bucket add/remove/list <WS>` | Membership | |
+| `remote ls <URI>` | Live listing | short references; `--cursor` `--limit` `--update-catalog` |
+| `remote stat <URI>` | Object metadata | |
+| `index start <BUCKET>` | Scan into catalog | checkpointed; takes a **bucket reference** |
+| `index status/stats` | State and sizes | |
+| `index pause/resume/cancel <BUCKET>` | Scan control | |
+| `index refresh <BUCKET>` | Reconcile stale rows | |
+| `index rebuild <BUCKET>` | Full rescan | destructive confirmation; non-interactive requires `--yes` |
+| `files list <WS>` | Mixed listing | `--path` `--bucket` (repeatable) `--sort <field>:<dir>` `--limit` `--after` `--untagged` |
+| `files search <WS> <PATTERN>` | Name search | `--sort` `--limit` |
+| `files show <URI>` | Object detail | `--workspace` |
+| `tag create <WS> <NAME>` | Create a tag | `--color` `--description` |
+| `tag list/edit/remove` | Manage | remove requires `--yes` |
+| `tag merge <WS> <SRC> <DST>` | Merge tags | source removed, associations deduplicated; destructive confirmation, non-interactive requires `--yes` |
+| `tag add <WS> <URIS…/- >` | Attach tags | `--tag` (repeatable) `--replace`; `-` reads stdin |
+| `tag detach <WS> <URIS…/- >` | Detach tags | omitting `--tag` clears all |
+| `upload <SOURCES…> <TARGET>` | Upload | `-r` `--conflict` `--dry-run` `--yes` `--no-progress`; `-` reads stdin |
+| `download <SOURCES…> <TARGET>` | Download | multi-URI batches become per-URI subtasks |
+| `cp <SOURCES…/-> <TARGET>` | Copy | `-r` `--conflict` `--dry-run` `--yes` `--keep-tags` |
+| `mv <SOURCES…/-> <TARGET>` | Move | as cp; verifies target before deleting source |
+| `rm <URIS…/->` | Delete | `-r` `--dry-run` `--yes` |
+| `task list/show/pause/resume/retry/cancel` | Job management | show supports `--errors`; ordinals accepted |
+| `url <URIS…/->` | Links | per-item independence; `--format path/s3/url/markdown/html/json` `--signed` `--ttl` |
+| `catalog gc` | Purge tombstones | `--dry-run` `--retention 30m/1h/1d/2w/seconds` (max 365d); actual purge is destructive confirmation, non-interactive requires `--yes` |
+| `config show/export/import` | Local configuration | export `--out`; import `--dry-run` skips duplicates |
+| `doctor` | Health report | |
+| `version` | Version | |
 
-### 数据存放位置
+### Where data lives
 
-| 内容 | 位置 |
+| Contents | Location |
 |---|---|
-| 连接/桶/workspace/标签定义/索引/任务 | `catalog.db`（SQLite，WAL），见 `rstore config show` |
-| 凭证 | Connection 配置表（SQLite） |
-| 日志 | `<config>/log/`（滚动） |
+| Catalog (connections, buckets, workspaces, tags, index, jobs) | `catalog.db` (SQLite, WAL) — see `rstore config show` |
+| Credentials | The connection table inside the catalog database |
+| Logs | `<log dir>/` (daily rolling) |
 
-### 常见问题
+### Troubleshooting
 
-- **连接测试通过，桶操作 404** → endpoint 带路径时确认写全；部分网关（Supabase）需要 `--addressing-style path`。
-- **`bucket add` 警告 not readable 但注册成功** → 探测失败不阻断，先用 `remote ls` 看真实错误；`--skip-verify` 可跳过探测。
-- **非交互下删除/确认报错** → 破坏性操作加 `--yes`（含 `index rebuild`）；`ask` 冲突策略加 `--yes`（视为 overwrite）或换 `--conflict`。
-- **自签证书 / `--tls-verify=false`** → 该开关目前只存储设置、尚未接入校验器；证书仍按系统默认校验。
-- **Ctrl+C 之后** → 任务存为 interrupted，重跑原命令即续传；`task list` 可查。
-- **换机器** → `config export/import` 迁注册表；导出文件不含凭证，导入后重新录入密钥。
+- **Connection test passes, bucket operations 404** — verify the endpoint is
+  complete; gateways like Supabase need `--addressing-style path`.
+- **`bucket add` warns "not readable" but registers** — the probe is
+  non-blocking; run `remote ls` for the real error or pass `--skip-verify`.
+- **Non-interactive delete/confirm errors** — destructive operations need
+  `--yes` (including `catalog gc`, `tag merge`, `index rebuild`); an `ask`
+  conflict policy needs `--yes` (resolved as overwrite) or a different
+  `--conflict`.
+- **Self-signed certificates / `--tls-verify=false`** — the setting is
+  stored but not yet applied to a custom verifier; system defaults still
+  apply.
+- **After Ctrl+C** — the job persists as interrupted; re-run the original
+  command to resume, `task list` to inspect.
+- **Changing machines** — `config export/import` moves the registry;
+  re-enter credentials afterwards because bundles exclude them.

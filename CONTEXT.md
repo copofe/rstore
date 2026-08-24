@@ -1,48 +1,76 @@
-# CONTEXT.md — 领域术语与边界速查
+# CONTEXT.md — Domain Glossary
 
-完整架构说明见 `docs/architecture-guide.md`；协作规则见 `AGENTS.md`。本文件只收录
-评审与开发对话中实际使用、且需要唯一定义的术语。按字母序排列。
+This file defines the terms used in design discussions and code review, in
+one place. Each term has exactly one meaning; the architecture guide
+([`docs/architecture-guide.md`](docs/architecture-guide.md)) explains how the
+terms map to crates. Entries are grouped by concern.
 
-## 组合与启动
+## Composition and startup
 
-- **组合根（Composition Root）** — `crates/bootstrap`。唯一允许选择具体 SQLite、
-  Storage 适配器、Outbox 与通知通道的层；生产代码中只有它打开 `Database`。
-- **组装点（assemble）** — `rstore_persistence::assemble(db, storage_factory,
-  clock) → ApplicationDependencies`。把一个已打开的 `Database` 与可选 Storage
-  工厂、时钟装配成 Application 依赖图的唯一函数；依赖组结构与端口别名词汇表
-  位于 `rstore_application_ports::deps`。生产启动（bootstrap）与测试夹具
-  （application::test_util）都必须经过它，不得各自转写依赖列表。
-- **写门（WriteGate）** — `rstore_persistence::tx::WriteGate`。写连接池与
-  有界写者（SqliteWriter）的不可拆分配对，`Database::gate()` 是唯一发放处。
-  repo 的多语句写只能经 `gate.write_unit(label, work)`（permit 与事务一体
-  获取，重入死锁在构造上不可能）；单语句写经 `gate.permit()`。repo 构造器
-  只收 `(gate, read_pool)`——不存在能绕开共享写门、自建 writer 的单池构造
-  器；`tx::atomically` 随之私有，事务只从写门进入。
-- **启动编排（Runtime::open_locked）** — `bootstrap::Runtime::open_locked(&AppDirs)`。
-  进程启动的完整序列：创建数据目录 → 获取跨进程写锁（DATA-008）→ 打开数据库 →
-  迁移 → 恢复 processing 状态的 Outbox 事件 → `Application::initialize`（把遗留
-  非终态 Job 标记为 interrupted）。锁 guard 由返回的 `Runtime` 持有，进程退出即释放。
-- **构造/恢复分离（from_dependencies / initialize）** — `Application::from_dependencies`
-  只组装服务、保持确定性；`Application::initialize` 执行启动恢复规则。两者分离是
-  有意设计：测试可以只构造不恢复。
-- **进程写锁（AppLock）** — `crates/platform` 提供的跨进程互斥锁（DATA-008）。
-  platform 不依赖 domain；`LockError → domain::Error` 的映射只发生在 bootstrap。
+- **Composition root** — `crates/bootstrap`. The only layer allowed to choose
+  concrete SQLite, storage adapter, outbox, and notification implementations;
+  the only production code that opens the `Database`.
+- **Assembly point (`assemble`)** — `rstore_persistence::assemble(db,
+  storage_factory) -> ApplicationDependencies`. The single function that
+  turns an opened `Database` (which carries the injected clock) plus an
+  optional storage factory into the application dependency graph; the group
+  structs and port aliases live in `rstore_application_ports::deps`.
+  Bootstrap and the application test fixture both go through it — neither
+  re-transcribes the dependency list.
+- **Write gate** — `rstore_persistence::tx::WriteGate`. The write pool and
+  the bounded writer actor as an inseparable pair, handed out only by
+  `Database::gate()`. Multi-statement repository writes go through
+  `gate.write_unit(label, work)` (the permit and the transaction are acquired
+  together, so re-entrant deadlock is impossible by construction); single
+  statements take `gate.permit()`. Repository constructors receive only
+  `(gate, read_pool)` — no construction path can bypass the shared gate.
+- **Startup sequence (`Runtime::open_locked`)** — the complete process-startup
+  order: create data directories → take the cross-process write lock → open
+  the database (with the configured clock) → run migrations → recover outbox
+  events stuck in processing → `Application::initialize` (marks orphaned
+  non-terminal jobs interrupted). The returned `Runtime` holds the lock guard
+  for the process lifetime.
+- **Construction vs recovery** — `Application::from_dependencies` only wires
+  services and stays deterministic; `Application::initialize` applies startup
+  recovery rules. Deliberately separate so tests can construct without
+  recovering.
+- **Process write lock (`AppLock`)** — the cross-process mutex from
+  `crates/platform`. The platform crate does not depend on domain; mapping a
+  `LockError` to a `domain::Error` happens only in bootstrap.
 
-## 核心域（速查，详见 architecture-guide §1）
+## Core domains
 
-- **Registry / Catalog / Transfer / AccessDiagnostics** — 四个领域上下文。
-- **Connection** — 一个 S3 兼容端点的配置 + 凭据（凭据存于 Connection 行，
-  内存中为 `Secret<T>`）。
-- **Bucket** — Connection 下的远端桶，携带 `read_only` / `allow_delete` 守卫位。
-- **RemoteObject** — Catalog 中一个远端对象的本地投影（含 tombstone 生命周期）。
-- **Job** — 一次批处理运行的持久化意图与状态机（Pending → Running → …）。
-- **Outbox / Repair** — 远端变更事实的可靠落库与可查询的跟进失败。
-- **RemoteMutationReceipt** — 远端操作成功的事实凭据，与 Outbox fact 同事务提交。
-- **Storage / StorageFactory** — Provider 无关的存储端口与工厂端口（storage-api）。
-- **Multipart 会话（MultipartSession）** — storage-api 的会话端口：
-  `Storage::create_multipart` / `adopt_multipart` 返回会话句柄，part 上传
-  （`upload_part`）、服务端段拷贝（`copy_part`，默认 CapabilityUnsupported，
-  S3 以 UploadPartCopy 覆写）、`complete` 与 `abort` 都在会话上。三种失败
-  处置随类型走且只有一份：`complete` 从不 abort（留待续传）、`abort` 严格
-  （失败即错误）、`abandon(self)` warn-only 消费。重试装饰器返回包一层
-  RetryingSession，段级重试语义与平铺时代一致。
+- **Registry / Catalog / Transfer / AccessDiagnostics** — the four bounded
+  contexts of the domain model.
+- **Connection** — one S3-compatible endpoint's configuration plus
+  credentials. Credentials are stored in the connection row and held in
+  memory as `Secret<T>`.
+- **Bucket** — a remote bucket registered under a connection, carrying the
+  `read_only` and `allow_delete` guard bits. The gateway enforces them at
+  the seam: a `Writer` or `Deleter` handle is only issued when the flags
+  allow the intent, so a use case holding one cannot bypass the guard.
+- **Workspace** — a local grouping of buckets that scopes catalog rows,
+  tags, and ignore rules.
+- **RemoteObject** — the local projection of one remote object in the
+  catalog, including its tombstone lifecycle.
+- **Job** — the persisted intent and state machine of one batch run
+  (pending → running → …); no job survives its process.
+- **Outbox / Repair** — durable recording of remote-change facts, and the
+  queryable record of follow-up failures.
+- **RemoteMutationReceipt** — the durable fact that a remote operation
+  succeeded, committed in the same transaction as its outbox fact.
+- **Storage / StorageFactory** — the provider-neutral storage port and its
+  factory port (`crates/storage-api`).
+
+## Multipart sessions
+
+- **Multipart session (`MultipartSession`)** — the provider-side session port
+  on `storage-api`: `Storage::create_multipart` / `adopt_multipart` return a
+  handle owning part upload (`upload_part`), server-side part copy
+  (`copy_part`, default `CapabilityUnsupported`; S3 overrides with
+  UploadPartCopy), `complete`, and `abort`. Three failure dispositions ride
+  the type and exist exactly once: `complete` never aborts (a checkpointed
+  caller resumes), `abort` is strict (failure surfaces),
+  `abandon(self)` is warn-only teardown for callers without a resume path.
+  The retry decorator wraps sessions transparently, preserving per-part
+  retry semantics.
