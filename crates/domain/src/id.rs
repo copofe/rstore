@@ -1,10 +1,10 @@
-//! Strongly-typed identifiers (CORE-008).
+//! Strongly-typed identifiers.
 //!
-//! Each entity owns a distinct newtype over [`uuid::Uuid`]. They never share a
-//! bare `String`/`Uuid` type, so the compiler prevents connection IDs being
+//! Each entity owns a distinct newtype over [`uuid::Uuid`]. They never share
+//! a bare `String`/`Uuid` type, so the compiler prevents connection IDs being
 //! passed where a bucket ID is expected. JSON output is a stable prefixed
-//! string (`conn_<uuid>`, `bkt_<uuid>`, ...) so it is human-readable and still
-//! round-trips through `FromStr`.
+//! string (`conn_<uuid>`, `bkt_<uuid>`, ...) so it is human-readable and
+//! still round-trips through `FromStr`.
 
 use std::fmt;
 use std::str::FromStr;
@@ -26,6 +26,11 @@ pub trait TypedId:
 }
 
 /// Defines a typed ID newtype.
+///
+/// The string contract is `<prefix>_<uuid>` in both directions: [`Display`]
+/// and serde serialize with the prefix, `FromStr` and serde deserialize only
+/// the matching prefix — a foreign prefix or missing underscore is an
+/// [`ErrorCode::InvalidInput`] error, never a silent reinterpretation.
 macro_rules! define_id {
     ($(#[$m:meta])* $name:ident, $prefix:literal) => {
         $(#[$m])*
@@ -33,8 +38,8 @@ macro_rules! define_id {
         pub struct $name(pub uuid::Uuid);
 
         impl $name {
-            /// Generate a new random ID.
-            pub fn new() -> Self {
+            /// Generate a fresh random identity.
+            pub fn new_random() -> Self {
                 Self(uuid::Uuid::new_v4())
             }
 
@@ -44,11 +49,8 @@ macro_rules! define_id {
             }
         }
 
-        impl Default for $name {
-            fn default() -> Self {
-                Self::new()
-            }
-        }
+
+
 
         impl fmt::Display for $name {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -89,7 +91,7 @@ macro_rules! define_id {
                 self.0
             }
             fn new_random() -> Self {
-                Self::new()
+                Self(uuid::Uuid::new_v4())
             }
         }
 
@@ -130,7 +132,7 @@ define_id!(
     "wsp"
 );
 define_id!(
-    /// Stable identity for an indexed remote object (PRD §7.3).
+    /// Stable identity for an indexed remote object.
     RemoteObjectId,
     "obj"
 );
@@ -151,13 +153,25 @@ define_id!(
     "job"
 );
 
+define_id!(
+    /// Correlates one durable remote-mutation receipt with its repair items.
+    ReceiptId,
+    "rcpt"
+);
+
+define_id!(
+    /// Identifies one queryable catalog follow-up failure.
+    RepairId,
+    "rep"
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn round_trip_prefixed_string() {
-        let id = ConnectionId::new();
+        let id = ConnectionId::new_random();
         let s = id.to_string();
         assert!(s.starts_with("conn_"));
         let parsed: ConnectionId = s.parse().unwrap();
@@ -173,12 +187,12 @@ mod tests {
     fn types_do_not_mix() {
         // Compile-time guarantee: these are distinct types.
         fn takes_conn(_: ConnectionId) {}
-        takes_conn(ConnectionId::new());
+        takes_conn(ConnectionId::new_random());
     }
 
     #[test]
     fn serde_round_trip() {
-        let id = BucketId::new();
+        let id = BucketId::new_random();
         let json = serde_json::to_string(&id).unwrap();
         let back: BucketId = serde_json::from_str(&json).unwrap();
         assert_eq!(id, back);

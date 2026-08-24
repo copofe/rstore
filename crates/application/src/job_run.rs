@@ -1,31 +1,26 @@
-//! The shared job-run seam for batch remote operations.
+//! Persisted transfer-run loop shared by upload, download, and copy jobs.
 //!
-//! Every application module that persists a run as a [`Job`] and reports per-item
-//! outcomes (copy/move, upload/download) drives it through [`run_items`]:
-//! one item identity, one create-job path, one outcome→`ItemState`/counts mapping with the
-//! 200-char error truncation, one cancellation/interrupt path, and one
-//! terminal-state rule — `failed` and `blocked` both count toward failure
-//! (`failed>0 || blocked>0` → `PartialSuccess` when anything succeeded,
-//! else `Failed`). The rule lives only here so new batch commands cannot
-//! fork it. Callers provide one [`RunItem`] per operation; its persisted and
-//! reported identity cannot drift from the work item it describes.
+//! Drives a batch of [`RunItem`]s through a caller-supplied closure, mirroring
+//! every settled item into the durable job record and a [`TransferReport`].
+//! Contract: the job reaches a terminal state exactly once, via
+//! `JobRepository::commit_terminal`; interruption (cancel token or an
+//! `Step::Interrupted` step) marks remaining pending items cancelled and
+//! commits `Interrupted`.
 
 use std::future::Future;
 
+use crate::batch_outcome::{Disposition, Failure, SkipReason};
+use crate::transfer_report::{TransferReport, TransferReportItem};
+use rstore_application_ports::JobRepository;
 use rstore_domain::job::{ItemState, Job, JobItem, JobKind, JobState};
-use rstore_domain::JobRepository;
 use rstore_domain::{Clock, JobId, Result};
 use rstore_transfer::{CancellationToken, Progress, ProgressSink};
 
-use crate::transfer_report::{Outcome, TransferReport, TransferReportItem};
-
-/// Cap on the per-item `error_code` persisted into the jobs table; long
-/// adapter errors are truncated, not stored whole.
+/// Maximum characters of a per-item error detail persisted on the job record.
 const ERROR_CODE_CAP: usize = 200;
 
-/// One operation and the identity Job-run persists and reports for it.
-/// Keeping these values together keeps persisted identity and work-item
-/// ordering in one value.
+/// One schedulable unit inside a transfer run: display labels plus the
+/// caller-defined payload handed to the per-item closure.
 pub struct RunItem<T> {
     job_label: String,
     source: String,
@@ -34,6 +29,7 @@ pub struct RunItem<T> {
 }
 
 impl<T> RunItem<T> {
+    /// Builds an item with its job-record label and report source/target paths.
     pub fn new(
         job_label: impl Into<String>,
         source: impl Into<String>,
@@ -49,54 +45,66 @@ impl<T> RunItem<T> {
     }
 }
 
-/// What one item did when the callback ran it.
+/// Result of one per-item closure invocation.
 pub enum Step {
-    /// The item finished with this outcome and transferred byte count
-    /// (0 where not counted). Its identity stays on [`RunItem`].
+    /// The item finished; carry its disposition, optional detail, and byte
+    /// count.
     Done {
-        outcome: Outcome,
+        disposition: Disposition,
         detail: Option<String>,
         bytes: u64,
     },
-    /// The item was abandoned mid-flight (e.g. the engine saw `Cancelled`);
-    /// it stays pending and the run persists as interrupted.
+
+    /// The run must stop here; remaining items are marked cancelled.
     Interrupted,
 }
 
 impl Step {
-    /// A completed step that does not count bytes.
-    pub fn done(outcome: Outcome, detail: Option<String>) -> Self {
+    /// A completed item with no transferred bytes recorded.
+    pub fn done(disposition: Disposition, detail: Option<String>) -> Self {
         Self::Done {
-            outcome,
+            disposition,
             detail,
             bytes: 0,
         }
     }
 
-    /// A failed item — the one Err→Failed translation, so the failure detail
-    /// format cannot fork per caller.
+    /// A succeeded item with no detail.
+    pub fn succeeded() -> Self {
+        Self::done(Disposition::Succeeded, None)
+    }
+
+    /// A failed item whose detail is rendered from a domain error.
     pub fn failed(e: &rstore_domain::Error) -> Self {
-        Self::done(Outcome::Failed, Some(e.to_string()))
+        Self::Done {
+            disposition: Disposition::Failed(Failure::from_error(e)),
+            detail: Some(e.to_string()),
+            bytes: 0,
+        }
     }
 
-    /// A failed item narrated by a message rather than an error value — the
-    /// per-item failure arms that compose their own detail.
+    /// A failed item with a free-form detail message.
     pub fn failed_msg(detail: impl Into<String>) -> Self {
-        Self::done(Outcome::Failed, Some(detail.into()))
+        Self::Done {
+            disposition: Disposition::Failed(Failure {
+                code: rstore_domain::ErrorCode::Unknown,
+                message: String::new(),
+            }),
+            detail: Some(detail.into()),
+            bytes: 0,
+        }
     }
 
-    /// A dry-run preview (MOVE-012 / DEL-003): the run performed no work;
-    /// `detail` is the "would \<verb\> \<target\>" narration. The one
-    /// spelling of the preview policy, so the batch families cannot drift —
-    /// and a family without a narration is visible at the call site.
+    /// A dry-run/preview item: fully resolved, deliberately not executed.
     pub fn preview(detail: impl Into<String>) -> Self {
-        Self::done(Outcome::Succeeded, Some(detail.into()))
+        Self::done(
+            Disposition::Skipped(SkipReason::DryRun),
+            Some(detail.into()),
+        )
     }
 }
 
-/// Create the job, pre-populate its items as `Pending`, and transition it to
-/// `Running`. The persisted rows are derived from the same [`RunItem`] values
-/// the run later executes.
+/// Persists a fresh job in `Pending` state and transitions it to `Running`.
 async fn create_job<T>(
     jobs: &dyn JobRepository,
     clock: &dyn Clock,
@@ -104,15 +112,15 @@ async fn create_job<T>(
     items: &[RunItem<T>],
 ) -> Result<Job> {
     let now = clock.now();
-    let mut job = Job::new(kind, JobId::new(), now);
+    let mut job = Job::new(kind, JobId::new_random(), now);
     job.items = items
         .iter()
         .map(|item| JobItem {
-            remote_uri: item.job_label.clone(),
+            label: item.job_label.clone(),
             state: ItemState::Pending,
             bytes_total: 0,
             bytes_done: 0,
-            error_code: None,
+            error: None,
         })
         .collect();
     jobs.create(&job).await?;
@@ -120,14 +128,15 @@ async fn create_job<T>(
     Ok(job)
 }
 
-/// Run `items` one by one against `per_item`, bookkeeping the job items and
-/// the [`TransferReport`] as it goes, then persist the terminal state.
-///
-/// Cancellation is checked before every item; a callback that abandoned its
-/// item mid-flight returns [`Step::Interrupted`]. Both enter the one
-/// interrupt path (JOB-014/015): remaining pending items become `cancelled`
-/// and the job persists as `interrupted`.
 #[allow(clippy::too_many_arguments)]
+/// Runs every item through `per_item`, persisting per-item state and emitting
+/// progress as it goes, then commits a single terminal state:
+/// `Succeeded`, `PartialSuccess` (some failed/blocked), or `Failed` (none
+/// succeeded). Returns the resulting [`TransferReport`].
+///
+/// # Errors
+/// Propagates repository failures; a failing terminal commit leaves the job
+/// record in `Running` so a later sweep can mark stale runs interrupted.
 pub async fn run_items<T, F, Fut>(
     jobs: &dyn JobRepository,
     clock: &dyn Clock,
@@ -151,7 +160,7 @@ where
         skipped: 0,
         failed: 0,
         blocked: 0,
-        state: "running",
+        state: JobState::Running,
         dry_run,
     };
 
@@ -159,7 +168,6 @@ where
 
     for (index, item) in items.into_iter().enumerate() {
         if cancel.is_cancelled() || cancel.check().is_err() {
-            // Persist the checkpoint state; the caller reports exit 130.
             return interrupt(jobs, clock, job, index, report).await;
         }
 
@@ -170,7 +178,7 @@ where
             ..
         } = item;
         let Step::Done {
-            outcome,
+            disposition,
             detail,
             bytes,
         } = per_item(work).await
@@ -178,26 +186,30 @@ where
             return interrupt(jobs, clock, job, index, report).await;
         };
 
-        match outcome {
-            Outcome::Succeeded => {
+        match &disposition {
+            Disposition::Succeeded => {
                 report.succeeded += 1;
                 job.items[index].state = ItemState::Succeeded;
             }
-            Outcome::Skipped => {
+            Disposition::Skipped(_) => {
                 report.skipped += 1;
                 job.items[index].state = ItemState::Skipped;
             }
-            Outcome::Failed => {
+            Disposition::Failed(_) => {
                 report.failed += 1;
                 job.items[index].state = ItemState::Failed;
             }
-            Outcome::Blocked => {
+            Disposition::Blocked(_) => {
                 report.blocked += 1;
+                // Blocked items surface as failed on the durable record while
+                // keeping their distinct counter in the report.
                 job.items[index].state = ItemState::Failed;
             }
         }
         if let Some(d) = &detail {
-            job.items[index].error_code = Some(d.chars().take(ERROR_CODE_CAP).collect());
+            // Cap persisted details so oversized provider errors cannot bloat
+            // the job record.
+            job.items[index].error = Some(d.chars().take(ERROR_CODE_CAP).collect());
         }
         job.items[index].bytes_done = bytes;
         job.items[index].bytes_total = bytes;
@@ -205,7 +217,7 @@ where
             source,
             target,
             kind: kind.as_str(),
-            outcome,
+            disposition,
             detail,
         });
         let settled = (report.succeeded + report.skipped + report.failed + report.blocked) as u64;
@@ -215,8 +227,8 @@ where
         });
     }
 
-    // Terminal state (JOB-011 semantics): `failed` and `blocked` both count
-    // toward failure; anything succeeded alongside → PartialSuccess.
+    // Single terminal commit: partial success only when at least one item
+    // landed alongside failures/blocks.
     let final_state = if report.failed > 0 || report.blocked > 0 {
         if report.succeeded > 0 {
             JobState::PartialSuccess
@@ -229,12 +241,11 @@ where
     let committed = jobs
         .commit_terminal(job.id, &job.items, final_state, clock.now())
         .await?;
-    report.state = committed.state.as_str();
+    report.state = committed.state;
     Ok(report)
 }
 
-/// Persist an interrupted job: remaining pending items become `cancelled`,
-/// the job transitions to `interrupted` (JOB-014/015).
+/// Marks all not-yet-settled items cancelled and commits `Interrupted`.
 async fn interrupt(
     jobs: &dyn JobRepository,
     clock: &dyn Clock,
@@ -250,7 +261,7 @@ async fn interrupt(
     let committed = jobs
         .commit_terminal(job.id, &job.items, JobState::Interrupted, clock.now())
         .await?;
-    report.state = committed.state.as_str();
+    report.state = committed.state;
     Ok(report)
 }
 
@@ -265,6 +276,7 @@ mod tests {
     use rstore_transfer::NullProgressSink;
 
     use super::*;
+    use crate::batch_outcome::BlockReason;
 
     #[derive(Default)]
     struct MemoryJobs {
@@ -387,7 +399,7 @@ mod tests {
             &CancellationToken::new(),
             |bytes| async move {
                 Step::Done {
-                    outcome: Outcome::Succeeded,
+                    disposition: Disposition::Succeeded,
                     detail: None,
                     bytes,
                 }
@@ -398,13 +410,13 @@ mod tests {
 
         let job = jobs.get(report.job_id).await.unwrap().unwrap();
         assert_eq!(job.items.len(), 1);
-        assert_eq!(job.items[0].remote_uri, "persisted");
+        assert_eq!(job.items[0].label, "persisted");
         assert_eq!(job.items[0].state, ItemState::Succeeded);
         assert_eq!(job.items[0].bytes_done, 7);
         assert_eq!(report.items.len(), 1);
         assert_eq!(report.items[0].source, "source");
         assert_eq!(report.items[0].target, "target");
-        assert_eq!(report.state, "succeeded");
+        assert_eq!(report.state, JobState::Succeeded);
     }
 
     #[tokio::test]
@@ -415,16 +427,21 @@ mod tests {
             &TestClock::default(),
             JobKind::Copy,
             vec![
-                RunItem::new("a", "a", "a-copy", Outcome::Succeeded),
-                RunItem::new("b", "b", "b-copy", Outcome::Blocked),
+                RunItem::new("a", "a", "a-copy", Disposition::Succeeded),
+                RunItem::new(
+                    "b",
+                    "b",
+                    "b-copy",
+                    Disposition::Blocked(BlockReason::Unresolved),
+                ),
             ],
             false,
             &NullProgressSink,
             &CancellationToken::new(),
-            |outcome| async move {
+            |disposition| async move {
                 Step::Done {
-                    outcome,
-                    detail: (outcome == Outcome::Blocked).then(|| "x".repeat(250)),
+                    detail: (!disposition.is_success()).then(|| "x".repeat(250)),
+                    disposition,
                     bytes: 0,
                 }
             },
@@ -434,12 +451,12 @@ mod tests {
 
         assert_eq!(report.succeeded, 1);
         assert_eq!(report.blocked, 1);
-        assert_eq!(report.state, "partial_success");
+        assert_eq!(report.state, JobState::PartialSuccess);
         let job = jobs.get(report.job_id).await.unwrap().unwrap();
         assert_eq!(job.state, JobState::PartialSuccess);
         assert_eq!(job.items[0].state, ItemState::Succeeded);
         assert_eq!(job.items[1].state, ItemState::Failed);
-        assert_eq!(job.items[1].error_code.as_deref().unwrap().len(), 200);
+        assert_eq!(job.items[1].error.as_deref().unwrap().len(), 200);
     }
 
     #[tokio::test]
@@ -454,7 +471,7 @@ mod tests {
             false,
             &NullProgressSink,
             &CancellationToken::new(),
-            |_| async { Step::done(Outcome::Succeeded, None) },
+            |_| async { Step::succeeded() },
         )
         .await
         .unwrap_err();
@@ -484,7 +501,7 @@ mod tests {
                 let cancel = cancel_from_work.clone();
                 async move {
                     cancel.cancel();
-                    Step::done(Outcome::Succeeded, None)
+                    Step::succeeded()
                 }
             },
         )
@@ -493,7 +510,7 @@ mod tests {
 
         assert_eq!(report.succeeded, 1);
         assert_eq!(report.items.len(), 1);
-        assert_eq!(report.state, "interrupted");
+        assert_eq!(report.state, JobState::Interrupted);
         let job = jobs.get(report.job_id).await.unwrap().unwrap();
         assert_eq!(job.state, JobState::Interrupted);
         assert_eq!(job.items[0].state, ItemState::Succeeded);

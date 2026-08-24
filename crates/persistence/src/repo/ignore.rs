@@ -1,18 +1,17 @@
-//! Repository for bucket ignore rules (IGN-).
-
+//! Repository for bucket ignore rules.
 use async_trait::async_trait;
 use rstore_application_ports::IgnoreRuleStore;
 use rstore_domain::id::BucketId;
-use rstore_domain::workspace::IgnoreRule;
-use rstore_domain::{Error, Result};
+use rstore_domain::workspace::{IgnoreRule, IgnoreRuleId};
+use rstore_domain::Result;
 use sqlx::sqlite::SqlitePool;
 
 use crate::codec::{unix_secs, uuid_to_text, Insert, RowReader};
 use crate::error::map_sqlx;
 use crate::tx::WriteGate;
 
-/// CRUD access to `bucket_ignore_rules`.
 #[derive(Clone)]
+/// CRUD access to `bucket_ignore_rules`.
 pub struct IgnoreRuleRepository {
     gate: WriteGate,
     read_pool: SqlitePool,
@@ -26,7 +25,6 @@ impl IgnoreRuleRepository {
 
 #[async_trait]
 impl IgnoreRuleStore for IgnoreRuleRepository {
-    /// All rules for a bucket (IGN-002).
     async fn list(&self, bucket: BucketId) -> Result<Vec<IgnoreRule>> {
         let rows = sqlx::query(
             "SELECT id, bucket_id, directory, enabled, created_at \
@@ -39,9 +37,8 @@ impl IgnoreRuleStore for IgnoreRuleRepository {
         rows.into_iter().map(row_to_rule).collect()
     }
 
-    /// Insert a rule. The directory must already be normalised
-    /// ([`IgnoreRule::normalise_directory`]); a duplicate directory is a
-    /// `Conflict` (IGN-013).
+    /// Insert a rule. The directory must already be normalised ([`IgnoreRule::normalise_directory`]);
+    /// a duplicate directory is a `Conflict`.
     async fn insert(&self, rule: &IgnoreRule) -> Result<()> {
         let _write = self.gate.permit().await?;
         Insert::into("bucket_ignore_rules")
@@ -51,19 +48,16 @@ impl IgnoreRuleStore for IgnoreRuleRepository {
             .column("created_at", unix_secs(rule.created_at))
             .execute(self.gate.pool())
             .await
+                        // map_sqlx classifies UNIQUE as Conflict; the remap adds the directory to the message.
             .map_err(|e| {
-                // map_sqlx already classifies UNIQUE as Conflict; this adds
-                // the directory to the message.
-                if e.code == rstore_domain::ErrorCode::Conflict {
-                    Error::conflict(format!("`{}` is already ignored", rule.directory))
-                } else {
-                    e
-                }
+                crate::error::with_conflict_message(e, || {
+                    format!("`{}` is already ignored", rule.directory)
+                })
             })?;
         Ok(())
     }
 
-    /// Delete by normalised directory; `true` when a rule was removed (IGN-003).
+    /// Delete by normalised directory; `true` when a rule was removed.
     async fn delete(&self, bucket: BucketId, directory: &str) -> Result<bool> {
         let _write = self.gate.permit().await?;
         let affected =
@@ -81,7 +75,7 @@ impl IgnoreRuleStore for IgnoreRuleRepository {
 fn row_to_rule(row: sqlx::sqlite::SqliteRow) -> Result<IgnoreRule> {
     let row = RowReader::new(row);
     Ok(IgnoreRule {
-        id: row.integer("id")?,
+        id: IgnoreRuleId(row.integer("id")?),
         bucket_id: rstore_domain::BucketId::from_uuid(row.uuid("bucket_id")?),
         directory: row.text("directory")?,
         enabled: row.bool("enabled")?,

@@ -1,4 +1,5 @@
-//! CLI snapshot + contract tests (CLI-030 / QA-013).
+//! CLI integration tests: help and command-tree coverage, plus JSON envelope
+//! snapshots for connection and transfer commands.
 
 use std::sync::Arc;
 
@@ -16,7 +17,7 @@ use rstore_platform::resolve_app_dirs;
 use rstore_test_support::TestClock;
 use time::OffsetDateTime;
 
-/// Fixed timestamp so envelope output is reproducible (CORE-009).
+/// Fixed timestamp so envelope output is reproducible.
 fn now() -> OffsetDateTime {
     OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap()
 }
@@ -40,8 +41,7 @@ fn help_snapshot() {
 
 #[test]
 fn command_tree_lists_all_domains() {
-    // CLI-001: the top-level command tree is complete. Domain names are read
-    // from clap itself, not repeated in a test-only constant.
+    // Domain names are read from clap itself, not repeated in a test-only constant.
     let help = Cli::command().render_help().to_string();
     for domain in command_domains() {
         assert!(help.contains(&domain), "help missing command `{domain}`");
@@ -116,7 +116,7 @@ async fn connection_add_produces_stable_envelope() {
     let env = envelope("connection.add", &out, now());
     let obj = env.as_object().unwrap();
 
-    // CLI-004/005: envelope contract.
+    // Envelope contract: stable keys, no schema_version, prefixed id.
     assert!(!obj.contains_key("schema_version"));
     assert_eq!(obj["command"], "connection.add");
     assert_eq!(obj["ok"], true);
@@ -126,14 +126,14 @@ async fn connection_add_produces_stable_envelope() {
         "https://example.r2.cloudflarestorage.com"
     );
     assert!(obj["data"]["id"].as_str().unwrap().starts_with("conn_"));
-    // CORE-009: timestamps are ISO 8601 strings, not component arrays.
+    // Timestamps are ISO 8601 strings, not component arrays.
     assert!(obj["data"]["created_at"].is_string());
     // The injected clock controls the envelope timestamp.
     assert_eq!(obj["meta"]["generated_at"], "2023-11-14T22:13:20Z");
-    // Credential fields are omitted from generic JSON config output (SEC-001).
+    // Credential fields are omitted from generic JSON config output.
     assert!(!obj["data"].as_object().unwrap().contains_key("access_key"));
     assert!(!obj["data"].as_object().unwrap().contains_key("secret_key"));
-    // No credentials were supplied: the envelope carries a warning (CLI-004).
+    // No credentials were supplied: the envelope carries a warning.
     assert_eq!(obj["warnings"].as_array().unwrap().len(), 1);
     assert!(obj["warnings"][0]
         .as_str()
@@ -219,7 +219,7 @@ async fn connection_show_displays_masked_credentials() {
 
 #[tokio::test]
 async fn application_contract_via_service_trait() {
-    // QA-002: exercise the ConnectionService trait directly (no CLI).
+    // Exercise the ConnectionService trait directly (no CLI layer).
     let db = Database::open_in_memory().await.unwrap();
     let app = rstore_application_test_support::application_from_db(db);
     let svc = app.api().registry().connections();

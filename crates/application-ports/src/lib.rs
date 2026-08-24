@@ -1,10 +1,9 @@
-//! Ports owned by the application core.
+//! Persistence ports owned by the application core.
 //!
-//! Concrete persistence implementations depend on this crate; the application
-//! core depends on these contracts and never on SQLite or a concrete adapter.
-//! The provider-facing storage ports remain in `rstore-storage-api` because
-//! they describe remote object-store semantics rather than local application
-//! records.
+//! Concrete persistence implementations depend on these contracts; the
+//! application core never depends on SQLite or any concrete adapter.
+//! Provider-facing remote object-store ports live in `rstore-storage-api`
+//! because they describe remote object-store semantics, not local records.
 
 pub mod deps;
 
@@ -14,10 +13,14 @@ pub use deps::{
     TransferDependencies,
 };
 use rstore_domain::connection::{ConnectionConfig, ConnectionTestStatus};
-use rstore_domain::id::{BucketId, ConnectionId, IndexRunId, RemoteObjectId, TagId, WorkspaceId};
+use rstore_domain::id::{
+    BucketId, ConnectionId, IndexRunId, JobId, ReceiptId, RemoteObjectId, RepairId, TagId,
+    WorkspaceId,
+};
+use rstore_domain::job::{Job, JobItem, JobState};
 use rstore_domain::remote::RemoteObject;
 use rstore_domain::workspace::{IgnoreRule, IndexRun, IndexRunState, Tag, Workspace};
-use rstore_domain::{Bucket, Result};
+use rstore_domain::{BoundedContext, Bucket, Result};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -81,7 +84,6 @@ pub trait ConnectionStore: Send + Sync {
         at: OffsetDateTime,
     ) -> Result<()>;
     async fn delete(&self, id: ConnectionId) -> Result<bool>;
-    async fn count(&self) -> Result<i64>;
 }
 
 /// Registry persistence port for local Bucket registrations.
@@ -109,7 +111,7 @@ pub trait WorkspaceStore: Send + Sync {
         &self,
         id: WorkspaceId,
         name: Option<&str>,
-        description: Option<&str>,
+        description: Option<Option<&str>>,
         at: OffsetDateTime,
     ) -> Result<()>;
     async fn delete(&self, id: WorkspaceId) -> Result<bool>;
@@ -183,10 +185,10 @@ pub trait LinkProfileStore: Send + Sync {
 /// Workspace tag definitions and association port.
 ///
 /// A subtrait of the catalog seam's narrow [`rstore_catalog::TagStore`]:
-/// `attach` and `associations_for_object` (MOVE-015 tag preservation) are
-/// declared once there, not duplicated here — every wide-port implementor is
-/// automatically a catalog-seam adapter. Callers of the inherited methods
-/// need `rstore_catalog::TagStore` in scope.
+/// `attach` and `associations_for_object` are declared once there, not
+/// duplicated here — every wide-port implementor is automatically a
+/// catalog-seam adapter. Callers of the inherited methods need
+/// `rstore_catalog::TagStore` in scope.
 #[async_trait]
 pub trait TagStore: Send + Sync + rstore_catalog::TagStore {
     async fn insert(&self, tag: &Tag) -> Result<()>;
@@ -198,7 +200,7 @@ pub trait TagStore: Send + Sync + rstore_catalog::TagStore {
         id: TagId,
         name: Option<&str>,
         color: Option<&str>,
-        description: Option<&str>,
+        description: Option<Option<&str>>,
     ) -> Result<()>;
     async fn delete(&self, id: TagId) -> Result<bool>;
     async fn detach(
@@ -222,7 +224,8 @@ pub trait TagStore: Send + Sync + rstore_catalog::TagStore {
     async fn clear_object(&self, workspace: WorkspaceId, object_id: RemoteObjectId) -> Result<()>;
 }
 
-/// Database-derived diagnostics and catalog statistics port.
+/// Database-derived diagnostics and catalog statistics port. Counts stay
+/// counts: callers never load full lists to answer "how many".
 #[async_trait]
 pub trait RuntimeStats: Send + Sync {
     async fn count_remote_objects(&self) -> Result<u64>;
@@ -230,16 +233,127 @@ pub trait RuntimeStats: Send + Sync {
     async fn count_tombstones(&self) -> Result<u64>;
     async fn count_pending_outbox(&self) -> Result<u64>;
     async fn count_pending_repairs(&self) -> Result<u64>;
+    /// Registry/health counters (doctor).
+    async fn count_connections(&self) -> Result<u64>;
+    async fn count_untested_connections(&self) -> Result<u64>;
+    async fn count_interrupted_jobs(&self) -> Result<u64>;
     async fn size_bytes(&self) -> Result<u64>;
+}
+
+/// Persists jobs and their item rows. Implemented over SQLite by
+/// `rstore-persistence`; consumers hold `Arc<dyn …>` so job services stay
+/// testable without a database.
+#[async_trait]
+pub trait JobRepository: Send + Sync {
+    async fn create(&self, job: &Job) -> Result<()>;
+    async fn get(&self, id: JobId) -> Result<Option<Job>>;
+    /// Apply a state transition and persist it.
+    async fn transition(&self, id: JobId, target: JobState, at: OffsetDateTime) -> Result<Job>;
+    /// Atomically replace terminal items and apply a validated terminal state
+    /// transition. A report must never outrun this local commit.
+    async fn commit_terminal(
+        &self,
+        id: JobId,
+        items: &[JobItem],
+        target: JobState,
+        at: OffsetDateTime,
+    ) -> Result<Job>;
+    async fn list(&self) -> Result<Vec<Job>>;
+    /// Replace a job's item rows wholesale (checkpoints / interruptions).
+    async fn replace_items(&self, id: JobId, items: &[JobItem]) -> Result<()>;
+    async fn delete(&self, id: JobId) -> Result<bool>;
+    /// Jobs orphaned by a dead process (pending/running/retrying) transition
+    /// to `Interrupted`; returns how many. Called once at startup
+    /// (`Application::initialize`) — there is no daemon, no job survives its
+    /// owner.
+    async fn mark_stale_jobs_interrupted(&self, at: OffsetDateTime) -> Result<u64>;
+}
+
+/// The kind of follow-up that failed, as recorded by its producer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairKind {
+    /// A catalog projection step failed after a remote mutation.
+    CatalogProjection,
+    /// The remote mutation's local settlement (receipt + outbox) failed.
+    RemoteMutation,
+    /// A move's post-copy verification or source deletion failed.
+    MoveFollowup,
+    /// Outbox delivery exhausted its attempts and was dead-lettered.
+    OutboxDelivery,
+}
+
+impl RepairKind {
+    /// Canonical stored token for this kind, as written by
+    /// [`RepairKind::parse`].
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CatalogProjection => "catalog_projection",
+            Self::RemoteMutation => "remote_mutation",
+            Self::MoveFollowup => "move_followup",
+            Self::OutboxDelivery => "outbox_delivery",
+        }
+    }
+
+    /// Decode the stored token of a persisted repair row.
+    pub fn parse(token: &str) -> Result<Self> {
+        match token {
+            "catalog_projection" => Ok(Self::CatalogProjection),
+            "remote_mutation" => Ok(Self::RemoteMutation),
+            "move_followup" => Ok(Self::MoveFollowup),
+            "outbox_delivery" => Ok(Self::OutboxDelivery),
+            other => Err(rstore_domain::Error::database(format!(
+                "unknown repair kind `{other}`"
+            ))),
+        }
+    }
+}
+
+impl std::fmt::Display for RepairKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Lifecycle state of a queryable repair item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairStatus {
+    /// The follow-up failed and waits for repair tooling.
+    Required,
+    /// The follow-up has been re-applied successfully.
+    Resolved,
+}
+
+impl RepairStatus {
+    /// Canonical stored token for this status, as written by
+    /// [`RepairStatus::parse`].
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Required => "repair_required",
+            Self::Resolved => "resolved",
+        }
+    }
+
+    /// Decode the stored token of a persisted repair row.
+    pub fn parse(token: &str) -> Result<Self> {
+        match token {
+            "repair_required" => Ok(Self::Required),
+            "resolved" => Ok(Self::Resolved),
+            other => Err(rstore_domain::Error::database(format!(
+                "unknown repair status `{other}`"
+            ))),
+        }
+    }
 }
 
 /// Small structured repair record exposed to diagnostics and job views.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepairItem {
-    pub id: String,
-    pub receipt_id: Option<String>,
-    pub kind: String,
-    pub status: String,
+    pub id: RepairId,
+    pub receipt_id: Option<ReceiptId>,
+    pub kind: RepairKind,
+    pub status: RepairStatus,
     pub attempts: u32,
     pub last_error: Option<String>,
     pub next_attempt_at: OffsetDateTime,
@@ -247,17 +361,23 @@ pub struct RepairItem {
     pub operation: Option<String>,
 }
 
+/// Persistence port for repair records produced by failed follow-ups.
 #[async_trait]
 pub trait RepairRepository: Send + Sync {
     async fn insert(&self, item: &RepairItem) -> Result<()>;
     async fn list(&self, limit: u32) -> Result<Vec<RepairItem>>;
-    async fn resolve(&self, id: &str, at: OffsetDateTime) -> Result<bool>;
+    async fn resolve(&self, id: RepairId, at: OffsetDateTime) -> Result<bool>;
 }
 
+/// Durable record that a remote mutation settled locally.
+///
+/// Written only through [`UnitOfWork::commit`]; read back for repair
+/// tooling and diagnostics. `remote_version`/`remote_etag` capture the
+/// provider state observed at completion when the provider reported one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteMutationReceipt {
-    pub receipt_id: String,
-    pub job_id: Option<String>,
+    pub receipt_id: ReceiptId,
+    pub job_id: Option<JobId>,
     pub operation: String,
     pub locator_json: String,
     pub remote_version: Option<String>,
@@ -266,13 +386,14 @@ pub struct RemoteMutationReceipt {
     pub payload: Option<serde_json::Value>,
 }
 
-/// Read access to durable remote-mutation receipts. Receipts are written
-/// exclusively through [`UnitOfWork::commit`](UnitOfWork) (receipt + outbox
-/// fact, one local unit) — there is deliberately no standalone write on this
-/// port. Reads serve repair tooling and diagnostics.
+/// Read access to durable remote-mutation receipts.
+///
+/// Receipts are written exclusively through [`UnitOfWork::commit`] (receipt
+/// and outbox fact in one local unit), so there is deliberately no standalone
+/// write method here. Reads serve repair tooling and diagnostics.
 #[async_trait]
 pub trait RemoteMutationRepository: Send + Sync {
-    async fn get(&self, receipt_id: &str) -> Result<Option<RemoteMutationReceipt>>;
+    async fn get(&self, receipt_id: ReceiptId) -> Result<Option<RemoteMutationReceipt>>;
 }
 
 /// Reliable outbox/repair port. The first implementation is SQLite-backed;
@@ -282,10 +403,10 @@ pub trait OutboxStore: Send + Sync {
     async fn append(&self, event: &OutboxEvent) -> Result<()>;
     async fn claim_due(&self, now: OffsetDateTime, limit: u32) -> Result<Vec<OutboxEvent>>;
     async fn recover_processing(&self, now: OffsetDateTime) -> Result<u64>;
-    async fn acknowledge(&self, event_id: &str, at: OffsetDateTime) -> Result<()>;
+    async fn acknowledge(&self, event_id: uuid::Uuid, at: OffsetDateTime) -> Result<()>;
     async fn retry(
         &self,
-        event_id: &str,
+        event_id: uuid::Uuid,
         next_attempt_at: OffsetDateTime,
         error: &str,
     ) -> Result<()>;
@@ -295,10 +416,15 @@ pub trait OutboxStore: Send + Sync {
 /// Versioned event envelope stored by the outbox.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutboxEvent {
-    pub event_id: String,
-    pub context: String,
+    pub event_id: uuid::Uuid,
+    pub context: BoundedContext,
     pub aggregate_type: String,
     pub aggregate_id: String,
+    /// Ordering position within the event's aggregate. The value `0` is a
+    /// sentinel asking the store to allocate the next version inside the
+    /// append transaction; any non-zero value is stored as given and must not
+    /// move backwards. Allocation lives in persistence so per-aggregate
+    /// ordering is a storage guarantee rather than a producer-side counter.
     pub aggregate_version: u64,
     pub event_type: String,
     pub schema_version: u32,
@@ -308,9 +434,13 @@ pub struct OutboxEvent {
     pub attempts: u32,
 }
 
-/// Unit-of-work boundary. Implementations must commit the supplied aggregate
-/// changes and outbox append atomically; the core never receives a SQL
-/// transaction object.
+/// Unit-of-work boundary between the application core and durable storage.
+///
+/// Implementations must commit the supplied operation atomically: for
+/// [`UnitOfWorkOperation::RemoteMutation`] the receipt row and its outbox
+/// event either both land or neither does, so a receipt can never exist
+/// without the domain fact that lets projection and repair workers find it.
+/// The core never receives a SQL transaction object.
 #[async_trait]
 pub trait UnitOfWork: Send + Sync {
     async fn commit(&self, operation: UnitOfWorkOperation) -> Result<()>;
@@ -328,17 +458,4 @@ pub enum UnitOfWorkOperation {
         receipt: RemoteMutationReceipt,
         event: OutboxEvent,
     },
-}
-
-/// Test double for the unit-of-work seam: accepts every operation without
-/// persisting anything. Production wiring (`bootstrap`, the SQLite-backed
-/// fixture) always supplies a real transactional implementation.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct NoopUnitOfWork;
-
-#[async_trait]
-impl UnitOfWork for NoopUnitOfWork {
-    async fn commit(&self, _operation: UnitOfWorkOperation) -> Result<()> {
-        Ok(())
-    }
 }

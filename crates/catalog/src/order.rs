@@ -1,4 +1,4 @@
-//! The one total-order vocabulary over catalog rows (IDX-024).
+//! The one total-order vocabulary over catalog rows.
 //!
 //! Every adapter orders and keyset-paginates by the `(sort value, path, id)`
 //! triple, with `id` components in bare-uuid text — the typed-ID `Display`
@@ -83,6 +83,11 @@ fn encode(value: &SortKey, path: &str, id: &str) -> String {
 /// Decode a cursor into its order key, parsing the value numerically for
 /// numeric fields (the same classification both adapters bind by). A cursor
 /// is opaque to callers; only this module gives it structure.
+///
+/// # Errors
+/// Fails with `ErrorCode::InvalidInput` when the cursor is not valid
+/// URL-safe Base64, not decodable UTF-8, or does not carry the three
+/// field separators.
 pub fn decode(cursor: &str, field: SortField) -> Result<(SortKey, String, String)> {
     let bytes = URL_SAFE_NO_PAD.decode(cursor).map_err(|_| bad_cursor())?;
     let raw = String::from_utf8(bytes).map_err(|_| bad_cursor())?;

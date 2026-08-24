@@ -1,7 +1,5 @@
-//! Repository for index runs, scan checkpoints and catalog revisions (IDX-).
-
+//! Repository for index runs, scan checkpoints and catalog revisions.
 use async_trait::async_trait;
-use std::str::FromStr;
 
 use rstore_application_ports::{IndexCheckpoint, IndexPageCommit, IndexRunCommit, IndexRunStore};
 use rstore_domain::id::{BucketId, IndexRunId};
@@ -32,7 +30,7 @@ impl IndexRunStore for IndexRunRepository {
     async fn create(&self, run: &IndexRun) -> Result<()> {
         let _write = self.gate.permit().await?;
         Insert::into("index_runs")
-            .column("id", run.id.to_string())
+            .column("id", uuid_to_text(&run.id))
             .column("bucket_id", uuid_to_text(&run.bucket_id))
             .column("state", run.state.as_str())
             .column("started_at", unix_secs(run.started_at))
@@ -44,7 +42,6 @@ impl IndexRunStore for IndexRunRepository {
         Ok(())
     }
 
-    /// Apply a state transition and/or progress counters (IDX-005).
     async fn update(
         &self,
         id: IndexRunId,
@@ -62,7 +59,7 @@ impl IndexRunStore for IndexRunRepository {
             )
             .set("objects_seen", objects_seen as i64)
             .set("error_count", error_count as i64)
-            .filter("id = ?", [Bind::Text(id.to_string())])
+            .filter("id = ?", [Bind::Text(uuid_to_text(&id))])
             .execute(self.gate.pool())
             .await?;
         Ok(())
@@ -73,14 +70,13 @@ impl IndexRunStore for IndexRunRepository {
             "SELECT id, bucket_id, state, started_at, finished_at, objects_seen, error_count \
              FROM index_runs WHERE id = ?",
         )
-        .bind(id.to_string())
+        .bind(uuid_to_text(&id))
         .fetch_optional(&self.read_pool)
         .await
         .map_err(map_sqlx)?;
         row.map(|r| row_to_run(RowReader::new(r))).transpose()
     }
 
-    /// The most recent run per bucket (IDX-014).
     async fn latest_per_bucket(&self) -> Result<Vec<IndexRun>> {
         let rows = sqlx::query(
             "SELECT id, bucket_id, state, started_at, finished_at, objects_seen, error_count \
@@ -96,7 +92,6 @@ impl IndexRunStore for IndexRunRepository {
             .collect()
     }
 
-    /// Load the scan cursor for a bucket (IDX-007: resume from it).
     async fn checkpoint(&self, bucket: BucketId) -> Result<Option<IndexCheckpoint>> {
         let row = sqlx::query(
             "SELECT continuation_token, updated_at FROM index_checkpoints WHERE bucket_id = ?",
@@ -136,9 +131,6 @@ impl IndexRunStore for IndexRunRepository {
         Ok(())
     }
 
-    /// Publish one remote page, its resume cursor and run counters together.
-    /// The catalog row writes use this repository's transaction so a reader
-    /// never observes a page without the progress that acknowledges it.
     async fn publish_page(&self, commit: &IndexPageCommit) -> Result<()> {
         let objects = commit.objects.clone();
         let run = commit.run;
@@ -178,7 +170,7 @@ impl IndexRunStore for IndexRunRepository {
                     let result = Update::table("index_runs")
                         .set("objects_seen", objects_seen as i64)
                         .set("error_count", error_count as i64)
-                        .filter("id = ?", [Bind::Text(run.to_string())])
+                        .filter("id = ?", [Bind::Text(uuid_to_text(&run))])
                         .execute(&mut **tx)
                         .await?;
                     if result.rows_affected() == 0 {
@@ -200,7 +192,6 @@ impl IndexRunStore for IndexRunRepository {
         Ok(())
     }
 
-    /// Commit the run state and, on success, the catalog revision together.
     async fn finish(&self, commit: &IndexRunCommit) -> Result<Option<i64>> {
         let run = commit.run;
         let bucket = commit.bucket;
@@ -220,7 +211,7 @@ impl IndexRunStore for IndexRunRepository {
                         )
                         .set("objects_seen", objects_seen as i64)
                         .set("error_count", error_count as i64)
-                        .filter("id = ?", [Bind::Text(run.to_string())])
+                        .filter("id = ?", [Bind::Text(uuid_to_text(&run))])
                         .execute(&mut **tx)
                         .await?;
                     if result.rows_affected() == 0 {
@@ -273,7 +264,7 @@ impl IndexRunStore for IndexRunRepository {
 
 pub(crate) fn row_to_run(row: RowReader) -> Result<IndexRun> {
     Ok(IndexRun {
-        id: row.token("id", IndexRunId::from_str)?,
+        id: IndexRunId::from_uuid(row.uuid("id")?),
         bucket_id: BucketId::from_uuid(row.uuid("bucket_id")?),
         state: row.token("state", IndexRunState::parse)?,
         started_at: row.timestamp("started_at")?,

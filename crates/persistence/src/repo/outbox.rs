@@ -1,17 +1,25 @@
 //! SQLite outbox and repair repository.
+//!
+//! Per-aggregate event ordering is allocated inside the append transaction;
+//! exhausted delivery dead-letters the event and opens a repair item in the
+//! same unit of work.
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use rstore_application_ports::{
-    OutboxEvent, OutboxStore, RemoteMutationReceipt, RepairItem, RepairRepository,
+    OutboxEvent, OutboxStore, RemoteMutationReceipt, RepairItem, RepairKind, RepairRepository,
+    RepairStatus,
 };
-use rstore_domain::{Error, Result};
+use rstore_domain::id::{ReceiptId, RepairId};
+use rstore_domain::{BoundedContext, Error, Result};
 use sqlx::sqlite::{SqlitePool, SqliteRow};
-use sqlx::Row;
 use time::OffsetDateTime;
 
 use crate::codec::{unix_secs, RowReader};
 use crate::error::map_sqlx;
 use crate::tx::WriteGate;
+
+use rstore_domain::Clock;
 
 const MAX_ATTEMPTS: i64 = 8;
 
@@ -19,32 +27,31 @@ const MAX_ATTEMPTS: i64 = 8;
 pub struct OutboxRepository {
     gate: WriteGate,
     read_pool: SqlitePool,
+    clock: Arc<dyn Clock>,
 }
 
 impl OutboxRepository {
-    pub(crate) fn new(gate: WriteGate, read_pool: SqlitePool) -> Self {
-        Self { gate, read_pool }
+    pub(crate) fn new(gate: WriteGate, read_pool: SqlitePool, clock: Arc<dyn Clock>) -> Self {
+        Self {
+            gate,
+            read_pool,
+            clock,
+        }
     }
 
     async fn append_event(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         event: &OutboxEvent,
     ) -> Result<OutboxEvent> {
-        // Version zero is the application-port sentinel for "allocate the
-        // next version in this transaction". Keeping allocation here makes
-        // aggregate ordering a persistence guarantee instead of a best-effort
-        // counter maintained by each use case.
         let mut stored = event.clone();
         if let Some(row) =
             sqlx::query("SELECT aggregate_version FROM outbox_events WHERE event_id = ?")
-                .bind(&event.event_id)
+                .bind(event.event_id.to_string())
                 .fetch_optional(&mut **tx)
                 .await
                 .map_err(map_sqlx)?
         {
-            stored.aggregate_version = row
-                .try_get::<i64, _>("aggregate_version")
-                .map_err(map_sqlx)? as u64;
+            stored.aggregate_version = RowReader::new(row).integer("aggregate_version")? as u64;
             return Ok(stored);
         }
 
@@ -98,8 +105,8 @@ impl OutboxRepository {
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(event_id) DO NOTHING",
         )
-        .bind(&event.event_id)
-        .bind(&event.context)
+        .bind(event.event_id.to_string())
+        .bind(event.context.as_str())
         .bind(&event.aggregate_type)
         .bind(&event.aggregate_id)
         .bind(stored.aggregate_version as i64)
@@ -144,7 +151,7 @@ impl OutboxRepository {
 impl RepairRepository for OutboxRepository {
     async fn insert(&self, item: &RepairItem) -> Result<()> {
         let _write = self.gate.permit().await?;
-        let now = OffsetDateTime::now_utc();
+        let now = self.clock.now();
         sqlx::query(
             "INSERT INTO repair_items \
              (id, receipt_id, kind, status, locator_json, operation, attempts, last_error, \
@@ -155,10 +162,10 @@ impl RepairRepository for OutboxRepository {
                  attempts = excluded.attempts, last_error = excluded.last_error, \
                  next_attempt_at = excluded.next_attempt_at, updated_at = excluded.updated_at",
         )
-        .bind(&item.id)
-        .bind(&item.receipt_id)
-        .bind(&item.kind)
-        .bind(&item.status)
+        .bind(item.id.to_string())
+        .bind(item.receipt_id.as_ref().map(ReceiptId::to_string))
+        .bind(item.kind.as_str())
+        .bind(item.status.as_str())
         .bind(&item.locator)
         .bind(&item.operation)
         .bind(i64::from(item.attempts))
@@ -176,12 +183,12 @@ impl RepairRepository for OutboxRepository {
         OutboxStore::repairs(self, limit).await
     }
 
-    async fn resolve(&self, id: &str, at: OffsetDateTime) -> Result<bool> {
+    async fn resolve(&self, id: RepairId, at: OffsetDateTime) -> Result<bool> {
         let _write = self.gate.permit().await?;
         let affected =
             sqlx::query("UPDATE repair_items SET status = 'resolved', updated_at = ? WHERE id = ?")
                 .bind(unix_secs(at))
-                .bind(id)
+                .bind(id.to_string())
                 .execute(self.gate.pool())
                 .await
                 .map_err(map_sqlx)?
@@ -225,7 +232,7 @@ impl OutboxStore for OutboxRepository {
                             "UPDATE outbox_events SET status = 'processing', attempts = attempts + 1 \
                              WHERE event_id = ?",
                         )
-                        .bind(&event.event_id)
+                        .bind(event.event_id.to_string())
                         .execute(&mut **tx)
                         .await
                         .map_err(map_sqlx)?;
@@ -236,7 +243,7 @@ impl OutboxStore for OutboxRepository {
                              SELECT event_id, attempts, ?, 'claimed' FROM outbox_events WHERE event_id = ?",
                         )
                         .bind(unix_secs(now))
-                        .bind(&event.event_id)
+                        .bind(event.event_id.to_string())
                         .execute(&mut **tx)
                         .await
                         .map_err(map_sqlx)?;
@@ -263,14 +270,14 @@ impl OutboxStore for OutboxRepository {
         Ok(affected)
     }
 
-    async fn acknowledge(&self, event_id: &str, at: OffsetDateTime) -> Result<()> {
+    async fn acknowledge(&self, event_id: uuid::Uuid, at: OffsetDateTime) -> Result<()> {
         let _write = self.gate.permit().await?;
         let affected = sqlx::query(
             "UPDATE outbox_events SET status = 'published', published_at = ?, \
              last_error = NULL WHERE event_id = ?",
         )
         .bind(unix_secs(at))
-        .bind(event_id)
+        .bind(event_id.to_string())
         .execute(self.gate.pool())
         .await
         .map_err(map_sqlx)?
@@ -285,24 +292,21 @@ impl OutboxStore for OutboxRepository {
 
     async fn retry(
         &self,
-        event_id: &str,
+        event_id: uuid::Uuid,
         next_attempt_at: OffsetDateTime,
         error: &str,
     ) -> Result<()> {
-        let event_id = event_id.to_owned();
         let error = error.to_owned();
+        let clock = self.clock.clone();
         self.gate
             .write_unit("outbox retry", move |tx| {
                 Box::pin(async move {
-                    // The attempts check and the following writes share one
-                    // transaction snapshot: no other unit can interleave
-                    // between reading the counter and acting on it.
                     let row = sqlx::query(
                         "SELECT event_id, context, aggregate_type, aggregate_id, aggregate_version, \
                                 event_type, schema_version, occurred_at, payload_json, attempts \
                          FROM outbox_events WHERE event_id = ?",
                     )
-                    .bind(&event_id)
+                    .bind(event_id.to_string())
                     .fetch_optional(&mut **tx)
                     .await
                     .map_err(map_sqlx)?
@@ -312,16 +316,14 @@ impl OutboxStore for OutboxRepository {
                     let event = row_to_event(row)?;
                     let attempts = i64::from(event.attempts);
                     if attempts >= MAX_ATTEMPTS {
-                        // Exhausted delivery: dead-letter the event and open a
-                        // repair item in the same unit.
-                        let now = OffsetDateTime::now_utc();
+                        let now = clock.now();
                         Self::append_event(tx, &event).await?;
                         sqlx::query(
                             "UPDATE outbox_events SET status = 'repair_required', last_error = ? \
                              WHERE event_id = ?",
                         )
                         .bind(&error)
-                        .bind(&event.event_id)
+                        .bind(event.event_id.to_string())
                         .execute(&mut **tx)
                         .await
                         .map_err(map_sqlx)?;
@@ -334,8 +336,8 @@ impl OutboxStore for OutboxRepository {
                                  attempts = repair_items.attempts + 1, last_error = excluded.last_error, \
                                  next_attempt_at = excluded.next_attempt_at, updated_at = excluded.updated_at",
                         )
-                        .bind(format!("repair_{}", event.event_id))
-                        .bind(&event.event_id)
+                        .bind(RepairId::from_uuid(event.event_id).to_string())
+                        .bind(event.event_id.to_string())
                         .bind(&event.aggregate_type)
                         .bind(&event.aggregate_id)
                         .bind(&event.event_type)
@@ -355,7 +357,7 @@ impl OutboxStore for OutboxRepository {
                     )
                     .bind(unix_secs(next_attempt_at))
                     .bind(&error)
-                    .bind(&event_id)
+                    .bind(event_id.to_string())
                     .execute(&mut **tx)
                     .await
                     .map_err(map_sqlx)?;
@@ -364,7 +366,7 @@ impl OutboxStore for OutboxRepository {
                          WHERE event_id = ? AND attempt_no = ?",
                     )
                     .bind(&error)
-                    .bind(&event_id)
+                    .bind(event_id.to_string())
                     .bind(attempts)
                     .execute(&mut **tx)
                     .await
@@ -389,14 +391,17 @@ impl OutboxStore for OutboxRepository {
             .map(|row| {
                 let reader = RowReader::new(row);
                 Ok(RepairItem {
-                    id: reader.text("id")?,
-                    receipt_id: reader.opt_text("receipt_id")?,
-                    kind: reader.text("kind")?,
-                    status: reader.text("status")?,
+                    id: reader.text("id")?.parse()?,
+                    receipt_id: reader
+                        .opt_text("receipt_id")?
+                        .map(|token| token.parse())
+                        .transpose()?,
+                    kind: RepairKind::parse(&reader.text("kind")?)?,
+                    status: RepairStatus::parse(&reader.text("status")?)?,
                     attempts: reader.integer("attempts")? as u32,
                     last_error: reader.opt_text("last_error")?,
-                    next_attempt_at: reader.timestamp("next_attempt_at")?,
                     locator: reader.opt_text("locator_json")?,
+                    next_attempt_at: reader.timestamp("next_attempt_at")?,
                     operation: reader.opt_text("operation")?,
                 })
             })
@@ -409,8 +414,9 @@ fn row_to_event(row: SqliteRow) -> Result<OutboxEvent> {
     let payload = serde_json::from_str(&reader.text("payload_json")?)
         .map_err(|e| Error::database("decode outbox payload").with_source(e))?;
     Ok(OutboxEvent {
-        event_id: reader.text("event_id")?,
-        context: reader.text("context")?,
+        event_id: uuid::Uuid::parse_str(&reader.text("event_id")?)
+            .map_err(|e| Error::database("decode outbox event id").with_source(e))?,
+        context: BoundedContext::parse(&reader.text("context")?)?,
         aggregate_type: reader.text("aggregate_type")?,
         aggregate_id: reader.text("aggregate_id")?,
         aggregate_version: reader.integer("aggregate_version")? as u64,
@@ -427,10 +433,12 @@ mod tests {
     use super::*;
     use crate::Database;
 
-    fn event(id: &str) -> OutboxEvent {
+    use uuid::Uuid;
+
+    fn event(id: Uuid) -> OutboxEvent {
         OutboxEvent {
-            event_id: id.to_owned(),
-            context: "catalog".into(),
+            event_id: id,
+            context: BoundedContext::Catalog,
             aggregate_type: "remote_object".into(),
             aggregate_id: "obj-1".into(),
             aggregate_version: 1,
@@ -442,11 +450,16 @@ mod tests {
         }
     }
 
+    const EVT1: Uuid = Uuid::from_u128(1);
+    const EVT_ROLLBACK: Uuid = Uuid::from_u128(2);
+    const EVT2: Uuid = Uuid::from_u128(3);
+    const EVT_DEAD: Uuid = Uuid::from_u128(4);
+
     #[tokio::test]
     async fn append_claim_and_acknowledge_are_idempotent() {
         let db = Database::open_in_memory().await.unwrap();
         let outbox = db.outbox();
-        let item = event("evt-1");
+        let item = event(EVT1);
 
         outbox.append(&item).await.unwrap();
         outbox.append(&item).await.unwrap();
@@ -459,7 +472,7 @@ mod tests {
         claimed_item.attempts = 1;
         assert_eq!(claimed, vec![claimed_item]);
         outbox
-            .acknowledge("evt-1", OffsetDateTime::UNIX_EPOCH)
+            .acknowledge(EVT1, OffsetDateTime::UNIX_EPOCH)
             .await
             .unwrap();
         assert!(outbox
@@ -474,7 +487,7 @@ mod tests {
     async fn failed_outbox_unit_rolls_back_event_and_aggregate_version() {
         let db = Database::open_in_memory().await.unwrap();
         let outbox = db.outbox();
-        let item = event("evt-rollback");
+        let item = event(EVT_ROLLBACK);
         let result: Result<()> = outbox
             .gate
             .write_unit("outbox test", |tx| {
@@ -486,12 +499,12 @@ mod tests {
             .await;
 
         assert_eq!(result.unwrap_err().code, rstore_domain::ErrorCode::Conflict);
-        let event_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM outbox_events WHERE event_id = 'evt-rollback'",
-        )
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
+        let event_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM outbox_events WHERE event_id = ?")
+                .bind(EVT_ROLLBACK.to_string())
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
         let version_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM aggregate_versions WHERE aggregate_id = 'obj-1'",
         )
@@ -506,13 +519,13 @@ mod tests {
     async fn retry_returns_event_to_the_due_queue() {
         let db = Database::open_in_memory().await.unwrap();
         let outbox = db.outbox();
-        outbox.append(&event("evt-2")).await.unwrap();
+        outbox.append(&event(EVT2)).await.unwrap();
         outbox
             .claim_due(OffsetDateTime::UNIX_EPOCH, 1)
             .await
             .unwrap();
         outbox
-            .retry("evt-2", OffsetDateTime::UNIX_EPOCH, "temporary")
+            .retry(EVT2, OffsetDateTime::UNIX_EPOCH, "temporary")
             .await
             .unwrap();
 
@@ -530,7 +543,7 @@ mod tests {
     async fn exhausted_delivery_becomes_repair_required() {
         let db = Database::open_in_memory().await.unwrap();
         let outbox = db.outbox();
-        outbox.append(&event("evt-dead-letter")).await.unwrap();
+        outbox.append(&event(EVT_DEAD)).await.unwrap();
 
         for attempt in 0..MAX_ATTEMPTS {
             let claimed = outbox
@@ -539,24 +552,20 @@ mod tests {
                 .unwrap();
             assert_eq!(claimed.len(), 1, "attempt {attempt}");
             outbox
-                .retry(
-                    "evt-dead-letter",
-                    OffsetDateTime::UNIX_EPOCH,
-                    "consumer failed",
-                )
+                .retry(EVT_DEAD, OffsetDateTime::UNIX_EPOCH, "consumer failed")
                 .await
                 .unwrap();
         }
 
         let repairs = outbox.repairs(10).await.unwrap();
         assert_eq!(repairs.len(), 1);
-        assert_eq!(repairs[0].kind, "outbox_delivery");
-        let status: String = sqlx::query_scalar(
-            "SELECT status FROM outbox_events WHERE event_id = 'evt-dead-letter'",
-        )
-        .fetch_one(db.read_pool())
-        .await
-        .unwrap();
+        assert_eq!(repairs[0].kind, RepairKind::OutboxDelivery);
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM outbox_events WHERE event_id = ?")
+                .bind(EVT_DEAD.to_string())
+                .fetch_one(db.read_pool())
+                .await
+                .unwrap();
         assert_eq!(status, "repair_required");
     }
 }

@@ -1,14 +1,10 @@
-//! Composition root for the application layer (CORE-003).
+//! Composition root for the application layer.
 //!
-//! Bootstrap supplies infrastructure-neutral ports, clocks and the storage
-//! factory; this module wires them into the Application Core services.
-//! The concrete S3 adapter is selected outside this crate.
-//!
-//! Wiring happens exactly once, when the raw dependencies are set (the
-//! `with_*` builder methods re-wire on their way through construction).
-//! Accessors hand out the cached handles and never re-assemble the dependency
-//! graph; callers reach services through them, not through the raw database /
-//! clock dependencies.
+//! Bootstrap supplies infrastructure-neutral ports, clocks, and the storage factory; this module
+//! wires them into the application services. The concrete S3 adapter is selected outside this
+//! crate. Wiring happens exactly once when the raw dependencies are set — the `with_*` builder
+//! methods re-wire on their way through construction — while accessors hand out cached handles
+//! and never re-assemble the dependency graph.
 
 use std::sync::Arc;
 
@@ -22,8 +18,11 @@ use crate::connection::DefaultConnectionService;
 use crate::gateway::RemoteGateway;
 use crate::ports::ApplicationDependencies;
 
-/// The wired application. Services are constructed once and shared; accessors
-/// clone the `Arc` handle, so the dependency graph is never re-assembled.
+/// The wired application.
+///
+/// Services are constructed once and shared; accessors clone the `Arc` handle, so the dependency
+/// graph is never re-assembled. Callers reach services through them, not through the raw database
+/// or clock dependencies.
 pub struct Application {
     dependencies: ApplicationDependencies,
     services: crate::api::Services,
@@ -32,23 +31,23 @@ pub struct Application {
 impl Application {
     /// Construct the application core from infrastructure-neutral ports.
     ///
-    /// Bootstrap owns the concrete repositories and storage factory. This
-    /// constructor only assembles use-case services and therefore remains
-    /// usable by both the CLI and the future desktop runtime.
+    /// Bootstrap owns the concrete repositories and storage factory. This constructor only
+    /// assembles use-case services and therefore remains usable by both the CLI and the desktop
+    /// runtime.
     pub fn from_dependencies(dependencies: ApplicationDependencies) -> Self {
         Self::wire(dependencies)
     }
 
-    /// Complete startup recovery after the composition root has built the
-    /// application. Keeping this separate makes construction deterministic
-    /// while retaining the existing interrupted-job recovery rule.
+    /// Complete startup recovery after the composition root has built the application.
+    ///
+    /// Keeping this separate makes construction deterministic while retaining the
+    /// interrupted-job recovery rule.
     pub async fn initialize(self) -> Result<Self> {
         self.services.jobs.mark_stale_interrupted().await?;
         Ok(self)
     }
 
-    /// Attach the storage adapter factory (the binary injects the S3 one) and
-    /// re-wire.
+    /// Attach the storage adapter factory (the binary injects the S3 one) and re-wire.
     pub fn with_storage_factory(mut self, factory: Arc<dyn StorageFactory>) -> Self {
         self.dependencies.replace_storage_factory(factory);
         self.rewire()
@@ -60,10 +59,11 @@ impl Application {
         self.rewire()
     }
 
-    /// Point the catalog seam at a second adapter (tests, future backends)
-    /// and re-wire: the locator, remote, indexer, transfer and copy services
-    /// receive its `RemoteObjectRepository` side, `files` its `CatalogQuery`
-    /// side. The adapter must satisfy the shared `catalog_contract`.
+    /// Point the catalog seam at a second adapter (tests, future backends) and re-wire.
+    ///
+    /// The locator, remote, indexer, transfer, and copy services receive its
+    /// `RemoteObjectRepository` side, `files` its `CatalogQuery` side. The adapter must satisfy
+    /// the shared `catalog_contract`.
     pub fn with_catalog<C>(mut self, catalog: Arc<C>) -> Self
     where
         C: RemoteObjectRepository + CatalogQuery + 'static,
@@ -112,7 +112,7 @@ impl Application {
         ));
         let job_repo = dependencies.transfer.jobs.clone();
         let remote = Arc::new(crate::remote::DefaultRemoteService::new(
-            buckets.clone(),
+            gateway.clone(),
             locator.clone(),
             catalog.clone(),
             job_repo.clone(),
@@ -124,16 +124,16 @@ impl Application {
             dependencies.runtime.clock.clone(),
         ));
         let transfers = Arc::new(crate::transfer::DefaultTransferService::new(
+            gateway.clone(),
             locator.clone(),
-            buckets.clone(),
             job_repo.clone(),
             dependencies.transfer.multipart.clone(),
             dependencies.runtime.clock.clone(),
             mutations.clone(),
         ));
         let copies = Arc::new(crate::copy::DefaultCopyService::new(
+            gateway.clone(),
             locator.clone(),
-            buckets.clone(),
             job_repo.clone(),
             dependencies.runtime.clock.clone(),
             mutations,
@@ -181,8 +181,6 @@ impl Application {
         ));
         let health = Arc::new(crate::health::HealthService::new(
             dependencies.runtime.stats.clone(),
-            dependencies.registry.connections.clone(),
-            job_repo,
         ));
         let repairs = dependencies.runtime.repairs.clone();
         Self {
@@ -207,13 +205,15 @@ impl Application {
         }
     }
 
-    /// Re-run [`Self::wire`] with the current raw dependencies (construction
-    /// path only — `with_*` builder calls).
+    /// Re-run [`Self::wire`] with the current raw dependencies.
+    ///
+    /// Construction path only (`with_*` builder calls).
     fn rewire(self) -> Self {
         Self::wire(self.dependencies)
     }
 
-    /// Current time per the wired clock — for output envelopes (`CLI-004`).
+    /// Current time per the wired clock, for output envelopes.
+    ///
     /// The clock itself stays inside the composition root.
     pub fn now(&self) -> time::OffsetDateTime {
         self.dependencies.runtime.clock.now()

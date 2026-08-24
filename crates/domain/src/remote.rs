@@ -1,4 +1,4 @@
-//! Remote object and locator domain models (REM-/IDX-).
+//! Remote object model and bucket-relative path value object.
 
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -9,13 +9,20 @@ use crate::workspace::ObjectState;
 
 /// A normalised object path relative to a bucket root.
 ///
-/// Internally the leading `/` is stripped and no bucket name is embedded; the
-/// S3 `prefix`/`delimiter` distinction is an adapter-internal concern (PRD §4.4).
+/// Validation contract: the constructor rejects empty input (including a bare
+/// `/`), strips all leading slashes, and stores the remainder verbatim — no
+/// other normalisation happens, and no bucket name is embedded. The S3
+/// `prefix`/`delimiter` distinction is an adapter-internal concern, so the
+/// stored string is directly usable as an S3 object key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ObjectPath(String);
 
 impl ObjectPath {
     /// Create a path, normalising leading slashes and rejecting empty paths.
+    ///
+    /// # Errors
+    /// Returns [`Error::invalid_input`] when the raw value is empty or
+    /// consists only of leading slashes.
     pub fn new(path: impl Into<String>) -> Result<Self, Error> {
         let raw = path.into();
         if raw.is_empty() {
@@ -43,11 +50,11 @@ impl ObjectPath {
         self.0.rsplit('/').next().unwrap_or(&self.0)
     }
 
-    /// Lexical file extension without the leading dot, if any.
+    /// Lexical file extension without the leading dot, if any. A leading-dot
+    /// name like `.gitignore` has no extension: its whole name is the stem.
     pub fn extension(&self) -> Option<&str> {
         self.file_name()
             .rsplit_once('.')
-            // a leading-dot file like `.gitignore` has no extension
             .filter(|(stem, _)| !stem.is_empty())
             .map(|(_, ext)| ext)
     }
@@ -66,41 +73,44 @@ pub struct RemoteObject {
     #[serde(with = "time::serde::rfc3339")]
     pub last_modified: OffsetDateTime,
     pub storage_class: Option<String>,
-    /// Optional version id (STORE-020, P2).
+    /// Optional version id for versioning-enabled buckets.
     pub version_id: Option<String>,
-    /// When the index last confirmed this object remotely (IDX-016).
+    /// When the index last confirmed this object remotely.
     #[serde(with = "time::serde::rfc3339")]
     pub confirmed_at: OffsetDateTime,
-    /// Catalog freshness (IDX-015).
+    /// Catalog freshness state.
     pub state: ObjectState,
 }
 
 impl RemoteObject {
-    /// Best-effort MIME classification for filtering (MIX-008).
+    /// Best-effort classification for filtering: the stored content type
+    /// wins; without one, the extension classifies directly.
     pub fn type_hint(&self) -> FileType {
-        match self
-            .content_type
-            .as_deref()
-            .or_else(|| self.path.extension().map(ext_to_mime))
-        {
+        match self.content_type.as_deref() {
             Some(ct) => FileType::from_mime(ct),
-            None => FileType::Other,
+            None => self
+                .path
+                .extension()
+                .map(ext_to_file_type)
+                .unwrap_or(FileType::Other),
         }
     }
 }
 
-fn ext_to_mime(ext: &str) -> &str {
+fn ext_to_file_type(ext: &str) -> FileType {
     match ext.to_ascii_lowercase().as_str() {
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" => "image",
-        "mp4" | "mov" | "avi" | "mkv" | "webm" => "video",
-        "mp3" | "wav" | "flac" | "ogg" | "m4a" => "audio",
-        "pdf" => "application/pdf",
-        "zip" | "tar" | "gz" | "7z" | "rar" => "archive",
-        _ => "other",
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" => FileType::Image,
+        "mp4" | "mov" | "avi" | "mkv" | "webm" => FileType::Video,
+        "mp3" | "wav" | "flac" | "ogg" | "m4a" => FileType::Audio,
+        "pdf" | "doc" | "docx" | "ppt" | "pptx" | "xls" | "xlsx" | "txt" | "md" => {
+            FileType::Document
+        }
+        "zip" | "tar" | "gz" | "7z" | "rar" => FileType::Archive,
+        _ => FileType::Other,
     }
 }
 
-/// Coarse file classification used by filters (MIX-015).
+/// Coarse file classification used by filters.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FileType {
@@ -114,9 +124,9 @@ pub enum FileType {
 }
 
 impl FileType {
-    /// Persistence name of the classification (`remote_objects.file_type`,
-    /// MIX-015). This list — not any SQL — is the one place extensions and
-    /// MIME prefixes map to kinds.
+    /// Persistence name of the classification (`remote_objects.file_type`).
+    /// This list — not any SQL — is the one place extensions and MIME
+    /// prefixes map to kinds.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Image => "image",
@@ -128,6 +138,7 @@ impl FileType {
         }
     }
 
+    /// Classify a MIME type; unrecognised types fall back to [`FileType::Other`].
     pub fn from_mime(mime: &str) -> Self {
         if mime.starts_with("image/") || mime == "image" {
             Self::Image

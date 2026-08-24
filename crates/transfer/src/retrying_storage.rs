@@ -1,11 +1,8 @@
-//! Retry decorator for every storage operation (STORE-024 / JOB-009).
+//! Retry decorator around every [`Storage`] operation.
 //!
-//! Keeping retries at the [`Storage`] seam means transfer, copy, listing,
-//! indexing, diagnostics and presigning all share the same policy. Concrete
-//! adapters classify errors; this decorator only retries those marked
-//! retryable. Multipart sessions get the same treatment: the session a
-//! factory returns is wrapped in [`RetryingSession`], so part-level retries
-//! behave exactly like the flat operations always did.
+//! Concrete adapters classify errors; this decorator retries exactly those
+//! marked retryable, under one policy shared by flat operations and multipart
+//! sessions alike (`RetryingSession`).
 
 use std::future::Future;
 use std::sync::Arc;
@@ -71,6 +68,7 @@ pub struct RetryingStorage {
 }
 
 impl RetryingStorage {
+    /// Wraps `inner` with `policy` retries and cooperative cancellation.
     pub fn new(inner: Arc<dyn Storage>, policy: RetryPolicy, cancel: CancellationToken) -> Self {
         Self {
             inner,
@@ -326,7 +324,6 @@ mod tests {
         };
         let storage = RetryingStorage::new(flaky, policy, cancel.clone());
 
-        // Cancel from another task while the first backoff sleep is running.
         let spawner = cancel.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;

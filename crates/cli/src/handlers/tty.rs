@@ -1,9 +1,8 @@
-//! TTY interaction policy (CON-005 / CLI-014 / SEC-006): hidden credential
-//! input, y/N confirmations and conflict resolution all live here so the
-//! prompting rules have one home — and they all read one [`Session`] for
-//! "may we prompt?", instead of each function re-deriving it from the
-//! terminal. JSON and non-terminal sessions never block on an interactive
-//! prompt.
+//! Terminal interaction policy in one home: hidden credential input, y/N
+//! confirmations, conflict resolution, and stdin URI lists all read a single
+//! [`Session`] for "may we prompt?" instead of re-deriving it from the
+//! terminal per call site. JSON and non-terminal sessions never block on an
+//! interactive prompt.
 
 use std::io::{IsTerminal, Write};
 
@@ -14,9 +13,9 @@ use rstore_domain::{Error, Result};
 
 use crate::args::ConnectionAddArgs;
 
-/// One definition of "may we prompt": machine output (`--json`) or a
+/// The one definition of "may we prompt": machine output (`--json`) or a
 /// non-terminal stdin means no. Constructed once per run and threaded to
-/// every prompt; the future desktop passes its own (always non-interactive)
+/// every prompt; an embedded consumer passes its own always-non-interactive
 /// session and inherits every prompting rule for free.
 #[derive(Debug, Clone, Copy)]
 pub struct Session {
@@ -32,12 +31,14 @@ impl Session {
         }
     }
 
-    /// Whether a human can answer a prompt right now.
+    /// Whether a human can answer a prompt.
     pub fn is_interactive(&self) -> bool {
         !self.json && self.stdin_is_tty
     }
 }
 
+/// Prints `prompt [y/N]` on stderr and reads one line; anything but a bare
+/// or case-insensitive `y` answers no.
 pub(super) fn confirm(prompt: &str) -> Result<bool> {
     let mut stderr = std::io::stderr();
     write!(stderr, "{prompt} [y/N] ").ok();
@@ -49,8 +50,8 @@ pub(super) fn confirm(prompt: &str) -> Result<bool> {
     Ok(line.trim().eq_ignore_ascii_case("y"))
 }
 
-/// SEC-006: destructive commands need `--yes` non-interactively, a y/N
-/// prompt on an interactive session.
+/// Gates destructive commands: `--yes` skips the prompt, non-interactive
+/// sessions require `--yes`, interactive sessions get a y/N prompt.
 pub(super) fn confirm_destructive(prompt: &str, yes: bool, session: &Session) -> Result<()> {
     if yes {
         return Ok(());
@@ -65,12 +66,11 @@ pub(super) fn confirm_destructive(prompt: &str, yes: bool, session: &Session) ->
     }
 }
 
-/// The one destructive-removal order (SEC-006): confirm the named target
-/// *before* the removal runs, then the fixed success report. Callers
-/// resolve their display name first so the prompt is exact — a new remove
-/// command cannot forget the order or confirm after mutating.
-/// (`remote rm` is the counted sibling: it plans, confirms the exact object
-/// count, then removes through the job-run seam.)
+/// The single destructive-removal order: confirm the named target *before*
+/// the removal runs, then emit the fixed success report. Callers resolve
+/// their display name first so the prompt is exact — a remove command cannot
+/// forget the order or confirm after mutating. (`remote rm` is the counted
+/// sibling: plan, confirm the exact object count, then remove.)
 pub(super) async fn remove_flow(
     prompt: String,
     yes: bool,
@@ -83,16 +83,17 @@ pub(super) async fn remove_flow(
     Ok(crate::output::HandlerOutput::human(done))
 }
 
+/// Reads one line of hidden input (credentials) from the terminal.
 pub(super) fn prompt_hidden(prompt: &str) -> Result<String> {
     rpassword::prompt_password(format!("{prompt}: "))
         .map_err(|e| Error::invalid_input("could not read hidden input").with_source(e))
 }
 
-/// The one credential-input policy: a flag pair
-/// must be complete and non-empty; with neither flag, a non-tty (or
-/// `--json`) session stores nothing while a tty prompts hidden — an empty
-/// pair means "keep what exists / store nothing", a half pair is an error.
-/// Callers supply the prompts; everything else is one policy.
+/// The single credential-input policy: a flag pair must be complete and
+/// non-empty; with neither flag, a non-tty (or `--json`) session stores
+/// nothing while a tty prompts hidden — an empty pair means "keep what
+/// exists / store nothing", a half pair is an error. Callers supply the
+/// prompts; everything else is one policy.
 pub(super) fn read_credential_pair(
     access_key: Option<&str>,
     secret_key: Option<&str>,
@@ -139,6 +140,7 @@ pub(super) fn read_credential_pair(
     }
 }
 
+/// Collects credentials for `connection add` from flags or a hidden prompt.
 pub(super) fn read_credential_input(
     args: &ConnectionAddArgs,
     session: &Session,
@@ -153,6 +155,8 @@ pub(super) fn read_credential_input(
     )
 }
 
+/// Collects credentials for `connection edit`: without either flag nothing
+/// is touched; otherwise an empty hidden answer keeps the stored value.
 pub(super) fn read_edit_credential_input(
     args: &crate::args::ConnectionEditArgs,
     session: &Session,
@@ -174,7 +178,7 @@ pub(super) fn read_edit_credential_input(
     )
 }
 
-/// Resolve the interactive part of the conflict policy. The Application API
+/// Resolves the interactive part of the conflict policy. The Application API
 /// has already applied the explicit-policy / bucket-default precedence; this
 /// function only handles `ask`, `--yes`, and the terminal prompt.
 pub(super) fn resolve_conflict(
@@ -214,10 +218,9 @@ pub(super) fn resolve_conflict(
     }
 }
 
-/// Resolve a multi-URI argument list: `-` reads one URI per stdin line
-/// (MOVE-007/008, TAG-011/012, DEL-, MIX-029); an empty list is the
-/// caller's `empty_msg` error. The one entry point every multi-URI command
-/// shares.
+/// Resolves a multi-URI argument list: `-` reads one URI per stdin line;
+/// an empty list is the caller's `empty_msg` error. The one entry point
+/// every multi-URI command shares.
 pub(super) fn resolve_uris(args: &[String], empty_msg: &str) -> rstore_domain::Result<Vec<String>> {
     if args.len() == 1 && args[0] == "-" {
         let uris = read_stdin_uris()?;
@@ -232,8 +235,8 @@ pub(super) fn resolve_uris(args: &[String], empty_msg: &str) -> rstore_domain::R
     }
 }
 
-/// Read one remote reference per line from stdin (MOVE-007/008, TAG-011/012).
-/// Blank lines and `#` comments are ignored.
+/// Reads one remote reference per line from stdin. Blank lines and `#`
+/// comments are ignored.
 pub(super) fn read_stdin_uris() -> rstore_domain::Result<Vec<String>> {
     use std::io::BufRead;
     if std::io::stdin().is_terminal() {

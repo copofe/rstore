@@ -1,21 +1,23 @@
-//! Cooperative cancellation (CORE-010).
+//! Cooperative cancellation shared by every transfer loop.
 //!
-//! Transfers poll the token between parts/items/chunks. The same cooperative
-//! cancellation contract is shared by CLI and future desktop callers; the
-//! next poll unwinds with `Error::cancelled()` and the caller persists state.
+//! Transfers poll [`CancellationToken::check`] between parts, chunks and
+//! items; waiters resolve event-driven from the signal itself, no polling.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use rstore_domain::{Error, Result};
+use tokio::sync::Notify;
 
 /// A shared cancellation flag.
 #[derive(Debug, Clone, Default)]
 pub struct CancellationToken {
     cancelled: Arc<AtomicBool>,
+    notify: Arc<Notify>,
 }
 
 impl CancellationToken {
+    /// Creates a token nobody has cancelled.
     pub fn new() -> Self {
         Self::default()
     }
@@ -23,6 +25,7 @@ impl CancellationToken {
     /// Signal cancellation to every holder.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
     }
 
     /// Whether cancellation was signalled.
@@ -40,16 +43,18 @@ impl CancellationToken {
         }
     }
 
-    /// Resolves as soon as cancellation is signalled. Polls at 10 ms: the
-    /// only latency this bounds is how fast a backoff sleep unwinds, and a
-    /// sleeping retry needs no tighter precision.
+    /// Resolves as soon as cancellation is signalled — event-driven, no
+    /// polling. The waiter registers before re-checking the flag, so a
+    /// concurrent `cancel` can never fall into the gap between check and
+    /// wait.
     pub async fn cancelled(&self) {
-        loop {
-            if self.is_cancelled() {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.is_cancelled() {
+            return;
         }
+        notified.await;
     }
 }
 

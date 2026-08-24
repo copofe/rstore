@@ -1,4 +1,4 @@
-//! The storage factory seam (STORE-001).
+//! The storage factory seam.
 //!
 //! The application core calls [`StorageFactory`] to turn a
 //! [`ConnectionConfig`] plus its stored credentials into a connected [`Storage`].
@@ -14,8 +14,8 @@ use crate::Storage;
 
 /// Static credentials for authenticating against an endpoint. The fields are
 /// [`Secret`] so the redaction invariant travels the seam by type: the
-/// derived `Debug` prints redacted fields (SEC-001), and adapters call
-/// `expose()` only where the SDK needs plaintext.
+/// derived `Debug` prints redacted fields, and adapters call `expose()` only
+/// where the SDK needs plaintext.
 #[derive(Debug, Clone)]
 pub struct StorageCredentials {
     pub access_key: Secret<String>,
@@ -28,6 +28,10 @@ pub trait StorageFactory: Send + Sync {
     fn name(&self) -> &'static str;
 
     /// Build a connected adapter for `config`.
+    ///
+    /// # Errors
+    /// Fails when the configuration cannot produce a usable adapter (e.g. an
+    /// invalid endpoint or TTL).
     fn build(
         &self,
         config: &ConnectionConfig,

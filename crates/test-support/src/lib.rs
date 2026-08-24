@@ -1,11 +1,14 @@
-//! Shared test fixtures (CORE-014 / QA-004).
+//! Shared test fixtures.
 //!
-//! - [`FakeStorage`]: an in-memory [`Storage`] so tests never touch the network.
-//! - [`FakeStorageFactory`]: a [`StorageFactory`] handing out that fake.
+//! - [`FakeStorage`]: an in-memory [`rstore_storage_api::Storage`] so tests
+//!   never touch the network.
+//! - [`FakeStorageFactory`]: a [`rstore_storage_api::StorageFactory`] handing
+//!   out that fake.
 //! - [`TempDb`]: a migrated SQLite catalog in a throwaway directory.
-//! - [`TestClock`]: a deterministic, advanceable [`Clock`].
-//! - [`catalog_contract`]: the shared behavioral suite every catalog adapter
-//!   runs (SQLite repositories and `rstore_catalog::InMemoryCatalog`).
+//! - [`TestClock`]: a deterministic, advanceable [`rstore_domain::Clock`].
+//! - [`storage_contract`] / [`catalog_contract`]: the shared behavioral
+//!   suites every storage / catalog adapter runs, so fakes and real
+//!   adapters are pinned to the same semantics.
 
 mod catalog_contract;
 mod clock;

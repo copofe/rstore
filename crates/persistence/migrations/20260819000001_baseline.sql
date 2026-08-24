@@ -95,15 +95,6 @@ CREATE TABLE IF NOT EXISTS remote_objects (
 CREATE INDEX IF NOT EXISTS idx_remote_objects_bucket ON remote_objects(bucket_id);
 CREATE INDEX IF NOT EXISTS idx_remote_objects_path ON remote_objects(object_path);
 
-CREATE TABLE IF NOT EXISTS remote_object_revisions (
-    id                INTEGER PRIMARY KEY AUTOINCREMENT,
-    remote_object_id  TEXT NOT NULL REFERENCES remote_objects(id) ON DELETE CASCADE,
-    etag              TEXT,
-    size              INTEGER,
-    content_type      TEXT,
-    last_modified     INTEGER,
-    observed_at       INTEGER NOT NULL
-);
 
 CREATE TABLE IF NOT EXISTS index_runs (
     id           TEXT PRIMARY KEY,
@@ -121,14 +112,6 @@ CREATE TABLE IF NOT EXISTS index_checkpoints (
     updated_at         INTEGER NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS index_errors (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    index_run_id TEXT NOT NULL REFERENCES index_runs(id) ON DELETE CASCADE,
-    object_path  TEXT,
-    error_code   TEXT,
-    message      TEXT,
-    occurred_at  INTEGER NOT NULL
-);
 
 CREATE TABLE IF NOT EXISTS catalog_revisions (
     bucket_id          TEXT PRIMARY KEY REFERENCES buckets(id) ON DELETE CASCADE,
@@ -158,10 +141,7 @@ CREATE TABLE IF NOT EXISTS remote_object_tags (
 
 CREATE TABLE IF NOT EXISTS metadata_tombstones (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    workspace_id     TEXT REFERENCES workspaces(id) ON DELETE CASCADE,
     remote_object_id TEXT NOT NULL,
-    tag_id           TEXT REFERENCES tags(id) ON DELETE CASCADE,
-    locator          TEXT NOT NULL,
     created_at       INTEGER NOT NULL,
     expires_at       INTEGER
 );
@@ -195,11 +175,11 @@ CREATE TABLE IF NOT EXISTS transfer_jobs (
 CREATE TABLE IF NOT EXISTS transfer_job_items (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     job_id      TEXT NOT NULL REFERENCES transfer_jobs(id) ON DELETE CASCADE,
-    remote_uri  TEXT NOT NULL,
+    label       TEXT NOT NULL,
     state       TEXT NOT NULL,
     bytes_total INTEGER NOT NULL DEFAULT 0,
     bytes_done  INTEGER NOT NULL DEFAULT 0,
-    error_code  TEXT
+    error       TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_job_items_job ON transfer_job_items(job_id);
 
@@ -225,22 +205,6 @@ CREATE TABLE IF NOT EXISTS multipart_parts (
     PRIMARY KEY(multipart_upload_id, part_number)
 );
 
-CREATE TABLE IF NOT EXISTS job_events (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    job_id      TEXT REFERENCES transfer_jobs(id) ON DELETE CASCADE,
-    level       TEXT NOT NULL,
-    message     TEXT NOT NULL,
-    occurred_at INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS operation_audit (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    actor       TEXT NOT NULL DEFAULT 'local',
-    operation   TEXT NOT NULL,
-    target      TEXT,
-    result      TEXT,
-    occurred_at INTEGER NOT NULL
-);
 
 -- Access/diagnostics and consistency infrastructure -----------------------
 CREATE TABLE IF NOT EXISTS aggregate_versions (
@@ -301,7 +265,7 @@ CREATE TABLE IF NOT EXISTS repair_items (
     receipt_id        TEXT REFERENCES remote_mutation_receipts(receipt_id) ON DELETE SET NULL,
     kind              TEXT NOT NULL,
     status            TEXT NOT NULL
-                      CHECK (status IN ('pending', 'retrying', 'repair_required', 'resolved')),
+                      CHECK (status IN ('repair_required', 'resolved')),
     aggregate_type    TEXT,
     aggregate_id      TEXT,
     locator_json      TEXT,

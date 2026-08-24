@@ -1,6 +1,4 @@
-//! Schema-sync pins: the embedded schema and connection pragmas cannot drift
-//! silently.
-
+//! Schema-sync pins: the embedded schema and connection pragmas cannot drift silently.
 use rstore_persistence::Database;
 
 #[test]

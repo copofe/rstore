@@ -1,8 +1,8 @@
-//! Job / transfer-task domain model (JOB-001..003, CORE-006).
+//! Job / transfer-task domain model.
 //!
 //! A [`Job`] is created the moment a long operation starts and is immediately
-//! persisted (JOB-001). [`JobState`] is a guarded state machine: illegal
-//! transitions are rejected (JOB-003).
+//! persisted. [`JobState`] is a guarded state machine: illegal transitions
+//! are rejected.
 
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -37,6 +37,11 @@ impl JobKind {
         }
     }
 
+    /// Decode the canonical token.
+    ///
+    /// # Errors
+    /// Returns [`Error::database`] for an unknown token: a vocabulary miss in
+    /// the `kind` column is internal corruption, not user input.
     pub fn parse(token: &str) -> Result<Self, Error> {
         match token {
             "upload" => Ok(Self::Upload),
@@ -51,28 +56,28 @@ impl JobKind {
     }
 }
 
-/// The lifecycle of a job (JOB-003 / PRD §10.11.2).
+/// The lifecycle of a job.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobState {
-    /// Created but not yet executing (JOB-004).
+    /// Created but not yet executing.
     #[default]
     Pending,
-    /// Actively executing (JOB-005).
+    /// Actively executing.
     Running,
-    /// User-paused, resumable (JOB-006).
+    /// User-paused, resumable.
     Paused,
-    /// Backing off before another attempt (JOB-009).
+    /// Backing off before another attempt.
     Retrying,
-    /// Finished with some items failing (JOB-011).
+    /// Finished with some items failing.
     PartialSuccess,
     /// All items succeeded.
     Succeeded,
     /// Unrecoverable failure.
     Failed,
-    /// Cancelled by the user (JOB-008).
+    /// Cancelled by the user.
     Cancelled,
-    /// Process died mid-run; resumable on next start (JOB-015).
+    /// Process died mid-run; resumable on next start.
     Interrupted,
 }
 
@@ -105,6 +110,16 @@ impl JobState {
         }
     }
 
+    /// Whether the run ended via Ctrl+C — the exit-130 trigger.
+    pub fn is_interrupted(self) -> bool {
+        self == Self::Interrupted
+    }
+
+    /// Decode the canonical token.
+    ///
+    /// # Errors
+    /// Returns [`Error::database`] for an unknown token: a vocabulary miss in
+    /// the `state` column is internal corruption, not user input.
     pub fn parse(token: &str) -> Result<Self, Error> {
         match token {
             "pending" => Ok(Self::Pending),
@@ -120,7 +135,12 @@ impl JobState {
         }
     }
 
-    /// Apply a target state, rejecting illegal transitions (JOB-003).
+    /// Apply a target state, rejecting illegal transitions.
+    ///
+    /// # Errors
+    /// Returns [`Error::conflict`] when `(self, target)` is not an allowed
+    /// edge of the transition table; terminal states can only be re-entered
+    /// via retry into `Running`.
     pub fn transition(self, target: JobState) -> Result<JobState, Error> {
         use JobState::*;
         let allowed = match (self, target) {
@@ -146,7 +166,7 @@ impl JobState {
             (Retrying, Interrupted) => true,
             (Interrupted, Running) => true,
             (Interrupted, Cancelled) => true,
-            // JOB-010: `task retry` re-runs a finished-but-unsuccessful job.
+            // `task retry` re-runs a finished-but-unsuccessful job.
             (Failed, Running) => true,
             (PartialSuccess, Running) => true,
             (s, t) if s == t => true,
@@ -163,7 +183,7 @@ impl JobState {
     }
 }
 
-/// Per-file progress / outcome record inside a job (JOB-002).
+/// Per-file progress / outcome record inside a job.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ItemState {
@@ -188,6 +208,10 @@ impl ItemState {
         }
     }
 
+    /// Decode the canonical token.
+    ///
+    /// # Errors
+    /// Returns [`Error::database`] for an unknown token.
     pub fn parse(token: &str) -> Result<Self, Error> {
         match token {
             "pending" => Ok(Self::Pending),
@@ -201,13 +225,18 @@ impl ItemState {
     }
 }
 
+/// One transferred object's progress and outcome within a [`Job`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobItem {
-    pub remote_uri: String,
+    /// Canonical narration label of the transferred object
+    /// (`conn/bucket/key` or the local path spelling a dry run reports).
+    pub label: String,
     pub state: ItemState,
     pub bytes_total: u64,
     pub bytes_done: u64,
-    pub error_code: Option<String>,
+    /// Truncated failure detail of a failed item (`job_run` caps length);
+    /// the stable exit-code class lives on the report, not per item.
+    pub error: Option<String>,
 }
 
 /// A transfer / index job record.
@@ -225,6 +254,7 @@ pub struct Job {
 }
 
 impl Job {
+    /// Create a pending job stamped with the given instant.
     pub fn new(kind: JobKind, id: JobId, now: OffsetDateTime) -> Self {
         Self {
             id,
@@ -237,7 +267,11 @@ impl Job {
         }
     }
 
-    /// Move to `target`, updating `updated_at` (JOB-003).
+    /// Move to `target`, updating `updated_at`.
+    ///
+    /// # Errors
+    /// Returns [`Error::conflict`] when the underlying state machine rejects
+    /// the transition; the job state is left unchanged in that case.
     pub fn transition(&mut self, target: JobState, now: OffsetDateTime) -> Result<(), Error> {
         self.state = self.state.transition(target)?;
         self.updated_at = now;
@@ -255,39 +289,10 @@ impl Job {
     }
 }
 
-/// Persists jobs and their items (JOB-001/002/015). Implemented over SQLite
-/// by `rstore-persistence`; consumers hold `Arc<dyn …>` so job services stay
-/// testable without a database. The state machine and its persistence
-/// contract belong together.
-#[async_trait::async_trait]
-pub trait JobRepository: Send + Sync {
-    /// Insert a new job (created ⇒ persisted immediately).
-    async fn create(&self, job: &Job) -> crate::Result<()>;
-    async fn get(&self, id: JobId) -> crate::Result<Option<Job>>;
-    /// Apply a state transition and persist (JOB-003).
-    async fn transition(
-        &self,
-        id: JobId,
-        target: JobState,
-        at: OffsetDateTime,
-    ) -> crate::Result<Job>;
-    /// Atomically replace terminal items and apply a validated terminal state
-    /// transition. A report must never outrun this local commit.
-    async fn commit_terminal(
-        &self,
-        id: JobId,
-        items: &[JobItem],
-        target: JobState,
-        at: OffsetDateTime,
-    ) -> crate::Result<Job>;
-    async fn list(&self) -> crate::Result<Vec<Job>>;
-    /// Replace a job's item rows wholesale (checkpoints / interruptions).
-    async fn replace_items(&self, id: JobId, items: &[JobItem]) -> crate::Result<()>;
-    async fn delete(&self, id: JobId) -> crate::Result<bool>;
-    /// JOB-015: jobs orphaned by a dead process (pending/running/retrying)
-    /// transition to `Interrupted`; returns how many. Called once at startup
-    /// (`Application::open`) — there is no daemon, no job survives its owner.
-    async fn mark_stale_jobs_interrupted(&self, at: OffsetDateTime) -> crate::Result<u64>;
+impl std::fmt::Display for JobState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 #[cfg(test)]
@@ -301,7 +306,7 @@ mod tests {
 
     #[test]
     fn legal_transitions() {
-        let mut job = Job::new(JobKind::Upload, JobId::new(), now());
+        let mut job = Job::new(JobKind::Upload, JobId::new_random(), now());
         job.transition(JobState::Running, now()).unwrap();
         job.transition(JobState::Paused, now()).unwrap();
         job.transition(JobState::Running, now()).unwrap();
@@ -311,22 +316,18 @@ mod tests {
 
     #[test]
     fn illegal_transition_rejected() {
-        let mut job = Job::new(JobKind::Delete, JobId::new(), now());
-        // Cannot pause a pending job that has not started.
+        let mut job = Job::new(JobKind::Delete, JobId::new_random(), now());
         assert!(job.transition(JobState::Paused, now()).is_err());
-        // Cannot skip Running and jump straight to a terminal state.
         assert!(job.transition(JobState::Succeeded, now()).is_err());
-        // Legal path into a terminal state.
         job.transition(JobState::Running, now()).unwrap();
         job.transition(JobState::Succeeded, now()).unwrap();
         assert!(job.state.is_terminal());
-        // Cannot resurrect a terminal job.
         assert!(job.transition(JobState::Running, now()).is_err());
     }
 
     #[test]
     fn interrupted_is_resumable() {
-        let mut job = Job::new(JobKind::Upload, JobId::new(), now());
+        let mut job = Job::new(JobKind::Upload, JobId::new_random(), now());
         job.transition(JobState::Running, now()).unwrap();
         job.transition(JobState::Interrupted, now()).unwrap();
         job.transition(JobState::Running, now()).unwrap();
@@ -348,7 +349,7 @@ mod tests {
 
     #[test]
     fn items_done_counts_only_succeeded_and_skipped_items() {
-        let mut job = Job::new(JobKind::Upload, JobId::new(), now());
+        let mut job = Job::new(JobKind::Upload, JobId::new_random(), now());
         job.items = [
             ItemState::Pending,
             ItemState::Running,
@@ -359,11 +360,11 @@ mod tests {
         ]
         .into_iter()
         .map(|state| JobItem {
-            remote_uri: String::new(),
+            label: String::new(),
             state,
             bytes_total: 0,
             bytes_done: 0,
-            error_code: None,
+            error: None,
         })
         .collect();
 

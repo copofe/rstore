@@ -1,9 +1,9 @@
-//! Workspace, tag, ignore-rule and index-run domain models (WSP-/TAG-/IGN-/IDX-).
+//! Workspace, tag, ignore-rule and index-run domain models.
 //!
-//! A workspace is a *local grouping* of registered buckets (PRD §4.3): it
-//! never touches remote state. Tags are workspace-scoped and keyed to the
-//! stable [`RemoteObjectId`], so they survive product-side renames (TAG-018)
-//! and same-path overwrites (TAG-021).
+//! A workspace is a *local grouping* of registered buckets: it never touches
+//! remote state. Tags are workspace-scoped and keyed to the stable
+//! [`crate::RemoteObjectId`], so they survive remote renames and same-path
+//! overwrites.
 
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -11,12 +11,12 @@ use time::OffsetDateTime;
 use crate::error::{Error, Result};
 use crate::id::{BucketId, IndexRunId, TagId, WorkspaceId};
 
-/// A named grouping of buckets with its own tag namespace (WSP-001).
+/// A named grouping of buckets with its own tag namespace.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Workspace {
     pub id: WorkspaceId,
-    /// Unique, case-sensitive; uniqueness is checked case-insensitively too
-    /// (WSP-001: 名称唯一).
+    /// Unique, case-sensitive; uniqueness is checked case-insensitively too,
+    /// so two workspaces may not differ by case alone.
     pub name: String,
     pub description: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
@@ -26,6 +26,7 @@ pub struct Workspace {
 }
 
 impl Workspace {
+    /// Create a workspace stamped with the given instant.
     pub fn new(id: WorkspaceId, name: impl Into<String>, at: OffsetDateTime) -> Self {
         Self {
             id,
@@ -37,7 +38,7 @@ impl Workspace {
     }
 }
 
-/// A bucket-in-workspace membership row (WSP-006).
+/// A bucket-in-workspace membership row.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceBucket {
     pub workspace_id: WorkspaceId,
@@ -46,14 +47,23 @@ pub struct WorkspaceBucket {
     pub added_at: Option<OffsetDateTime>,
 }
 
-/// One ignore rule: a bucket-relative directory prefix (IGN-001).
+/// Stable identity of one ignore-rule row (SQLite autoincrement).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct IgnoreRuleId(pub i64);
+
+impl std::fmt::Display for IgnoreRuleId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ign_{}", self.0)
+    }
+}
+
+/// One ignore rule: a bucket-relative directory prefix.
 ///
-/// The directory is stored normalised with a trailing `/` (IGN-004) so prefix
-/// matching (`path.starts_with(dir)`) is exact; glob characters are rejected
-/// (IGN-015).
+/// The directory is stored normalised with a trailing `/` so prefix matching
+/// (`path.starts_with(dir)`) is exact; glob characters are rejected.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IgnoreRule {
-    pub id: i64,
+    pub id: IgnoreRuleId,
     pub bucket_id: BucketId,
     pub directory: String,
     pub enabled: bool,
@@ -62,9 +72,13 @@ pub struct IgnoreRule {
 }
 
 impl IgnoreRule {
-    /// Normalise a user-supplied directory (IGN-004): strip leading `/`,
-    /// ensure the trailing `/` that prefix matching relies on, reject globs
-    /// (IGN-015) and empty input.
+    /// Normalise a user-supplied directory: strip leading `/`, ensure the
+    /// trailing `/` that prefix matching relies on, reject globs and empty
+    /// input.
+    ///
+    /// # Errors
+    /// Returns [`Error::invalid_input`] for glob characters (`*`, `?`, `[`)
+    /// and for input that normalises to empty.
     pub fn normalise_directory(input: &str) -> Result<String> {
         if input.contains('*') || input.contains('?') || input.contains('[') {
             return Err(Error::invalid_input(
@@ -78,19 +92,21 @@ impl IgnoreRule {
         Ok(format!("{trimmed}/"))
     }
 
-    /// Does `path` fall inside this ignored subtree? (IGN-005 pruning rule.)
+    /// Does `path` fall inside this ignored subtree? Exact prefix pruning:
+    /// the stored directory always ends in `/`, so sibling names sharing a
+    /// stem never match.
     pub fn matches(&self, path: &str) -> bool {
         path.starts_with(&self.directory)
     }
 }
 
-/// A workspace-scoped tag definition (TAG-001).
+/// A workspace-scoped tag definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tag {
     pub id: TagId,
     pub workspace_id: WorkspaceId,
     pub name: String,
-    /// Case-folded name; uniqueness is enforced on this column (TAG-002).
+    /// Case-folded name; uniqueness is enforced on this column.
     pub normalized_name: String,
     pub color: String,
     pub description: Option<String>,
@@ -99,6 +115,9 @@ pub struct Tag {
 }
 
 impl Tag {
+    /// Create a tag with the default colour `"gray"` (free-form otherwise;
+    /// no palette validation lives in the domain) and its case-folded
+    /// uniqueness key.
     pub fn new(
         id: TagId,
         workspace_id: WorkspaceId,
@@ -118,12 +137,14 @@ impl Tag {
     }
 }
 
-/// Case-insensitive folding for tag uniqueness (TAG-002).
+/// Case-fold a user-supplied tag name into its uniqueness key: trim
+/// surrounding whitespace first, then lowercase. Two names whose keys are
+/// equal are the same tag within a workspace.
 pub fn normalize_tag_name(name: &str) -> String {
     name.trim().to_lowercase()
 }
 
-/// One scan/reconcile run over a bucket's index (IDX-001..014).
+/// One scan/reconcile run over a bucket's index.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexRun {
     pub id: IndexRunId,
@@ -137,7 +158,7 @@ pub struct IndexRun {
     pub error_count: u64,
 }
 
-/// Index run lifecycle. Closed vocabulary stored as text (IDX-014).
+/// Index run lifecycle. Closed vocabulary stored as text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IndexRunState {
@@ -149,6 +170,7 @@ pub enum IndexRunState {
 }
 
 impl IndexRunState {
+    /// Canonical token stored in the `state` column.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Running => "running",
@@ -159,6 +181,10 @@ impl IndexRunState {
         }
     }
 
+    /// Decode the canonical token.
+    ///
+    /// # Errors
+    /// Returns [`Error::database`] for an unknown token.
     pub fn parse(token: &str) -> Result<Self> {
         Ok(match token {
             "running" => Self::Running,
@@ -173,7 +199,12 @@ impl IndexRunState {
     }
 
     /// Apply a lifecycle transition, rejecting state jumps that would make a
-    /// persisted Index run lie about whether scanning completed.
+    /// persisted index run lie about whether scanning completed.
+    ///
+    /// # Errors
+    /// Returns [`Error::conflict`] for any edge outside
+    /// `Running → {Paused, Cancelled, Succeeded, Failed}`,
+    /// `Paused → {Running, Cancelled}`, and self-transitions.
     pub fn transition(self, target: Self) -> Result<Self> {
         use IndexRunState::{Cancelled, Failed, Paused, Running, Succeeded};
         let allowed = matches!(
@@ -190,21 +221,22 @@ impl IndexRunState {
     }
 }
 
-/// Catalog-side object freshness (IDX-015): when the index last confirmed the
-/// object against the remote, and whether it has since gone stale or been
-/// deleted (tombstoned).
+/// Catalog-side object freshness: when the index last confirmed the object
+/// against the remote, and whether it has since gone stale or been deleted
+/// (tombstoned).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ObjectState {
     #[default]
     Confirmed,
-    /// A refresh marked it missing remotely but inside the retention window
-    /// (IDX-012): still listed, flagged stale.
+    /// A refresh marked it missing remotely but inside the retention window:
+    /// still listed, flagged stale.
     Stale,
     Deleted,
 }
 
 impl ObjectState {
+    /// Canonical token stored in the `state` column.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Confirmed => "confirmed",
@@ -213,6 +245,10 @@ impl ObjectState {
         }
     }
 
+    /// Decode the canonical token.
+    ///
+    /// # Errors
+    /// Returns [`Error::database`] for an unknown token.
     pub fn parse(token: &str) -> Result<Self> {
         Ok(match token {
             "confirmed" => Self::Confirmed,
@@ -250,8 +286,8 @@ mod tests {
     #[test]
     fn ignore_rule_prefix_matches_subtree_only() {
         let rule = IgnoreRule {
-            id: 1,
-            bucket_id: BucketId::new(),
+            id: IgnoreRuleId(1),
+            bucket_id: BucketId::new_random(),
             directory: "photos/raw/".into(),
             enabled: true,
             created_at: OffsetDateTime::UNIX_EPOCH,

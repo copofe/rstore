@@ -11,8 +11,8 @@ use crate::remote::ObjectPath;
 ///
 /// CLI and desktop input may use several URI spellings, but application
 /// workflows should exchange this value instead of reparsing strings. The
-/// bucket-relative path is kept as [`ObjectPath`], so a locator cannot carry a
-/// second, conflicting bucket or connection name.
+/// bucket-relative path is kept as [`ObjectPath`], so a locator cannot carry
+/// a second, conflicting bucket or connection name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RemoteLocator {
     pub connection_id: ConnectionId,
@@ -21,24 +21,13 @@ pub struct RemoteLocator {
 }
 
 impl RemoteLocator {
+    /// Build a locator from its typed components.
     pub fn new(connection_id: ConnectionId, bucket_id: BucketId, path: ObjectPath) -> Self {
         Self {
             connection_id,
             bucket_id,
             path,
         }
-    }
-
-    pub const fn connection_id(&self) -> ConnectionId {
-        self.connection_id
-    }
-
-    pub const fn bucket_id(&self) -> BucketId {
-        self.bucket_id
-    }
-
-    pub fn path(&self) -> &ObjectPath {
-        &self.path
     }
 }
 
@@ -61,8 +50,8 @@ mod tests {
     #[test]
     fn displays_the_canonical_typed_address() {
         let locator = RemoteLocator::new(
-            ConnectionId::new(),
-            BucketId::new(),
+            ConnectionId::new_random(),
+            BucketId::new_random(),
             ObjectPath::new("/photos/cat.jpg").unwrap(),
         );
 
@@ -73,8 +62,8 @@ mod tests {
     #[test]
     fn serde_round_trip_preserves_typed_ids() {
         let locator = RemoteLocator::new(
-            ConnectionId::new(),
-            BucketId::new(),
+            ConnectionId::new_random(),
+            BucketId::new_random(),
             ObjectPath::new("photos/cat.jpg").unwrap(),
         );
 

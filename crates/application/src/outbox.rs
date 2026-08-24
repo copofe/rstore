@@ -1,16 +1,20 @@
 //! Application-owned outbox dispatcher.
 //!
-//! The dispatcher delivers durable domain facts; it does not publish progress
-//! or UI notifications. A failed handler is recorded back into the outbox and
-//! retried with exponential backoff. Once the adapter reaches its attempt
-//! limit, the adapter creates a repair item that diagnostics can query.
+//! The dispatcher delivers durable domain facts; it does not publish progress or UI
+//! notifications. A failed handler is recorded back into the outbox and retried with
+//! exponential backoff. Once the adapter reaches its attempt limit, the adapter creates a
+//! repair item that diagnostics can query.
 
 use async_trait::async_trait;
 use rstore_application_ports::{OutboxEvent, OutboxStore, RepairItem};
-use rstore_domain::{Error, Result};
+use rstore_domain::Result;
 use std::sync::Arc;
 use time::{Duration, OffsetDateTime};
 
+/// Per-cycle outcome of [`OutboxDispatcher::dispatch_once`].
+///
+/// `repair_required` counts currently pending repair items (capped at the batch size), not
+/// repairs created by this cycle.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DispatchReport {
     pub claimed: u32,
@@ -19,11 +23,13 @@ pub struct DispatchReport {
     pub repair_required: u32,
 }
 
+/// A consumer of outbox events; success acknowledges the event, failure schedules a retry.
 #[async_trait]
 pub trait OutboxHandler: Send + Sync {
     async fn handle(&self, event: &OutboxEvent) -> Result<()>;
 }
 
+/// Delivers due outbox events to an [`OutboxHandler`] in bounded batches.
 #[derive(Clone)]
 pub struct OutboxDispatcher {
     store: Arc<dyn OutboxStore>,
@@ -31,6 +37,7 @@ pub struct OutboxDispatcher {
 }
 
 impl OutboxDispatcher {
+    /// A dispatcher with the default batch size of 64 events per cycle.
     pub fn new(store: Arc<dyn OutboxStore>) -> Self {
         Self {
             store,
@@ -38,15 +45,25 @@ impl OutboxDispatcher {
         }
     }
 
+    /// Override the per-cycle batch size (clamped to at least 1).
     pub fn with_batch_size(mut self, batch_size: u32) -> Self {
         self.batch_size = batch_size.max(1);
         self
     }
 
+    /// Reclaim events left in `processing` by a dead dispatcher so they become claimable
+    /// again; returns the number reclaimed.
     pub async fn recover_processing(&self, now: OffsetDateTime) -> Result<u64> {
         self.store.recover_processing(now).await
     }
 
+    /// Run one dispatch cycle.
+    ///
+    /// Flow: claim up to `batch_size` due events, then for each one acknowledge on handler
+    /// success, or on failure schedule a retry with `2^attempts` seconds of exponential
+    /// backoff (attempts clamped so the delay stays bounded). Events that exhaust the store's
+    /// attempt limit turn into repair items; the report counts pending repairs after the
+    /// cycle.
     pub async fn dispatch_once<H: OutboxHandler + ?Sized>(
         &self,
         now: OffsetDateTime,
@@ -59,14 +76,14 @@ impl OutboxDispatcher {
         for event in events {
             match handler.handle(&event).await {
                 Ok(()) => {
-                    self.store.acknowledge(&event.event_id, now).await?;
+                    self.store.acknowledge(event.event_id, now).await?;
                     published += 1;
                 }
                 Err(error) => {
                     let backoff_seconds = 2_i64.pow(event.attempts.clamp(1, 8));
                     let retry_at = now + Duration::seconds(backoff_seconds);
                     self.store
-                        .retry(&event.event_id, retry_at, &error.to_string())
+                        .retry(event.event_id, retry_at, &error.to_string())
                         .await?;
                     retried += 1;
                 }
@@ -81,14 +98,14 @@ impl OutboxDispatcher {
         })
     }
 
+    /// List pending repair items, most pressing first, up to `limit`.
     pub async fn repairs(&self, limit: u32) -> Result<Vec<RepairItem>> {
         self.store.repairs(limit).await
     }
 }
 
-/// A handler useful for tests and for a bootstrap that has no projection
-/// consumer configured yet. It acknowledges events without adding a second
-/// delivery side effect.
+/// A handler useful for tests and for a bootstrap that has no projection consumer configured
+/// yet. It acknowledges events without adding a second delivery side effect.
 pub struct NoopOutboxHandler;
 
 #[async_trait]
@@ -96,12 +113,6 @@ impl OutboxHandler for NoopOutboxHandler {
     async fn handle(&self, _event: &OutboxEvent) -> Result<()> {
         Ok(())
     }
-}
-
-/// Build an application-level error when a dispatcher has no store. Kept as a
-/// named helper so future desktop wiring can map this to a diagnostics DTO.
-pub fn dispatcher_unavailable() -> Error {
-    Error::config("outbox dispatcher is not configured")
 }
 
 #[cfg(test)]
@@ -112,8 +123,8 @@ mod tests {
 
     fn event() -> OutboxEvent {
         OutboxEvent {
-            event_id: "evt-dispatch".into(),
-            context: "transfer".into(),
+            event_id: uuid::Uuid::new_v4(),
+            context: rstore_domain::BoundedContext::Transfer,
             aggregate_type: "job".into(),
             aggregate_id: "job-1".into(),
             aggregate_version: 1,

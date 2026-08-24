@@ -1,11 +1,9 @@
-//! The one prelude for remote batch operations.
+//! Shared remote endpoint resolution and batch item planning.
 //!
-//! Recursive `cp`/`mv` sources and `rm` targets share one shape: resolve the
-//! endpoint once per unique `conn/bucket`, expand directory references
-//! through `expand::source_entries`, type the paths and label every item with
-//! the canonical `conn/bucket/key` address. That assembly lives here, so the
-//! orchestrators are parameter assemblies, and `job_run`'s interrupt,
-//! truncation and terminal-state rules govern every batch.
+//! [`Endpoints`] caches one resolved adapter per connection/bucket pair so a
+//! batch touching many keys under the same target pays the locator chain
+//! once, and every item validates its URI shape before any resolution work
+//! happens (`validate-before-resolve`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -15,35 +13,34 @@ use rstore_domain::{Bucket, Result};
 use rstore_storage_api::Storage;
 
 use crate::locator::CatalogLocator;
-use crate::remote::RemoteUri;
+use crate::reference::RemoteUri;
 
-/// One resolved `conn/bucket` endpoint, shared by every item referencing it —
-/// adapter construction stays once per unique endpoint however many objects a
-/// recursive expansion yields.
+/// One resolved batch target: the bucket plus an adapter connected to it.
 pub struct Endpoint {
     pub bucket: Bucket,
     pub storage: Arc<dyn Storage>,
-    /// `conn/bucket` in the reference's own spelling — the base of the
-    /// canonical address form.
+
+    /// `<connection>/<bucket>` prefix used to render per-item labels.
     base: String,
 }
 
 impl Endpoint {
-    /// The canonical `conn/bucket/key` address (the short-reference shape).
+    /// Render the full remote label for one object key under this target.
     pub fn label(&self, key: &str) -> String {
         format!("{}/{}", self.base, key)
     }
 }
 
-/// The endpoint cache a run resolves through.
+/// Cache of resolved [`Endpoint`]s keyed by `connection-display/bucket`.
 #[derive(Default)]
 pub struct Endpoints {
     cache: HashMap<String, Arc<Endpoint>>,
 }
 
 impl Endpoints {
-    /// Resolve one endpoint, reusing an adapter that has already been resolved when
-    /// the same `conn/bucket` repeats in a batch.
+    /// Resolve a URI's connection and bucket to a shared [`Endpoint`],
+    /// reusing the cached adapter when this pair was already resolved this
+    /// batch. Errors when the locator cannot resolve the target.
     pub async fn resolve(
         &mut self,
         locator: &CatalogLocator,
@@ -64,22 +61,22 @@ impl Endpoints {
     }
 }
 
-/// One typed item of a remote batch: endpoint shared, path typed, label
-/// canonical, prefix-relative name kept for directory-target pairing.
+/// One planned source item for a remote-side batch operation.
 pub struct RemoteItem {
     pub endpoint: Arc<Endpoint>,
     pub path: ObjectPath,
-    /// The entry's name relative to the expanded prefix — what a
-    /// directory-ish target joins under its own key.
+
+    /// Key relative to the requested prefix (empty for the prefix itself).
     pub relative: String,
-    /// Canonical `conn/bucket/key`.
+
     pub label: String,
 }
 
-/// Expand one URI reference into typed items — the shared prelude. The
-/// directory-reference pairing rule (`require_recursive`), prefix expansion
-/// (`source_entries`) and canonical labels happen here once; callers consume
-/// typed items and never re-parse or re-resolve.
+/// List the objects under a remote URI as planned [`RemoteItem`]s.
+///
+/// Validates the URI and the recursive/prefix combination before any
+/// resolution or listing; errors surface before side effects. Non-recursive
+/// calls list a single flat level, recursive calls walk the whole subtree.
 pub async fn remote_items(
     locator: &CatalogLocator,
     endpoints: &mut Endpoints,
@@ -87,8 +84,8 @@ pub async fn remote_items(
     recursive: bool,
 ) -> Result<Vec<RemoteItem>> {
     let parsed = RemoteUri::parse(uri)?;
-    let endpoint = endpoints.resolve(locator, &parsed).await?;
     crate::expand::require_recursive(uri, &parsed.key, recursive)?;
+    let endpoint = endpoints.resolve(locator, &parsed).await?;
     let entries = crate::expand::source_entries(
         endpoint.storage.as_ref(),
         &endpoint.bucket.name,

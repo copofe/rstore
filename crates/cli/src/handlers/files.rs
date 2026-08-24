@@ -1,4 +1,8 @@
-//! `index …` and `files …` handlers (IDX-/MIX-).
+//! Handlers for `index …`, `files …`, and catalog maintenance commands.
+//!
+//! Each handler renders one [`HandlerOutput`] carrying both the structured
+//! data and the pre-rendered human text; destructive actions go through the
+//! shared confirmation discipline before touching state.
 
 use rstore_application::{BucketRef, WorkspaceRef};
 use rstore_application::{FileFilter, FileSort, PageRequest, SortField, SortOrder};
@@ -9,6 +13,11 @@ use super::HandlerResult;
 use crate::args::{FilesCommand, IndexCommand};
 use crate::output::HandlerOutput;
 
+/// Run an index subcommand: start, stats, status, pause, resume, cancel,
+/// refresh, or rebuild.
+///
+/// Rebuild drops catalog rows for the bucket and rescans, so it always asks
+/// for confirmation unless `--yes` was given.
 pub(super) async fn index(
     action: &IndexCommand,
     app: &rstore_application::ApplicationApi,
@@ -74,8 +83,8 @@ pub(super) async fn index(
                 .with_data(serde_json::json!({"bucket": bucket, "run": super::json_value(&run)?})))
         }
         IndexCommand::Resume { bucket } => {
-            // Resume is start through the persisted checkpoint (IDX-007) —
-            // one scan entry path, no service-level alias.
+            // Resume reuses the start path through the persisted checkpoint,
+            // keeping a single scan entry point with no service-level alias.
             let report = svc.start(&BucketRef::parse(bucket), cancel).await?;
             render_report(report)
         }
@@ -102,6 +111,7 @@ pub(super) async fn index(
     }
 }
 
+/// Render an index-run summary line set from the application's report.
 fn render_report(report: rstore_application::IndexReport) -> HandlerResult {
     let human = format!(
         "index run {} — {}\n  seen {}  upserted {}  pruned {}  stale {}\n  catalog revision {}\n",
@@ -116,6 +126,7 @@ fn render_report(report: rstore_application::IndexReport) -> HandlerResult {
     Ok(HandlerOutput::human(human).with_data(super::json_value(&report)?))
 }
 
+/// Run a files subcommand: list, search, or show a catalog entry.
 pub(super) async fn files(
     action: &FilesCommand,
     app: &rstore_application::ApplicationApi,
@@ -170,7 +181,7 @@ pub(super) async fn files(
                 .header(&entry.uri)
                 .push("bucket", &entry.bucket)
                 .push("connection", &entry.connection)
-                .push("size", format!("{} bytes", entry.size))
+                .push("size", super::format::human_size(entry.size))
                 .push(
                     "modified",
                     rstore_domain::clock::iso8601(entry.last_modified),
@@ -229,7 +240,7 @@ async fn list_files(
     for f in &page.items {
         table.row(vec![
             f.name.clone(),
-            format!("{}B", f.size),
+            super::format::human_size(f.size),
             format!("{}/{}", f.connection, f.bucket),
             f.state.as_str().to_string(),
         ]);
@@ -254,8 +265,12 @@ async fn list_files(
     Ok(HandlerOutput::human(human).with_data(data))
 }
 
-/// `field:dir` → [`FileSort`] (MIX-023). Falls back to name when the field
-/// is sortable only with extra context we do not expose yet.
+/// Parse a `field:dir` spec into a [`FileSort`], defaulting to descending
+/// order when the direction is omitted. Fields whose sort needs extra context
+/// beyond the CLI surface are rejected like unknown names.
+///
+/// # Errors
+/// Returns [`Error::invalid_input`] for an unrecognized field or order.
 fn parse_sort(spec: &str) -> Result<FileSort, Error> {
     let (field, order) = match spec.split_once(':') {
         Some((f, o)) => (f, o),
@@ -286,14 +301,25 @@ fn parse_sort(spec: &str) -> Result<FileSort, Error> {
     Ok(FileSort { field, order })
 }
 
-// --- catalog gc (IDX-020): catalog maintenance beside index/files ---------
-
+/// Run catalog maintenance; currently only tombstone garbage collection.
+///
+/// Purging tombstones is destructive, so a real (non-dry-run) run goes
+/// through the same `--yes`/prompt confirmation as every other destructive
+/// command.
 pub(super) async fn catalog(
     action: &crate::args::CatalogCommand,
     app: &rstore_application::ApplicationApi,
+    session: &super::tty::Session,
 ) -> HandlerResult {
     match action {
-        crate::args::CatalogCommand::Gc { dry_run, retention } => {
+        crate::args::CatalogCommand::Gc {
+            dry_run,
+            retention,
+            yes,
+        } => {
+            if !*dry_run {
+                super::tty::confirm_destructive("purge expired tombstones", *yes, session)?;
+            }
             let retention_override = match retention {
                 Some(raw) => Some(parse_retention(raw)?),
                 None => None,
@@ -317,8 +343,11 @@ pub(super) async fn catalog(
 }
 
 /// Parse a retention span: plain seconds or `30m`/`1h`/`2d`/`1w` units,
-/// bounded to a year (the retention setting, TAG-026 — unlike presign TTLs
-/// this can far exceed seven days).
+/// bounded to a year. Unlike presign TTLs this bound may far exceed seven
+/// days, because tombstone retention legitimately outlives short-lived URLs.
+///
+/// # Errors
+/// Returns a domain error for malformed or out-of-range spans.
 fn parse_retention(raw: &str) -> rstore_domain::Result<u64> {
     rstore_domain::duration::parse_span(
         raw,

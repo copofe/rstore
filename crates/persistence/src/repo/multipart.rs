@@ -1,21 +1,20 @@
-//! SQLite-backed multipart checkpoint store (UP-014/015, JOB-013).
+//! SQLite-backed multipart checkpoint store.
 //!
-//! Implements [`MultipartStore`] over `multipart_uploads` / `multipart_parts`
-//! so an interrupted upload resumes from its completed parts on the next run.
-
+//! Implements the storage-layer multipart port over `multipart_uploads` /
+//! `multipart_parts` so an interrupted upload resumes from its completed parts
+//! on the next run.
 use async_trait::async_trait;
 use std::sync::Arc;
 
+use rstore_domain::id::ConnectionId;
 use rstore_domain::{Clock, Error, Result};
-use rstore_storage_api::model::UploadedPart;
-use rstore_storage_api::{FileFingerprint, MultipartStore, PendingUpload};
+use rstore_storage_api::{FileFingerprint, MultipartStore, PendingUpload, UploadedPart};
 use sqlx::sqlite::SqlitePool;
 
 use crate::codec::{Bind, Insert, RowReader};
 use crate::error::map_sqlx;
 use crate::tx::WriteGate;
 
-/// SQLite checkpoint store.
 #[derive(Clone)]
 pub struct SqliteMultipartStore {
     gate: WriteGate,
@@ -32,13 +31,17 @@ impl SqliteMultipartStore {
         }
     }
 
-    /// The `multipart_uploads.id` row for (connection, bucket, key).
-    async fn row_id(&self, connection: &str, bucket: &str, key: &str) -> Result<Option<i64>> {
+    async fn row_id(
+        &self,
+        connection: ConnectionId,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<i64>> {
         let row = sqlx::query(
             "SELECT id FROM multipart_uploads
              WHERE connection_id = ? AND bucket = ? AND key = ?",
         )
-        .bind(connection)
+        .bind(crate::codec::uuid_to_text(&connection))
         .bind(bucket)
         .bind(key)
         .fetch_optional(&self.read_pool)
@@ -52,7 +55,7 @@ impl SqliteMultipartStore {
 impl MultipartStore for SqliteMultipartStore {
     async fn pending(
         &self,
-        connection: &str,
+        connection: ConnectionId,
         bucket: &str,
         key: &str,
     ) -> Result<Option<PendingUpload>> {
@@ -61,7 +64,7 @@ impl MultipartStore for SqliteMultipartStore {
              FROM multipart_uploads
              WHERE connection_id = ? AND bucket = ? AND key = ?",
         )
-        .bind(connection)
+        .bind(crate::codec::uuid_to_text(&connection))
         .bind(bucket)
         .bind(key)
         .fetch_optional(&self.read_pool)
@@ -111,7 +114,7 @@ impl MultipartStore for SqliteMultipartStore {
 
     async fn started(
         &self,
-        connection: &str,
+        connection: ConnectionId,
         bucket: &str,
         key: &str,
         upload_id: &str,
@@ -122,7 +125,7 @@ impl MultipartStore for SqliteMultipartStore {
             .map_err(|e| Error::invalid_input("multipart source is too large").with_source(e))?;
         Insert::into("multipart_uploads")
             .column("job_id", Bind::NullInteger)
-            .column("connection_id", connection)
+            .column("connection_id", crate::codec::uuid_to_text(&connection))
             .column("bucket", bucket)
             .column("key", key)
             .column("upload_id", upload_id)
@@ -136,7 +139,7 @@ impl MultipartStore for SqliteMultipartStore {
 
     async fn part_done(
         &self,
-        connection: &str,
+        connection: ConnectionId,
         bucket: &str,
         key: &str,
         part: &UploadedPart,
@@ -144,13 +147,13 @@ impl MultipartStore for SqliteMultipartStore {
         self.record_part(connection, bucket, key, part).await
     }
 
-    async fn cleared(&self, connection: &str, bucket: &str, key: &str) -> Result<()> {
+    async fn cleared(&self, connection: ConnectionId, bucket: &str, key: &str) -> Result<()> {
         let _write = self.gate.permit().await?;
         sqlx::query(
             "DELETE FROM multipart_uploads
              WHERE connection_id = ? AND bucket = ? AND key = ?",
         )
-        .bind(connection)
+        .bind(crate::codec::uuid_to_text(&connection))
         .bind(bucket)
         .bind(key)
         .execute(self.gate.pool())
@@ -163,7 +166,7 @@ impl MultipartStore for SqliteMultipartStore {
 impl SqliteMultipartStore {
     async fn record_part(
         &self,
-        connection: &str,
+        connection: ConnectionId,
         bucket: &str,
         key: &str,
         part: &UploadedPart,
@@ -206,22 +209,26 @@ mod tests {
         }
     }
 
+    const CONN: ConnectionId = ConnectionId::from_uuid(uuid::Uuid::nil());
+
     #[tokio::test]
     async fn checkpoint_round_trips_fingerprint_parts_and_injected_time() {
-        let db = crate::Database::open_in_memory().await.unwrap();
         let now = OffsetDateTime::from_unix_timestamp(1_700_000_123).unwrap();
-        let store = db.multipart(Arc::new(FixedClock(now)));
+        let db = crate::Database::open_in_memory_with_clock(Arc::new(FixedClock(now)))
+            .await
+            .unwrap();
+        let store = db.multipart();
         let fingerprint = FileFingerprint {
             size: 42,
             modified_ns: Some(1_700_000_123_456_789_000),
         };
         store
-            .started("conn", "bucket", "key", "upload-1", &fingerprint)
+            .started(CONN, "bucket", "key", "upload-1", &fingerprint)
             .await
             .unwrap();
         store
             .part_done(
-                "conn",
+                CONN,
                 "bucket",
                 "key",
                 &UploadedPart {
@@ -233,11 +240,7 @@ mod tests {
             .await
             .unwrap();
 
-        let pending = store
-            .pending("conn", "bucket", "key")
-            .await
-            .unwrap()
-            .unwrap();
+        let pending = store.pending(CONN, "bucket", "key").await.unwrap().unwrap();
         assert_eq!(pending.upload_id, "upload-1");
         assert_eq!(pending.fingerprint, fingerprint);
         assert_eq!(pending.parts.len(), 1);
@@ -254,9 +257,9 @@ mod tests {
         assert_eq!(created_at, now.unix_timestamp());
         assert_eq!(uploaded_at, now.unix_timestamp());
 
-        store.cleared("conn", "bucket", "key").await.unwrap();
+        store.cleared(CONN, "bucket", "key").await.unwrap();
         assert!(store
-            .pending("conn", "bucket", "key")
+            .pending(CONN, "bucket", "key")
             .await
             .unwrap()
             .is_none());
@@ -264,11 +267,15 @@ mod tests {
 
     #[tokio::test]
     async fn corrupt_checkpoint_is_an_error_not_a_missing_checkpoint() {
-        let db = crate::Database::open_in_memory().await.unwrap();
-        let store = db.multipart(Arc::new(FixedClock(OffsetDateTime::UNIX_EPOCH)));
+        let db = crate::Database::open_in_memory_with_clock(Arc::new(FixedClock(
+            OffsetDateTime::UNIX_EPOCH,
+        )))
+        .await
+        .unwrap();
+        let store = db.multipart();
         store
             .started(
-                "conn",
+                CONN,
                 "bucket",
                 "key",
                 "upload-1",
@@ -284,7 +291,7 @@ mod tests {
             .await
             .unwrap();
 
-        let error = store.pending("conn", "bucket", "key").await.unwrap_err();
+        let error = store.pending(CONN, "bucket", "key").await.unwrap_err();
         assert_eq!(error.code, rstore_domain::ErrorCode::Database);
     }
 }

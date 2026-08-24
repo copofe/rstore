@@ -1,39 +1,39 @@
-//! Transfer orchestration (UP- / DOWN- / JOB- / IDX-011).
-//!
-//! [`TransferService`] turns a user request (files + remote prefix) into a
-//! persisted job, runs the [`TransferEngine`] item by item with Core-level
-//! guards (SEC-004/005), and keeps the catalog in step with every completed
-//! transfer. Cancellation (Ctrl+C) persists job state before unwinding so
-//! `task resume`/a re-run continues from the checkpoints (UP-014/015).
+//! Upload/download orchestration: classifies download modes, turns remote
+//! references into plans, resolves endpoints with retry, and drives the
+//! transfer engine per item while recording jobs and catalog settlements.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use rstore_application_ports::JobRepository;
 use rstore_domain::job::JobKind;
 use rstore_domain::policy::ConflictPolicy;
-use rstore_domain::JobRepository;
 use rstore_domain::{Clock, Error, Result};
 use rstore_transfer::{
     CancellationToken, MultipartStore, ProgressSink, TransferConfig, TransferEngine,
 };
 
-use crate::bucket::BucketService;
 use crate::connection::ConnectionRef;
-use crate::remote::RemoteUri;
+use crate::reference::RemoteUri;
 use crate::transfer_plan::EngineItem;
 
 pub use crate::transfer_plan::{DownloadPlan, UploadPlan};
-pub use crate::transfer_report::{Outcome, TransferReport, TransferReportItem};
+pub use crate::transfer_report::{TransferReport, TransferReportItem};
 
-/// How a download command should be executed after the boundary has parsed
-/// its source list. The target-directory rule belongs to Application so CLI
-/// and Desktop share it.
+/// Whether a download targets one object or fans out over a directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DownloadMode {
     Single,
     Batch,
 }
 
+/// Picks the download mode from source count and target shape.
+///
+/// A batch requires an existing target directory; every item then mirrors
+/// beneath it.
+///
+/// # Errors
+/// Returns `invalid_input` for zero sources or a batch without a directory.
 pub fn classify_download(source_count: usize, target: &Path) -> Result<DownloadMode> {
     if source_count == 0 {
         return Err(Error::invalid_input(
@@ -51,9 +51,9 @@ pub fn classify_download(source_count: usize, target: &Path) -> Result<DownloadM
     Ok(DownloadMode::Single)
 }
 
-/// Build typed download plans from already-expanded canonical references.
-/// URI parsing and plan shape stay below the entry point; renderers only
-/// choose the target path and conflict policy.
+/// Parses canonical remote references into one plan per source.
+///
+/// Parsing happens once here so later stages never re-expand references.
 pub fn download_plans(
     references: &[String],
     target: PathBuf,
@@ -76,8 +76,7 @@ pub fn download_plans(
         .collect()
 }
 
-/// Aggregate of a batch download. Each source remains its own persisted child
-/// job; orchestration and aggregate state live at the application seam.
+/// Aggregate counters over several sequential downloads.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BatchDownloadReport {
     pub reports: Vec<TransferReport>,
@@ -88,9 +87,18 @@ pub struct BatchDownloadReport {
     pub interrupted: bool,
 }
 
-/// Options for a run. `retry` lives here, next to the layer that spends it
-/// (the connection handle), not inside the engine's `TransferConfig` — the
-/// engine issues each storage operation exactly once.
+impl BatchDownloadReport {
+    /// The worst child severity — the batch verdict entry layers act on.
+    pub fn severity(&self) -> crate::batch_outcome::Severity {
+        self.reports
+            .iter()
+            .map(TransferReport::severity)
+            .max()
+            .unwrap_or(crate::batch_outcome::Severity::AllOk)
+    }
+}
+
+/// Runtime knobs shared by upload and download runs.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RunOptions {
     pub dry_run: bool,
@@ -98,11 +106,9 @@ pub struct RunOptions {
     pub retry: rstore_transfer::RetryPolicy,
 }
 
-/// The transfer orchestrator. Dependencies are trait objects: the
-/// composition root wires the SQLite repositories, tests substitute fakes.
 pub struct DefaultTransferService {
+    gateway: crate::gateway::RemoteGateway,
     locator: crate::locator::CatalogLocator,
-    buckets: Arc<dyn BucketService>,
     jobs: Arc<dyn JobRepository>,
     checkpoints: Arc<dyn MultipartStore>,
     clock: Arc<dyn Clock>,
@@ -111,16 +117,16 @@ pub struct DefaultTransferService {
 
 impl DefaultTransferService {
     pub(crate) fn new(
+        gateway: crate::gateway::RemoteGateway,
         locator: crate::locator::CatalogLocator,
-        buckets: Arc<dyn BucketService>,
         jobs: Arc<dyn JobRepository>,
         checkpoints: Arc<dyn MultipartStore>,
         clock: Arc<dyn Clock>,
         mutations: Arc<crate::mutation::MutationCoordinator>,
     ) -> Self {
         Self {
+            gateway,
             locator,
-            buckets,
             jobs,
             checkpoints,
             clock,
@@ -128,9 +134,6 @@ impl DefaultTransferService {
         }
     }
 
-    /// Resolve a plan's base (connection + bucket + prefix) through the
-    /// tier-1 locator path — every live remote operation resolves the same
-    /// way, with the same not-found hint.
     #[cfg(test)]
     async fn plan_target(
         &self,
@@ -144,6 +147,7 @@ impl DefaultTransferService {
         self.locator.resolve_pair_target(connection, bucket).await
     }
 
+    /// Resolves the endpoint pair with retry and cancellation support.
     async fn plan_target_with_retry(
         &self,
         connection: &ConnectionRef,
@@ -160,8 +164,10 @@ impl DefaultTransferService {
             .await
     }
 
-    /// Run an upload job (UP-001..015). Items are guarded, then transferred
-    /// one by one; every completion updates the catalog (IDX-011).
+    /// Uploads local files (optionally whole trees) to one bucket.
+    ///
+    /// Plan validation runs on a blocking thread before endpoint resolution,
+    /// so bad sources fail without ever building a storage adapter.
     pub async fn run_upload(
         &self,
         plan: &UploadPlan,
@@ -169,14 +175,22 @@ impl DefaultTransferService {
         progress: &dyn ProgressSink,
         cancel: &CancellationToken,
     ) -> Result<TransferReport> {
-        // Local validation and tree expansion precede endpoint resolution, so
-        // bad input never constructs a remote adapter.
-        let prepared = crate::transfer_plan::prepare_upload(plan)?;
+        // Recursive directory walks are blocking I/O; keep them off the
+        // async runtime threads.
+        let prepared = {
+            let plan = plan.clone();
+            tokio::task::spawn_blocking(move || crate::transfer_plan::prepare_upload(&plan))
+                .await
+                .map_err(|error| Error::database("upload planning task").with_source(error))??
+        };
         let (config, bucket, storage) = self
             .plan_target_with_retry(&plan.connection, &plan.bucket, options.retry, cancel)
             .await?;
-        // SEC-004: read-only buckets refuse uploads at the Core layer.
-        self.buckets.assert_writable(bucket.id).await?;
+
+        // The write guard is the gateway's writer handle: holding one proves
+        // the bucket accepted mutations before the engine exists.
+        let writer = self.gateway.writer(storage.clone(), &bucket)?;
+        let storage = writer.storage().clone();
 
         let engine = TransferEngine::new(storage, self.checkpoints.clone(), options.config);
         let items = crate::transfer_plan::upload_items(prepared, config.id, &bucket.name)
@@ -195,7 +209,9 @@ impl DefaultTransferService {
         .await
     }
 
-    /// Run a download job (DOWN-001..009).
+    /// Downloads objects under a prefix or exact key to a local target.
+    ///
+    /// Plan validation is purely local and runs before endpoint resolution.
     pub async fn run_download(
         &self,
         plan: &DownloadPlan,
@@ -203,7 +219,6 @@ impl DefaultTransferService {
         progress: &dyn ProgressSink,
         cancel: &CancellationToken,
     ) -> Result<TransferReport> {
-        // Syntax and exact-key validation happen before adapter construction.
         let prepared = crate::transfer_plan::prepare_download(plan)?;
         let (config, bucket, storage) = self
             .plan_target_with_retry(&plan.connection, &plan.bucket, options.retry, cancel)
@@ -233,8 +248,10 @@ impl DefaultTransferService {
         .await
     }
 
-    /// Run one download job per source plan and aggregate their item results
-    /// (MIX-029). Cancellation stops the batch after the interrupted child.
+    /// Runs plans sequentially, aggregating counts into one batch report.
+    ///
+    /// Stops after the first interrupted child so cancellation propagates
+    /// promptly instead of queuing further downloads.
     pub async fn run_batch_download(
         &self,
         plans: &[DownloadPlan],
@@ -290,8 +307,6 @@ impl DefaultTransferService {
             |item| {
                 let bucket = bucket.clone();
                 async move {
-                    // MOVE-012: no write requests leave the process; the
-                    // preview narrates what a real run would do.
                     if dry_run {
                         return crate::job_run::Step::preview(item.preview());
                     }
@@ -308,9 +323,12 @@ impl DefaultTransferService {
                         }
                         Err(e) => return crate::job_run::Step::failed(&e),
                     };
-                    let (outcome, detail) = Outcome::from_engine(&out);
-                    // IDX-011: keep the catalog in step with the transfer.
-                    if outcome == Outcome::Succeeded {
+                    let (disposition, detail) =
+                        crate::transfer_report::disposition_from_engine(&out);
+
+                    // Only successful uploads index metadata; downloads carry
+                    // no catalog follow-up of their own.
+                    if disposition.is_success() {
                         if let (EngineItem::Upload(_), Some(metadata)) = (&item, out.metadata) {
                             self.mutations
                                 .settle_upload(
@@ -323,7 +341,7 @@ impl DefaultTransferService {
                         }
                     }
                     crate::job_run::Step::Done {
-                        outcome,
+                        disposition,
                         detail,
                         bytes: out.bytes,
                     }
@@ -456,7 +474,6 @@ mod tests {
         assert_eq!(factory.built(), before);
     }
 
-    /// `--conflict skip` reports `skipped` with the target untouched.
     #[tokio::test]
     async fn conflict_skip_reports_skipped_not_succeeded() {
         use rstore_storage_api::Storage as _;
@@ -484,7 +501,11 @@ mod tests {
             .unwrap();
         assert_eq!(report.skipped, 1);
         assert_eq!(report.succeeded, 0);
-        assert_eq!(report.items[0].outcome, Outcome::Skipped);
+        assert!(matches!(
+            report.items[0].disposition,
+            crate::batch_outcome::Disposition::Skipped(_)
+                | crate::batch_outcome::Disposition::Blocked(_)
+        ));
         assert!(report.items[0]
             .detail
             .as_deref()
@@ -526,9 +547,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(report.succeeded, 2);
-        assert_eq!(report.state, "succeeded");
+        assert_eq!(report.state, JobState::Succeeded);
 
-        // The adapter's real metadata follows the upload into the catalog.
         let (_, bucket, _) = svc
             .plan_target(&ConnectionRef::Name("nas".into()), "media")
             .await
@@ -545,7 +565,6 @@ mod tests {
         assert_eq!(indexed.size, 5);
         assert!(indexed.etag.is_some());
 
-        // Objects landed under the prefix; assert via download below.
         let target_dir = temp_dir("dl");
         let dl = DownloadPlan {
             connection: ConnectionRef::Name("nas".into()),
@@ -570,7 +589,6 @@ mod tests {
             b"alpha".to_vec()
         );
 
-        // The upload job is persisted and inspectable.
         let jobs = svc.jobs.list().await.unwrap();
         assert!(jobs
             .iter()
@@ -603,7 +621,7 @@ mod tests {
             .await
             .unwrap();
         assert!(report.dry_run);
-        // Nothing actually uploaded: a download of the prefix finds nothing.
+
         let dl = DownloadPlan {
             connection: ConnectionRef::Name("nas".into()),
             bucket: "media".into(),
@@ -629,7 +647,7 @@ mod tests {
         let dir = temp_dir("cancel");
         std::fs::write(dir.join("z.txt"), b"payload").unwrap();
         let token = CancellationToken::new();
-        token.cancel(); // cancelled before the first item
+        token.cancel();
         let plan = UploadPlan {
             connection: ConnectionRef::Name("nas".into()),
             bucket: "media".into(),
@@ -642,7 +660,7 @@ mod tests {
             .run_upload(&plan, &RunOptions::default(), &NullProgressSink, &token)
             .await
             .unwrap();
-        assert_eq!(report.state, "interrupted");
+        assert_eq!(report.state, JobState::Interrupted);
         let job = svc.jobs.list().await.unwrap().remove(0);
         assert_eq!(job.state, JobState::Interrupted);
     }
@@ -712,8 +730,6 @@ mod tests {
         assert_eq!(std::fs::read(target.join("two.txt")).unwrap(), b"22");
     }
 
-    // --- report shaping through a real run (JOB-011 semantics) -------------
-
     #[cfg(unix)]
     #[tokio::test]
     async fn partial_failure_reports_partial_success() {
@@ -724,8 +740,8 @@ mod tests {
         std::fs::write(&unreadable, b"secret").unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
-        // Root ignores file modes; without a read failure there is nothing to
-        // assert here, so skip rather than false-fail.
+
+        // Running as root makes the unreadable file readable; skip there.
         if std::fs::read(&unreadable).is_ok() {
             return;
         }
@@ -741,9 +757,8 @@ mod tests {
             .unwrap();
         assert_eq!(report.succeeded, 1);
         assert_eq!(report.failed, 1);
-        assert_eq!(report.state, "partial_success");
+        assert_eq!(report.state, JobState::PartialSuccess);
 
-        // JOB-011: the persisted job mirrors the report.
         let job = svc.jobs.list().await.unwrap().remove(0);
         assert_eq!(job.state, JobState::PartialSuccess);
         let failed_item = job
@@ -751,7 +766,7 @@ mod tests {
             .iter()
             .find(|i| i.state == ItemState::Failed)
             .unwrap();
-        // Item errors are truncated to 200 chars at the persistence boundary.
-        assert!(failed_item.error_code.as_deref().unwrap().len() <= 200);
+
+        assert!(failed_item.error.as_deref().unwrap().len() <= 200);
     }
 }

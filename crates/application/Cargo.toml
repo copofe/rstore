@@ -8,8 +8,11 @@ license.workspace = true
 
 [dependencies]
 rstore-domain.workspace = true
-rstore-application-ports.workspace = true
+# Optional so the `test-util` fixture can share FakeStorage wiring without
+# pulling test scaffolding into production builds.
+rstore-test-support = { workspace = true, optional = true }
 rstore-persistence = { workspace = true, optional = true }
+rstore-application-ports.workspace = true
 rstore-storage-api.workspace = true
 rstore-catalog.workspace = true
 rstore-transfer.workspace = true
@@ -20,9 +23,8 @@ bytes.workspace = true
 time.workspace = true
 uuid.workspace = true
 tracing.workspace = true
-# Optional so the `test-util` fixture can share FakeStorage wiring without
-# pulling test scaffolding into production builds.
-rstore-test-support = { workspace = true, optional = true }
+# `spawn_blocking` keeps local-tree walks off the async executor.
+tokio.workspace = true
 
 [features]
 default = []

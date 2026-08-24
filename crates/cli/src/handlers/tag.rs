@@ -1,4 +1,6 @@
-//! `tag …` handlers (TAG-).
+//! Handlers for the `tag` subcommands: workspace-scoped create/list/edit/
+//! remove/merge plus batched attach/detach over remote objects, with the
+//! batch arms rendered through the shared batch-report grammar.
 
 use rstore_application::{CreateTagInput, TagRef, UpdateTagInput, WorkspaceRef};
 
@@ -65,13 +67,15 @@ pub(super) async fn tag(
             description,
         } => {
             let updated = svc
-                .edit(
+                .update(
                     &WorkspaceRef::parse(workspace),
                     &TagRef::parse(tag),
                     UpdateTagInput {
                         name: name.clone(),
                         color: color.clone(),
-                        description: description.clone(),
+                        // Presentation convention: an empty --description
+                        // means "clear"; the API expresses it as Some(None).
+                        description: description.clone().map(|d| (!d.is_empty()).then_some(d)),
                     },
                 )
                 .await?;
@@ -85,6 +89,7 @@ pub(super) async fn tag(
             tag,
             yes,
         } => {
+            // Resolve first so the confirmation names the exact target.
             let reference = WorkspaceRef::parse(workspace);
             let tag_ref = TagRef::parse(tag);
             let existing = svc.resolve(&reference, &tag_ref).await?;
@@ -106,7 +111,15 @@ pub(super) async fn tag(
             workspace,
             source,
             target,
+            yes,
         } => {
+            // Merging removes the source tag, so the destructive
+            // --yes/prompt discipline applies.
+            super::tty::confirm_destructive(
+                &format!("merge `{source}` into `{target}` (source tag is removed)"),
+                *yes,
+                session,
+            )?;
             let source_ref = TagRef::parse(source);
             let target_ref = TagRef::parse(target);
             let report = svc
@@ -129,7 +142,7 @@ pub(super) async fn tag(
                 .attach_many(&WorkspaceRef::parse(workspace), &uris, tags, *replace)
                 .await?;
             let data = serde_json::json!({
-                "outcomes": super::json_value(&outcomes)?,
+                "outcomes": super::json_value(outcomes.items())?,
                 "tags": tags,
                 "replace": replace,
             });
@@ -145,7 +158,7 @@ pub(super) async fn tag(
                 .detach_many(&WorkspaceRef::parse(workspace), &uris, tags)
                 .await?;
             let data = serde_json::json!({
-                "outcomes": super::json_value(&outcomes)?,
+                "outcomes": super::json_value(outcomes.items())?,
                 "tags": tags,
             });
             render_tag_batch(&outcomes, "detached", data)
@@ -153,25 +166,25 @@ pub(super) async fn tag(
     }
 }
 
+/// Renders an attach/detach batch through the shared grammar; failures carry
+/// their error as the detail line and drive the exit-13 policy.
 fn render_tag_batch(
-    outcomes: &[rstore_application::TagBatchOutcome],
+    outcomes: &rstore_application::BatchOutcome<()>,
     success_marker: &str,
     data: serde_json::Value,
 ) -> HandlerResult {
-    let succeeded = outcomes.iter().filter(|o| o.succeeded()).count();
-    let failed = outcomes.len() - succeeded;
-    let entries = outcomes.iter().map(|outcome| {
-        if outcome.succeeded() {
+    let entries = outcomes.items().iter().map(|item| {
+        if item.disposition.is_success() {
             super::report::BatchEntry {
                 marker: success_marker.to_string(),
-                label: outcome.uri.clone(),
+                label: item.target.clone(),
                 detail: None,
             }
         } else {
             super::report::BatchEntry {
                 marker: "failed".to_string(),
-                label: outcome.uri.clone(),
-                detail: outcome.error.clone(),
+                label: item.target.clone(),
+                detail: failure_message(item),
             }
         }
     });
@@ -181,16 +194,27 @@ fn render_tag_batch(
         entries,
         "re-run to retry failures",
         &super::report::BatchFacts {
-            summary: Some(format!("{succeeded} succeeded, {failed} failed")),
+            summary: Some(format!(
+                "{} succeeded, {} failed",
+                outcomes.succeeded(),
+                outcomes.failed()
+            )),
             interrupted: false,
-            failed,
-            succeeded,
+            severity: outcomes.severity(),
         },
     )
 }
 
-/// `-` expands to one URI per stdin line (TAG-011/012); anything else passes
-/// through untouched.
+/// The projected failure message of one batch item, if it failed.
+fn failure_message(item: &rstore_application::ItemOutcome<()>) -> Option<String> {
+    match &item.disposition {
+        rstore_application::Disposition::Failed(f) => Some(f.message.clone()),
+        _ => None,
+    }
+}
+
+/// `-` expands to one URI per stdin line; anything else passes through
+/// untouched.
 async fn expand_uris(
     app: &rstore_application::ApplicationApi,
     uris: &[String],

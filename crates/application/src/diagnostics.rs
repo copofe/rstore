@@ -1,10 +1,9 @@
-//! Connection diagnostics (CON-007..009 / STORE-022).
+//! Connection diagnostics.
 //!
-//! Split from connection lifecycle so each side is a deep module: lifecycle
-//! owns CRUD and credential storage; diagnostics owns probing (test report,
-//! write probe) and the cached capability report. The diagnostics service's
-//! dependencies — gateway and settings — are required, not optional: a build
-//! without an adapter cannot diagnose.
+//! Split from connection lifecycle so each side is a deep module: lifecycle owns CRUD and
+//! credential storage; diagnostics owns probing (test report, write probe) and the cached
+//! capability report. The diagnostics service's dependencies — gateway and settings — are
+//! required, not optional: a build without an adapter cannot diagnose.
 
 use std::sync::Arc;
 
@@ -20,7 +19,7 @@ use time::OffsetDateTime;
 use crate::connection::ConnectionRef;
 use crate::gateway::RemoteGateway;
 
-/// One check inside a connection test (CON-007).
+/// One check inside a connection test.
 #[derive(Debug, Clone, Serialize)]
 pub struct CheckResult {
     pub name: String,
@@ -28,7 +27,7 @@ pub struct CheckResult {
     pub detail: String,
 }
 
-/// The full connection test report (CON-007/008).
+/// The full connection test report.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConnectionTestReport {
     pub connection: String,
@@ -49,7 +48,7 @@ impl ConnectionTestReport {
     }
 }
 
-/// Capability report for `connection show --capabilities` (CON-009).
+/// Capability report for `connection show --capabilities`.
 #[derive(Debug, Clone, Serialize)]
 pub struct CapabilityReport {
     pub connection: String,
@@ -60,6 +59,9 @@ pub struct CapabilityReport {
 }
 
 /// Probes connections and caches the outcomes.
+///
+/// Test reports persist the outcome on the connection row; capability reports are cached in
+/// the settings store for 24 hours before a fresh probe runs.
 pub struct ConnectionDiagnostics {
     repo: Arc<dyn ConnectionStore>,
     gateway: RemoteGateway,
@@ -82,8 +84,7 @@ impl ConnectionDiagnostics {
         }
     }
 
-    /// Write a raw capability-cache payload (test seam for cache-format
-    /// migration).
+    /// Write a raw capability-cache payload (test seam for cache-format migration).
     #[cfg(test)]
     async fn settings_set_for_test(
         &self,
@@ -96,7 +97,12 @@ impl ConnectionDiagnostics {
             .unwrap();
     }
 
-    /// Probe the connection and persist the outcome (CON-007/008).
+    /// Probe the connection and persist the outcome.
+    ///
+    /// Checks run in order: stored credentials, endpoint/auth plus ListBuckets, then the
+    /// optional write probe (a temporary object that must be cleaned up). An adapter that
+    /// cannot even be constructed short-circuits to a failed report; the outcome is recorded
+    /// on the connection either way.
     pub async fn test(
         &self,
         reference: &ConnectionRef,
@@ -154,6 +160,8 @@ impl ConnectionDiagnostics {
                 buckets
             }
             Err(e) => {
+                // A network failure is not an authentication failure — only unreachable
+                // networks mark the auth check as passed-by-default here.
                 checks.push(CheckResult {
                     name: "endpoint/auth".into(),
                     passed: e.code != ErrorCode::NetworkUnreachable,
@@ -168,13 +176,13 @@ impl ConnectionDiagnostics {
             }
         };
 
-        // 3. Optional write test against the first visible bucket (CON-008):
-        //    a temporary object is created and must be cleaned up.
+        // 3. Optional write test against the first visible bucket: a temporary object is
+        //    created and must be cleaned up.
         if write_test {
             let write = match buckets.first() {
                 Some(bucket) => {
-                    // A generated probe key — a failure to parse it is a bug
-                    // in this format, not user input.
+                    // A generated probe key — a failure to parse it is a bug in this format,
+                    // not user input.
                     let key = rstore_domain::remote::ObjectPath::new(format!(
                         ".rstore-write-test/{}",
                         uuid::Uuid::new_v4().simple()
@@ -234,15 +242,14 @@ impl ConnectionDiagnostics {
         Ok(report)
     }
 
-    /// Resolve capabilities for a connection, probing and caching when stale
-    /// (CON-009 / STORE-022).
+    /// Resolve capabilities for a connection, probing and caching when stale.
+    ///
+    /// A complete cached probe younger than 24 hours is reused as-is; incomplete or invalid
+    /// cache data counts as stale and triggers a fresh probe.
     pub async fn capabilities(&self, reference: &ConnectionRef) -> Result<CapabilityReport> {
         let config = self.gateway.config(reference).await?;
         let cache_key = format!("capabilities/{}", config.id.as_uuid());
 
-        // STORE-022: reuse a complete cached probe from the last 24 hours.
-        // Incomplete or invalid cache data is stale and is replaced by a
-        // fresh probe.
         if let Some(cached) = self.settings.get_json(&cache_key).await? {
             if let Some(probed) = ProbedCapabilities::from_cache(&cached) {
                 let age = self.clock.now().unix_timestamp() - probed.probed_at.unix_timestamp();
@@ -256,9 +263,9 @@ impl ConnectionDiagnostics {
             }
         }
 
-        // Probe: every entry is a real round trip against the live adapter —
-        // none is inferred from the provider's name (PRD §10.2.2). An
-        // adapter that cannot even be constructed classifies uniformly.
+        // Probe: every entry is a real round trip against the live adapter — none is inferred
+        // from the provider's name. An adapter that cannot even be constructed classifies
+        // uniformly.
         let probed = match self.gateway.storage_for_config(&config).await {
             Ok(storage) => probe(storage.as_ref(), self.clock.now()).await,
             Err(e) => ProbedCapabilities::uniform(self.clock.now(), classify(e.code)),
@@ -275,10 +282,11 @@ impl ConnectionDiagnostics {
     }
 }
 
-/// The probed capability set behind [`CapabilityReport`] (CON-009 /
-/// STORE-022). One listing decides `list_buckets` and supplies the bucket
-/// the write-shaped probes run against; multipart and copy probe with a
-/// throwaway object under `.rstore-write-test/`, presign signs locally.
+/// The probed capability set behind [`CapabilityReport`].
+///
+/// One listing decides `list_buckets` and supplies the bucket the write-shaped probes run
+/// against; multipart and copy probe with a throwaway object under `.rstore-write-test/`,
+/// presign signs locally.
 #[derive(Debug, Clone, Copy)]
 struct ProbedCapabilities {
     probed_at: OffsetDateTime,
@@ -318,8 +326,8 @@ impl ProbedCapabilities {
         })
     }
 
-    /// `None` when any probed field is missing or invalid; the caller re-probes
-    /// rather than returning an incomplete capability report.
+    /// `None` when any probed field is missing or invalid; the caller re-probes rather than
+    /// returning an incomplete capability report.
     fn from_cache(value: &serde_json::Value) -> Option<Self> {
         let field = |name: &str| value.get(name)?.as_str().map(Capability::parse_token);
         Some(Self {
@@ -333,9 +341,8 @@ impl ProbedCapabilities {
     }
 }
 
-/// The one probe error classification: an adapter's honest
-/// `CapabilityUnsupported` reads as unsupported, missing permissions as
-/// denied, anything else as inconclusive.
+/// The one probe error classification: an adapter's honest `CapabilityUnsupported` reads as
+/// unsupported, missing permissions as denied, anything else as inconclusive.
 fn classify(code: ErrorCode) -> Capability {
     match code {
         ErrorCode::CapabilityUnsupported => Capability::Unsupported,
@@ -344,8 +351,8 @@ fn classify(code: ErrorCode) -> Capability {
     }
 }
 
-/// A throwaway probe key under the established write-test prefix; a
-/// generated key failing to parse is a bug in this format, not input.
+/// A throwaway probe key under the established write-test prefix; a generated key failing to
+/// parse is a bug in this format, not input.
 fn probe_key(purpose: &str) -> rstore_domain::remote::ObjectPath {
     rstore_domain::remote::ObjectPath::new(format!(
         ".rstore-write-test/{purpose}-{}",
@@ -370,8 +377,8 @@ async fn probe(
             probe_multipart(storage, bucket).await,
             probe_copy(storage, bucket).await,
         ),
-        // Without a visible bucket the write-shaped probes are inconclusive;
-        // presign still signs locally.
+        // Without a visible bucket the write-shaped probes are inconclusive; presign still
+        // signs locally.
         None => (Capability::Unknown, Capability::Unknown),
     };
     let presign = probe_presign(storage).await;
@@ -384,8 +391,8 @@ async fn probe(
     }
 }
 
-/// Create-and-abandon one multipart upload: the provider accepting the create
-/// is the capability; teardown rides the session's own warn-only abandon.
+/// Create-and-abandon one multipart upload: the provider accepting the create is the
+/// capability; teardown rides the session's own warn-only abandon.
 async fn probe_multipart(storage: &dyn rstore_storage_api::Storage, bucket: &str) -> Capability {
     let key = probe_key("multipart");
     match storage
@@ -400,11 +407,10 @@ async fn probe_multipart(storage: &dyn rstore_storage_api::Storage, bucket: &str
     }
 }
 
-/// Copy one throwaway object within the first visible bucket (STORE-016):
-/// put, copy through the adapter's copy path, clean both ends up. Adapters
-/// riding the read+put fallback also succeed — the entry reports the copy
-/// path this connection delivers; an adapter that honestly lacks server-side
-/// copy answers `CapabilityUnsupported` there.
+/// Copy one throwaway object within the first visible bucket: put, copy through the adapter's
+/// copy path, clean both ends up. Adapters riding the read+put fallback also succeed — the
+/// entry reports the copy path this connection delivers; an adapter that honestly lacks
+/// server-side copy answers `CapabilityUnsupported` there.
 async fn probe_copy(storage: &dyn rstore_storage_api::Storage, bucket: &str) -> Capability {
     let source = probe_key("copy");
     let target = probe_key("copy-target");
@@ -454,8 +460,7 @@ async fn probe_copy(storage: &dyn rstore_storage_api::Storage, bucket: &str) -> 
     }
 }
 
-/// Presign one throwaway GET: signing is local, so no request leaves the
-/// process (LINK-005).
+/// Presign one throwaway GET: signing is local, so no request leaves the process.
 async fn probe_presign(storage: &dyn rstore_storage_api::Storage) -> Capability {
     match storage
         .presign(&rstore_storage_api::model::PresignRequest {
@@ -523,7 +528,7 @@ mod tests {
         assert_eq!(report.status, ConnectionTestStatus::Ok);
         assert!(report.checks.iter().all(|c| c.passed));
 
-        // The outcome is visible through the lifecycle side (CON-010).
+        // The outcome is visible through the lifecycle side.
         let config = lifecycle
             .resolve(&ConnectionRef::Name("nas".into()))
             .await
@@ -534,8 +539,8 @@ mod tests {
             .capabilities(&ConnectionRef::Name("nas".into()))
             .await
             .unwrap();
-        // Every entry is a real probe now: the fake's copy path, multipart
-        // create+abort and local presign all succeed against `media`.
+        // Every entry is a real probe now: the fake's copy path, multipart create+abort and
+        // local presign all succeed against `media`.
         for (name, state) in &caps.entries {
             assert_eq!(*state, Capability::Supported, "{name}");
         }
@@ -609,8 +614,8 @@ mod tests {
             .capabilities(&ConnectionRef::Name("nas".into()))
             .await
             .unwrap();
-        // STORE-022: the second call within 24h must come from the cache, so
-        // the gateway never rebuilds the storage adapter.
+        // The second call within 24h must come from the cache, so the gateway never rebuilds
+        // the storage adapter.
         let second = diag
             .capabilities(&ConnectionRef::Name("nas".into()))
             .await

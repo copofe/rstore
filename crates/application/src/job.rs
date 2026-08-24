@@ -1,4 +1,5 @@
-//! Job inspection and control (JOB-004..012, 015).
+//! Job inspection and control: pause, resume, retry, cancel, and startup
+//! recovery of orphaned runs.
 //!
 //! Foreground job execution and persisted state transitions for the runtime.
 //! Cooperative cancellation is shared by CLI and future desktop callers.
@@ -6,9 +7,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use rstore_application_ports::JobRepository;
 use rstore_domain::job::Job;
 use rstore_domain::job::JobState;
-use rstore_domain::JobRepository;
 use rstore_domain::{Clock, Error, JobId, Result};
 
 /// A reference to a job: `job_…` id or its ordinal position in the list
@@ -40,16 +41,16 @@ pub trait JobService: Send + Sync {
     async fn list(&self) -> Result<Vec<Job>>;
     /// Resolve a reference (`job_…` id or 1-based ordinal, newest first).
     async fn resolve(&self, reference: &JobRef) -> Result<Job>;
-    /// Pause a running job (JOB-006). Only `running` may pause.
+    /// Pause a running job. Only `running` may pause.
     async fn pause(&self, reference: &JobRef) -> Result<Job>;
-    /// Resume a paused/interrupted job (JOB-007).
+    /// Resume a paused or interrupted job.
     async fn resume(&self, reference: &JobRef) -> Result<Job>;
-    /// Re-run a failed/partial job (JOB-010).
+    /// Re-arm a failed or partially succeeded job for another run.
     async fn retry(&self, reference: &JobRef) -> Result<Job>;
-    /// Cancel a job in any non-terminal state (JOB-008).
+    /// Cancel a job in any non-terminal state.
     async fn cancel(&self, reference: &JobRef) -> Result<Job>;
-    /// JOB-015: at startup, mark jobs orphaned by a dead process as
-    /// `interrupted`. Called once from `Application::open`.
+    /// At startup, mark jobs orphaned by a dead process as `interrupted`.
+    /// Called once from [`crate::Application::initialize`].
     async fn mark_stale_interrupted(&self) -> Result<u64>;
 }
 
@@ -166,7 +167,7 @@ mod tests {
         let db = Database::open_in_memory().await.unwrap();
         let svc = DefaultJobService::new(Arc::new(db.jobs()), Arc::new(SystemClock));
         let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
-        let job = Job::new(JobKind::Upload, JobId::new(), now);
+        let job = Job::new(JobKind::Upload, JobId::new_random(), now);
         svc.repo.create(&job).await.unwrap();
         svc.repo
             .transition(job.id, JobState::Running, now)
@@ -187,7 +188,7 @@ mod tests {
         let resumed = svc.resume(&JobRef::Ordinal(1)).await.unwrap();
         assert_eq!(resumed.state, JobState::Running);
 
-        // Fail the job, then retry it (JOB-010), then cancel.
+        // Fail the job, re-arm it, then cancel.
         svc.repo
             .transition(job.id, JobState::Failed, OffsetDateTime::UNIX_EPOCH)
             .await

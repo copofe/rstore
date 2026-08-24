@@ -1,10 +1,10 @@
-//! Local catalog read/write contracts (CORE-005).
+//! Local catalog read/write contracts.
 //!
-//! The catalog is the rebuildable local index over remote objects (PRD §4.1).
-//! This crate defines the repository and query interfaces plus the filter/sort/
-//! pagination value types used by the mixed file list (MIX-) and search. A
-//! SQLite-backed and in-memory implementations share the same catalog seam;
-//! contract tests pin their observable behavior (QA-003).
+//! The catalog is the rebuildable local index over remote objects. This crate
+//! defines the repository and query interfaces plus the filter/sort/pagination
+//! value types used by the mixed file list and search. A SQLite-backed and an
+//! in-memory implementation share the same seam; shared contract tests pin
+//! their observable behavior so the two adapters cannot drift.
 
 pub mod order;
 pub mod query;

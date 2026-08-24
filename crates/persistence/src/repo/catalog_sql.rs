@@ -1,25 +1,19 @@
-//! The internal SQL builder behind `CatalogQuery` (MIX-001..024).
+//! Internal SQL builder behind `CatalogQuery`.
 //!
 //! One place owns everything dynamic about the mixed file list: filter
-//! predicates, LIKE escaping, sort expressions (including the `name` rtrim
-//! trick), the keyset cursor format and its typed comparison, and binding
-//! values sqlx cannot express against `format!`-built SQL. Repository methods
-//! declare *what* they want (`select`/`count` + `ordered_after` +
-//! `fetch`); the *how* stays here, so the future FTS index (IDX-023) swaps
-//! this module out without touching callers or the `CatalogQuery` seam.
-
+//! predicates, LIKE escaping, sort expressions (including the file-name rtrim
+//! trick), the keyset cursor comparison, and binding into dynamically
+//! assembled SQL. Repository methods declare what they want; the how stays
+//! here, so a future FTS-backed plan swaps this module out behind the
+//! `CatalogQuery` seam.
 use rstore_catalog::{FileFilter, FileSort, SortField, SortOrder};
 use rstore_domain::{Result, WorkspaceId};
 
 use crate::codec::uuid_to_text;
 
-/// The SQLite name of a sortable field plus its ORDER BY expression (MIX-023).
-/// `name` sorts by the path's file-name component (the SQLite rtrim trick).
 const NAME_EXPR: &str =
     "replace(object_path, rtrim(object_path, replace(object_path, '/', '')), '')";
 
-/// Column list for the joined query, `ro.`-qualified (search/count join
-/// `workspace_buckets`, so bare names would be ambiguous).
 pub(super) fn columns_qualified(columns: &str) -> String {
     columns
         .split(", ")
@@ -34,34 +28,23 @@ fn sort_expr(field: SortField) -> &'static str {
         F::Name => NAME_EXPR,
         F::Size => "ro.size",
         F::Modified => "ro.last_modified",
-        // The domain classifier column (MIX-015) — same source of truth the
-        // `file_type` filter reads; `content_type` is provider-supplied and
-        // often NULL.
         F::Type => "ro.file_type",
-        // `ro.`-qualified: the workspace join also carries a bucket_id, and
-        // an ambiguous name is a runtime error, not a plan-time one.
         F::Bucket => "ro.bucket_id",
         F::Connection => "ro.connection_id",
     }
 }
 
-/// A bind value for dynamically assembled SQL. sqlx cannot bind into
-/// `format!`-built text, so the builder collects typed values and applies
-/// them positionally at fetch time.
 enum Bind {
     Text(String),
     Integer(i64),
 }
 
-/// A `CatalogQuery` statement under construction: SQL text plus positional
-/// bind values, extended declaratively by the repository.
 pub(super) struct CatalogSql {
     sql: String,
     params: Vec<Bind>,
 }
 
 impl CatalogSql {
-    /// `SELECT {columns} …` scoped to a workspace, filters applied.
     pub(super) fn select(
         columns: &str,
         scope_workspace: &WorkspaceId,
@@ -79,7 +62,6 @@ impl CatalogSql {
         Ok(this)
     }
 
-    /// `SELECT COUNT(*) …` with the same scoping and filters.
     pub(super) fn count(scope_workspace: &WorkspaceId, filter: &FileFilter) -> Result<Self> {
         let mut sql = String::from(
             "SELECT COUNT(*) AS n FROM remote_objects ro \
@@ -91,11 +73,6 @@ impl CatalogSql {
         Ok(Self { sql, params })
     }
 
-    /// `SELECT` for the fully assembled files page. The page is still scoped
-    /// and filtered by the same predicates as [`Self::select`], but the
-    /// adapter also joins source identities and aggregates workspace tag
-    /// names. The caller obtains the total from [`Self::count`] before adding
-    /// the cursor predicate, so a cursor can never change its meaning.
     pub(super) fn page(
         columns: &str,
         scope_workspace: &WorkspaceId,
@@ -124,21 +101,13 @@ impl CatalogSql {
         Ok(this)
     }
 
-    /// Keyset pagination: keep rows strictly after the cursor's
-    /// `(sort value, path, id)`. The cursor's encoding is private to this
-    /// module; callers only ever pass the opaque string through.
     pub(super) fn ordered_after(mut self, sort: FileSort, cursor: &str) -> Result<Self> {
-        // The one cursor vocabulary: decode yields the typed sort value the
-        // keyset comparison binds by (numeric fields as INTEGER, like the
-        // ordered column).
         let (value, path, id) = rstore_catalog::order::decode(cursor, sort.field)?;
         let typed = match value {
             rstore_catalog::order::SortKey::Num(n) => Bind::Integer(n),
             rstore_catalog::order::SortKey::Text(t) => Bind::Text(t),
         };
         let expr = sort_expr(sort.field);
-        // Walk direction: a DESC page continues *down* the total order, so
-        // the keyset comparison flips with the sort direction.
         let cmp = if sort.order == SortOrder::Asc {
             ">"
         } else {
@@ -153,7 +122,6 @@ impl CatalogSql {
         Ok(self)
     }
 
-    /// Terminal ordering + `LIMIT n+1` (the extra row detects `has_more`).
     pub(super) fn ordered(mut self, sort: FileSort, limit: u32) -> Self {
         self.order_and_limit(sort, limit + 1);
         self
@@ -165,10 +133,6 @@ impl CatalogSql {
         } else {
             "DESC"
         };
-        // path+id are the stable secondary sort (MIX-023) in the SAME
-        // direction so the cursor comparison stays consistent. Direction
-        // applies to every key column — SQL binds `ASC`/`DESC` to one column
-        // at a time, so it must be repeated.
         self.sql.push_str(&format!(
             " ORDER BY {expr} {dir}, ro.object_path {dir}, ro.id {dir} LIMIT {limit}",
             expr = sort_expr(sort.field),
@@ -177,7 +141,6 @@ impl CatalogSql {
         ));
     }
 
-    /// Run the assembled statement and return all rows.
     pub(super) async fn fetch<'e, E>(self, executor: E) -> Result<Vec<sqlx::sqlite::SqliteRow>>
     where
         E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
@@ -196,15 +159,12 @@ impl CatalogSql {
     }
 }
 
-/// Append filter predicates (MIX-011..022). `state` defaults to "not deleted".
 fn push_filters(
     sql: &mut String,
     params: &mut Vec<Bind>,
     workspace: &WorkspaceId,
     filter: &FileFilter,
 ) -> Result<()> {
-    // Closed enums bind like every other value — interpolation is reserved
-    // for structural SQL (column expressions, placeholder lists).
     match filter.state {
         Some(state) => {
             sql.push_str(" AND ro.state = ? ");
@@ -213,16 +173,7 @@ fn push_filters(
         None => sql.push_str(" AND ro.state != 'deleted' "),
     }
     if let Some(name) = &filter.name_contains {
-        // IDX-023: token search through the FTS index instead of a LIKE
-        // scan. Each whitespace-separated term becomes a quoted prefix
-        // match, ANDed together — user input is never parsed as FTS syntax.
         if name.chars().count() >= 3 {
-            // IDX-023: the trigram index narrows candidates to paths
-            // containing the substring; the LIKE clause keeps the exact
-            // MIX-011 semantics (a name containing the substring implies
-            // its path does too, so the prefilter never drops a match).
-            // The query is a quoted FTS string — input is never parsed as
-            // FTS syntax.
             let quoted = format!("\"{}\"", name.replace('"', "\"\""));
             sql.push_str(&format!(
                 " AND ro.rowid IN (SELECT rowid FROM remote_objects_fts \
@@ -232,7 +183,6 @@ fn push_filters(
             params.push(Bind::Text(quoted));
             params.push(Bind::Text(format!("%{}%", escape_like(name))));
         } else {
-            // Trigram needs three characters; shorter needles LIKE-scan.
             sql.push_str(&format!(" AND {NAME_EXPR} LIKE ? ESCAPE '\\' "));
             params.push(Bind::Text(format!("%{}%", escape_like(name))));
         }
@@ -319,7 +269,6 @@ fn placeholders(n: usize) -> String {
     vec!["?"; n].join(", ")
 }
 
-/// Escape LIKE metacharacters in user input (partial-match search, MIX-011).
 fn escape_like(input: &str) -> String {
     input
         .replace('\\', "\\\\")

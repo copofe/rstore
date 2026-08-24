@@ -7,6 +7,7 @@
 
 pub mod api;
 pub mod app;
+pub mod batch_outcome;
 pub mod batch_plan;
 pub mod bucket;
 pub(crate) mod catalog_follow;
@@ -18,7 +19,6 @@ pub mod diagnostics;
 pub(crate) mod expand;
 pub mod files;
 pub mod gateway;
-pub(crate) mod guards;
 pub mod health;
 mod index_run;
 pub mod indexer;
@@ -27,13 +27,11 @@ pub mod job_run;
 pub mod link;
 pub mod locator;
 pub(crate) mod mutation;
-pub mod notifications;
 pub mod outbox;
 pub mod ports;
+pub mod reference;
 pub mod remote;
 pub mod tag;
-#[cfg(feature = "test-util")]
-pub mod test_util;
 pub mod transfer;
 mod transfer_plan;
 mod transfer_report;
@@ -44,6 +42,9 @@ pub use api::{
     TransferApi,
 };
 pub use app::Application;
+pub use batch_outcome::{
+    BatchOutcome, BlockReason, Disposition, Failure, ItemOutcome, Severity, SkipReason,
+};
 pub use bucket::{
     AddBucketInput, BucketRef, BucketService, DiscoveredBucket, ReadabilityCheck, UpdateBucketInput,
 };
@@ -60,25 +61,24 @@ pub use health::{HealthReport, HealthService};
 pub use indexer::{BucketIndexStatus, IndexReport, IndexService};
 pub use job::{JobRef, JobService};
 pub use link::{
-    parse_ttl, resolve_link_base, GeneratedLink, LinkFormat, LinkOutcome, LinkProfileInput,
-    LinkRequest,
+    parse_ttl, resolve_link_base, GeneratedLink, LinkFormat, LinkProfileInput, LinkRequest,
 };
-pub use notifications::{JobNotification, ProgressEvent};
 pub use outbox::{DispatchReport, OutboxDispatcher, OutboxHandler};
 pub use ports::{
     ApplicationDependencies, CatalogDependencies, RegistryDependencies, RuntimeDependencies,
     TransferDependencies,
 };
-pub use remote::{
-    expand_reference, expand_references, LsEntry, LsResult, RemoteService, RemoteUri, RemoveItem,
-    RemoveOutcome, RemoveReport,
-};
+pub use reference::{expand_reference, expand_references, RemoteUri};
+pub use remote::{LsEntry, LsResult, RemoteService, RemoveReport};
 pub use rstore_catalog::{FileFilter, FileSort, PageRequest, SortField, SortOrder};
-pub use tag::{CreateTagInput, MergeReport, TagBatchOutcome, TagRef, TagService, UpdateTagInput};
+pub use tag::{CreateTagInput, MergeReport, TagRef, TagService, UpdateTagInput};
 pub use transfer::{
-    classify_download, download_plans, BatchDownloadReport, DownloadMode, DownloadPlan, Outcome,
-    RunOptions, TransferReport, TransferReportItem, UploadPlan,
+    classify_download, download_plans, BatchDownloadReport, DownloadMode, DownloadPlan, RunOptions,
+    TransferReport, TransferReportItem, UploadPlan,
 };
 pub use workspace::{
     CreateWorkspaceInput, UpdateWorkspaceInput, WorkspaceDetail, WorkspaceRef, WorkspaceService,
 };
+
+#[cfg(feature = "test-util")]
+pub mod test_util;

@@ -1,10 +1,8 @@
-//! SQLite persistence layer (DATA-003..008, CORE-013).
+//! SQLite persistence for the rstore catalog.
 //!
-//! Owns the write pool, read-only pool, embedded migration set, and repositories.
-//! Writes are serialised across *processes* by the application-layer write lock
-//! (DATA-008) and within a process by the bounded SQLite Writer Actor; reads
-//! use the read-only pool.
-
+//! Owns the write pool, the read-only pool, the embedded migration set and the
+//! repository handles built over them; writes are serialised through a bounded
+//! single-writer actor, reads go through the read-only pool.
 pub mod actor;
 pub mod codec;
 pub mod error;
@@ -30,7 +28,7 @@ pub use repo::workspace::WorkspaceRepository;
 use std::path::Path;
 use std::time::Duration;
 
-use rstore_domain::{Clock, Error, Result};
+use rstore_domain::{Clock, Error, Result, SystemClock};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
 use std::sync::Arc;
 
@@ -40,20 +38,30 @@ pub use error::map_sqlx;
 
 const BASELINE_MIGRATION_VERSION: i64 = 20260819000001;
 
-/// Handle to the open SQLite catalog database.
 #[derive(Clone)]
+/// Handle to the open SQLite catalog database. It owns the injected clock, so
+/// every repository it hands out stamps time from a single source.
 pub struct Database {
     pool: SqlitePool,
     read_pool: SqlitePool,
     writer: SqliteWriter,
+    clock: Arc<dyn Clock>,
 }
 
 impl Database {
-    /// Open (or create) the database at `db_path`, apply migrations and set
-    /// connection-wide pragmas (WAL, foreign keys, busy timeout).
+    /// Open (or create) the database at `db_path`, apply migrations and set the
+    /// connection pragmas (WAL, foreign keys, busy timeout). Uses the system
+    /// clock; [`Self::open_with_clock`] injects a deterministic one.
     pub async fn open(db_path: &Path) -> Result<Self> {
+        Self::open_with_clock(db_path, Arc::new(SystemClock)).await
+    }
+
+    /// Open with an explicit clock: the composition root passes its configured
+    /// clock, deterministic tests pass a fixed one.
+    pub async fn open_with_clock(db_path: &Path, clock: Arc<dyn Clock>) -> Result<Self> {
         if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)
+            tokio::fs::create_dir_all(parent)
+                .await
                 .map_err(|e| Error::database("create db directory").with_source(e))?;
         }
 
@@ -80,16 +88,21 @@ impl Database {
             pool,
             read_pool,
             writer: SqliteWriter::new(64),
+            clock,
         };
         db.migrate().await?;
         Ok(db)
     }
 
-    /// Open an ephemeral in-memory database (handy for unit tests). Each call
-    /// owns a private database (no `cache=shared`) so parallel tests never
-    /// collide; `max_connections(1)` keeps that single connection's memory alive
-    /// for the pool's lifetime.
+    /// Open an ephemeral in-memory database using the system clock. Each call owns a private database (no
+    /// `cache=shared`) so parallel tests never collide; `max_connections(1)` keeps the single connection's
+    /// memory alive for the pool's lifetime.
     pub async fn open_in_memory() -> Result<Self> {
+        Self::open_in_memory_with_clock(Arc::new(SystemClock)).await
+    }
+
+    /// In-memory database over an injected clock for deterministic tests. Each call owns a private database.
+    pub async fn open_in_memory_with_clock(clock: Arc<dyn Clock>) -> Result<Self> {
         use std::str::FromStr;
         let options = SqliteConnectOptions::from_str("sqlite::memory:")
             .map_err(|e| Error::database("parse in-memory conn str").with_source(e))?
@@ -104,20 +117,21 @@ impl Database {
             read_pool: pool.clone(),
             pool,
             writer: SqliteWriter::new(64),
+            clock,
         };
         db.migrate().await?;
         Ok(db)
     }
 
-    /// Run the embedded schema migrations. Migrations run inside a transaction,
-    /// so a failure leaves the prior schema intact (DATA-005).
+    /// Run the embedded schema migrations inside a transaction, so a failure leaves the prior schema intact.
     async fn migrate(&self) -> Result<()> {
+        // Real legacy-file upgrade path: pre-baseline databases carry a multipart table shape not covered by
+        // CREATE TABLE IF NOT EXISTS in the baseline.
         self.ensure_legacy_multipart_columns().await?;
 
         let mut migrator = sqlx::migrate!("./migrations");
-        // The current source is a squashed baseline. Older databases retain
-        // their pre-baseline history, which SQLx should keep rather than
-        // treating as a missing migration.
+        // Databases created before the squashed baseline keep their migration history; SQLx must ignore it
+        // instead of failing on missing entries.
         if self.has_pre_baseline_migrations().await? {
             migrator.set_ignore_missing(true);
         }
@@ -125,10 +139,6 @@ impl Database {
         Ok(())
     }
 
-    /// Add columns introduced after the historical migrations that preceded
-    /// the current baseline. This is intentionally narrow: it upgrades the
-    /// only legacy table whose shape is not covered by `CREATE TABLE IF NOT
-    /// EXISTS` in the baseline.
     async fn ensure_legacy_multipart_columns(&self) -> Result<()> {
         let table_exists: i64 = sqlx::query_scalar(
             "SELECT EXISTS(
@@ -214,28 +224,29 @@ impl Database {
         Ok(has_legacy_rows != 0)
     }
 
-    /// Borrow the underlying pool for repository queries.
+    /// The write pool, for tests and direct diagnostics.
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }
 
-    /// The write path every repository shares: the write pool paired with the
-    /// bounded writer actor. Acquiring the permit and opening a transaction
-    /// are one operation on the gate ([`tx::WriteGate::write_unit`]) — this is
-    /// the only way repositories reach the write pool for multi-statement
-    /// units.
+    // Repositories reach the write pool only through this gate: permit and transaction are acquired
+    // together, never separately.
     fn gate(&self) -> crate::tx::WriteGate {
         crate::tx::WriteGate::new(self.pool.clone(), self.writer.clone())
     }
 
-    /// Read-side pool reserved for catalog and diagnostics queries. In-memory
-    /// databases share the write pool because a separate SQLite memory pool
-    /// would be a different database.
+    /// Read-side pool reserved for catalog and diagnostics queries. In-memory databases share the write pool:
+    /// a separate SQLite memory pool would be a different database.
     pub fn read_pool(&self) -> &SqlitePool {
         &self.read_pool
     }
 
-    /// A repository for storage connections.
+    /// The injected clock — the single time source for every stamped timestamp.
+    pub fn clock(&self) -> Arc<dyn Clock> {
+        self.clock.clone()
+    }
+
+    /// A repository for configured storage connections.
     pub fn connections(&self) -> ConnectionRepository {
         ConnectionRepository::new(self.gate(), self.read_pool.clone())
     }
@@ -247,7 +258,7 @@ impl Database {
 
     /// A repository for app settings (capability cache, machine-local state).
     pub fn settings(&self) -> SettingsRepository {
-        SettingsRepository::new(self.gate(), self.read_pool.clone())
+        SettingsRepository::new(self.gate(), self.read_pool.clone(), self.clock.clone())
     }
 
     /// The remote-object catalog repository.
@@ -255,52 +266,52 @@ impl Database {
         SqliteRemoteObjectRepository::new(self.gate(), self.read_pool.clone())
     }
 
-    /// The job/transfer-task repository.
+    /// The transfer-job repository.
     pub fn jobs(&self) -> SqliteJobRepository {
         SqliteJobRepository::new(self.gate(), self.read_pool.clone())
     }
 
-    /// The multipart checkpoint store (resumable uploads).
-    pub fn multipart(&self, clock: Arc<dyn Clock>) -> SqliteMultipartStore {
-        SqliteMultipartStore::new(self.gate(), self.read_pool.clone(), clock)
+    /// The multipart checkpoint store for resumable uploads.
+    pub fn multipart(&self) -> SqliteMultipartStore {
+        SqliteMultipartStore::new(self.gate(), self.read_pool.clone(), self.clock.clone())
     }
 
-    /// Domain-event outbox and repair queue.
+    /// The domain-event outbox and repair queue.
     pub fn outbox(&self) -> OutboxRepository {
-        OutboxRepository::new(self.gate(), self.read_pool.clone())
+        OutboxRepository::new(self.gate(), self.read_pool.clone(), self.clock.clone())
     }
 
+    /// Read access to completed remote-mutation receipts.
     pub fn mutation_receipts(&self) -> SqliteRemoteMutationRepository {
         SqliteRemoteMutationRepository::new(self.read_pool.clone())
     }
 
-    /// Workspaces and their bucket memberships (WSP-).
+    /// A repository for workspaces and their bucket memberships.
     pub fn workspaces(&self) -> WorkspaceRepository {
         WorkspaceRepository::new(self.gate(), self.read_pool.clone())
     }
 
-    /// Bucket ignore rules (IGN-).
+    /// A repository for bucket ignore rules.
     pub fn ignore_rules(&self) -> IgnoreRuleRepository {
         IgnoreRuleRepository::new(self.gate(), self.read_pool.clone())
     }
 
-    /// Tag definitions and associations (TAG-).
+    /// A repository for tag definitions and associations.
     pub fn tags(&self) -> TagRepository {
         TagRepository::new(self.gate(), self.read_pool.clone())
     }
 
-    /// Index runs, checkpoints and revisions (IDX-).
+    /// A repository for index runs, scan checkpoints and catalog revisions.
     pub fn index_runs(&self) -> IndexRunRepository {
         IndexRunRepository::new(self.gate(), self.read_pool.clone())
     }
 
-    /// Per-bucket link settings (LINK-).
+    /// A repository for per-bucket link settings.
     pub fn links(&self) -> repo::link::LinkRepository {
         repo::link::LinkRepository::new(self.gate(), self.read_pool.clone())
     }
 
-    /// Row counts for `index stats` (IDX-021). Plain COUNT(*)s over the
-    /// catalog tables; callers render them.
+    /// Rows currently in `remote_objects`.
     pub async fn count_remote_objects(&self) -> Result<u64> {
         codec::count_scalar(
             self.read_pool(),
@@ -310,6 +321,7 @@ impl Database {
         .await
     }
 
+    /// Rows in `remote_objects` whose state is `stale`.
     pub async fn count_stale_objects(&self) -> Result<u64> {
         codec::count_scalar(
             self.read_pool(),
@@ -319,6 +331,7 @@ impl Database {
         .await
     }
 
+    /// Rows in `metadata_tombstones`.
     pub async fn count_tombstones(&self) -> Result<u64> {
         codec::count_scalar(
             self.read_pool(),
@@ -328,6 +341,7 @@ impl Database {
         .await
     }
 
+    /// Outbox events neither published nor dead-lettered.
     pub async fn count_pending_outbox(&self) -> Result<u64> {
         codec::count_scalar(
             self.read_pool(),
@@ -337,6 +351,7 @@ impl Database {
         .await
     }
 
+    /// Repair items not yet resolved.
     pub async fn count_pending_repairs(&self) -> Result<u64> {
         codec::count_scalar(
             self.read_pool(),
@@ -346,7 +361,37 @@ impl Database {
         .await
     }
 
-    /// On-disk database size in bytes (IDX-021): page count × page size.
+    /// Configured storage connections.
+    pub async fn count_connections(&self) -> Result<u64> {
+        codec::count_scalar(
+            self.read_pool(),
+            "SELECT COUNT(*) AS n FROM storage_connections",
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// Connections that have never been tested.
+    pub async fn count_untested_connections(&self) -> Result<u64> {
+        codec::count_scalar(
+            self.read_pool(),
+            "SELECT COUNT(*) AS n FROM storage_connections WHERE last_test_status IS NULL",
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// Transfer jobs in the `interrupted` state.
+    pub async fn count_interrupted_jobs(&self) -> Result<u64> {
+        codec::count_scalar(
+            self.read_pool(),
+            "SELECT COUNT(*) AS n FROM transfer_jobs WHERE state = 'interrupted'",
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// On-disk database size in bytes (page count × page size).
     pub async fn size_bytes(&self) -> Result<u64> {
         let row: sqlx::sqlite::SqliteRow = sqlx::query(
             "SELECT (SELECT page_count FROM pragma_page_count) * \
@@ -372,14 +417,12 @@ fn migration_error(e: sqlx::migrate::MigrateError) -> Error {
     Error::database("run migrations").with_source(e)
 }
 
-/// The single assembly point (CONTEXT.md: 组装点): turn an opened database,
-/// an optional storage factory and a clock into the application dependency
-/// graph. `bootstrap::Runtime::open` and the application test fixture both
-/// call this; neither re-transcribes the dependency list.
+/// The single assembly point: turn an opened database and an optional storage factory into the application
+/// dependency graph. `bootstrap::Runtime::open` and the application test fixture both call this — neither
+/// re-transcribes the dependency list.
 pub fn assemble(
     db: &Database,
     storage_factory: Option<Arc<dyn rstore_storage_api::StorageFactory>>,
-    clock: Arc<dyn Clock>,
 ) -> rstore_application_ports::ApplicationDependencies {
     use rstore_application_ports::{
         CatalogDependencies, RegistryDependencies, RuntimeDependencies, TransferDependencies,
@@ -404,11 +447,11 @@ pub fn assemble(
         },
         TransferDependencies {
             jobs: Arc::new(db.jobs()),
-            multipart: Arc::new(db.multipart(clock.clone())),
+            multipart: Arc::new(db.multipart()),
         },
         RuntimeDependencies {
             stats: Arc::new(db.clone()),
-            clock,
+            clock: db.clock(),
             storage_factory,
             unit_of_work: Arc::new(db.clone()),
             repairs: Arc::new(db.outbox()),

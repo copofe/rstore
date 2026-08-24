@@ -84,7 +84,7 @@ async fn workspace_crud_and_membership() {
     assert_eq!(detail.buckets.len(), 1);
 
     let edited = ws
-        .edit(
+        .update(
             &wsp_ref(),
             UpdateWorkspaceInput {
                 name: Some("renamed".into()),
@@ -96,7 +96,7 @@ async fn workspace_crud_and_membership() {
     assert_eq!(edited.name, "renamed");
 
     let cleared = ws
-        .edit(
+        .update(
             &WorkspaceRef::Name("renamed".into()),
             UpdateWorkspaceInput {
                 name: None,
@@ -231,7 +231,7 @@ async fn files_list_search_show_with_tags() {
         .await
         .unwrap();
 
-    // Tag one object (TAG-009) through its URI.
+    // Tag one object through its URI.
     app.api()
         .catalog()
         .tags()
@@ -255,7 +255,7 @@ async fn files_list_search_show_with_tags() {
         .await
         .unwrap();
 
-    // Full mixed list (MIX-001): every object across the workspace buckets.
+    // Full mixed list: every object across the workspace buckets.
     let files = app.api().catalog().files();
     let page = files
         .list(
@@ -272,7 +272,7 @@ async fn files_list_search_show_with_tags() {
     assert_eq!(page.total, 3);
     assert!(page.next_cursor.is_none());
 
-    // Name search (MIX-011).
+    // Name search.
     let filter = FileFilter {
         name_contains: Some("report".into()),
         ..Default::default()
@@ -293,7 +293,7 @@ async fn files_list_search_show_with_tags() {
     assert_eq!(page.items[0].connection, "nas");
     assert_eq!(page.items[0].tags, vec!["Urgent".to_string()]);
 
-    // Untagged view (MIX-021).
+    // Untagged view.
     let untagged = FileFilter {
         untagged: true,
         ..Default::default()
@@ -309,7 +309,7 @@ async fn files_list_search_show_with_tags() {
         .unwrap();
     assert_eq!(page.total, 2);
 
-    // files show (IDX-015/016).
+    // files show carries state and tags.
     let entry = files
         .show(&WorkspaceRef::Name("w".into()), "nas/media/docs/report.pdf")
         .await
@@ -317,7 +317,7 @@ async fn files_list_search_show_with_tags() {
     assert_eq!(entry.state, rstore_domain::ObjectState::Confirmed);
     assert_eq!(entry.tags, vec!["Urgent".to_string()]);
 
-    // Keyset pagination (IDX-024): limit 2 leaves a cursor, no duplicates.
+    // Keyset pagination: limit 2 leaves a cursor, no duplicates.
     let mut seen = Vec::new();
     let mut after: Option<String> = None;
     loop {
@@ -410,19 +410,19 @@ async fn tag_lifecycle_and_isolation() {
         )
         .await
         .unwrap();
-    assert!(outcomes[0].succeeded());
-    assert!(!outcomes[1].succeeded());
+    assert!(outcomes.items()[0].disposition.is_success());
+    assert!(!outcomes.items()[1].disposition.is_success());
     let list = tags.list(&WorkspaceRef::Name("w".into())).await.unwrap();
     assert_eq!(list[0].object_count, 1);
 
     let edited = tags
-        .edit(
+        .update(
             &WorkspaceRef::Name("w".into()),
             &TagRef::Name("keep".into()),
             rstore_application::UpdateTagInput {
                 name: Some("Archive".into()),
                 color: None,
-                description: Some(String::new()),
+                description: Some(None),
             },
         )
         .await
@@ -472,9 +472,9 @@ async fn files_on_unknown_workspace_is_not_found() {
 
 #[tokio::test]
 async fn tag_attach_rejects_object_outside_workspace() {
-    // WSP-013: the object's bucket must belong to the workspace. `other-wsp`
-    // exists but never adds the bucket, so attaching to its catalog object
-    // must fail as NotFound — the object's existence is not leaked.
+    // The object's bucket must belong to the workspace. `other-wsp` exists
+    // but never adds the bucket, so attaching to its catalog object must
+    // fail as NotFound — the object's existence is not leaked.
     let app = seeded_app().await;
     let ws = app.api().catalog().workspaces();
     ws.create(CreateWorkspaceInput {
@@ -545,8 +545,6 @@ async fn tag_attach_rejects_object_outside_workspace() {
     .unwrap();
 }
 
-// --- catalog gc / index stats (IDX-020/021) ----------------------------------
-
 #[tokio::test]
 async fn catalog_gc_purges_only_expired_tombstones() {
     use rstore_test_support::TestClock;
@@ -561,7 +559,7 @@ async fn catalog_gc_purges_only_expired_tombstones() {
         .storage()
         .seed("media", "docs/fresh.pdf", b"dd", None);
 
-    // One tombstone now, one two hours later.
+    // One tombstone fresh, one two hours later.
     app.api()
         .transfer()
         .remote()
@@ -587,7 +585,7 @@ async fn catalog_gc_purges_only_expired_tombstones() {
         .unwrap();
 
     let indexer = app.api().catalog().indexer();
-    // Dry run counts without deleting (1h retention: only the old one).
+    // Dry run counts without deleting (1h retention: only the expired one).
     let report = indexer.gc(Some(3600), true).await.unwrap();
     assert!(report.dry_run);
     assert_eq!(report.expired, 1);
@@ -603,8 +601,6 @@ async fn catalog_gc_purges_only_expired_tombstones() {
     assert_eq!(stats.tombstone_rows, 1);
     assert!(stats.db_bytes > 0);
 }
-
-// --- tag merge (TAG-008) ------------------------------------------------------
 
 #[tokio::test]
 async fn tag_merge_moves_associations_and_removes_source() {
@@ -658,7 +654,7 @@ async fn tag_merge_moves_associations_and_removes_source() {
     // `b` already carried `new`, so only `a`'s association counts as moved.
     assert_eq!(report.moved, 1);
 
-    // The source is gone; both objects now carry only `new`.
+    // The source is gone; both objects carry only `new`.
     let list = tags.list(&ws).await.unwrap();
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].tag.name, "new");
@@ -679,8 +675,6 @@ async fn tag_merge_moves_associations_and_removes_source() {
         .is_err());
 }
 
-// --- config import/export (DATA-015/016) -------------------------------------
-
 #[tokio::test]
 async fn config_bundle_round_trips_without_credentials() {
     let seeded = seeded_app().await;
@@ -689,7 +683,7 @@ async fn config_bundle_round_trips_without_credentials() {
     assert!(exported.access_key.is_none());
     assert!(exported.secret_key.is_none());
     assert!(bundle.buckets.iter().any(|b| b.name == "media"));
-    // The serialised form never carries credential values (SEC-001).
+    // The serialised form never carries credential values.
     let json = serde_json::to_value(&bundle).unwrap().to_string();
     assert!(!json.contains("AK"));
     assert!(!json.contains("SK"));
@@ -736,7 +730,7 @@ async fn config_bundle_round_trips_without_credentials() {
     assert!(imported.access_key.is_none());
     assert!(imported.secret_key.is_none());
 
-    // Dry run on the now-populated app skips everything and adds nothing.
+    // Dry run on the populated app skips everything and adds nothing.
     let dry = fresh
         .api()
         .config()
@@ -749,7 +743,7 @@ async fn config_bundle_round_trips_without_credentials() {
     assert_eq!(dry.connections_skipped, 1);
     assert_eq!(dry.buckets_skipped, 1);
 
-    // A real re-import also skips: conflicts never overwrite (DATA-016).
+    // A real re-import also skips: conflicts never overwrite.
     let again = fresh
         .api()
         .config()

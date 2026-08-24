@@ -1,4 +1,4 @@
-//! Standard application data directories (DATA-001).
+//! Standard application data directories.
 //!
 //! Resolves `config / data / cache / log` per platform:
 //! - macOS  — `~/Library/Application Support/rstore`, `~/Library/Caches/rstore`
@@ -6,8 +6,8 @@
 //! - Windows — `%APPDATA%\rstore`, `%LOCALAPPDATA%\rstore\cache`
 //!
 //! A single portable root may be forced via the `RSTORE_HOME` env var or by
-//! passing a `root` to [`resolve_app_dirs`] — essential for tests and for the
-//! CLI `--config` relocation (CLI-022).
+//! passing a `root` to [`resolve_app_dirs`] — essential for tests and for
+//! portable installations.
 
 use std::path::{Path, PathBuf};
 
@@ -22,7 +22,7 @@ pub struct AppDirs {
     pub log_dir: PathBuf,
     /// Database file for the local catalog (under `data_dir`).
     pub db_path: PathBuf,
-    /// File used by the cross-process write lock (DATA-008).
+    /// File used by the cross-process write lock.
     pub lock_path: PathBuf,
 }
 
@@ -55,39 +55,43 @@ pub fn resolve_app_dirs(root: Option<&Path>) -> AppDirs {
     platform_dirs().unwrap_or_else(|| from_root(Path::new(".rstore")))
 }
 
-fn from_root(root: &Path) -> AppDirs {
-    let config_dir = root.join("config");
-    let data_dir = root.join("data");
-    let cache_dir = root.join("cache");
-    let log_dir = root.join("log");
-    let db_path = data_dir.join("catalog.db");
-    let lock_path = data_dir.join("rstore.lock");
+/// The database and lock files always live directly under the data dir; both
+/// directory resolvers share this one layout so a rename cannot drift.
+fn from_dirs(
+    config_dir: PathBuf,
+    data_dir: PathBuf,
+    cache_dir: PathBuf,
+    log_dir: PathBuf,
+) -> AppDirs {
     AppDirs {
         config_dir,
+        db_path: data_dir.join("catalog.db"),
+        lock_path: data_dir.join("rstore.lock"),
         data_dir,
         cache_dir,
         log_dir,
-        db_path,
-        lock_path,
     }
+}
+
+fn from_root(root: &Path) -> AppDirs {
+    from_dirs(
+        root.join("config"),
+        root.join("data"),
+        root.join("cache"),
+        root.join("log"),
+    )
 }
 
 fn platform_dirs() -> Option<AppDirs> {
     let proj = directories::ProjectDirs::from("dev", "rstore", crate::APP_NAME)?;
     let data_dir = proj.data_dir().to_path_buf();
-    let config_dir = proj.config_dir().to_path_buf();
-    let cache_dir = proj.cache_dir().to_path_buf();
     let log_dir = data_dir.join("log");
-    let db_path = data_dir.join("catalog.db");
-    let lock_path = data_dir.join("rstore.lock");
-    Some(AppDirs {
-        config_dir,
+    Some(from_dirs(
+        proj.config_dir().to_path_buf(),
         data_dir,
-        cache_dir,
+        proj.cache_dir().to_path_buf(),
         log_dir,
-        db_path,
-        lock_path,
-    })
+    ))
 }
 
 #[cfg(test)]

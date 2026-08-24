@@ -1,11 +1,11 @@
-//! The one decision table for [`ConflictPolicy`] (UP-010..013 / DOWN-005/006 /
-//! MOVE-013). Upload, download and copy/move all answer "the write target
-//! already exists — now what?" through [`resolve_conflict`].
+//! The single decision table for [`ConflictPolicy`].
 //!
-//! Unresolved `Ask` is a per-item [`ConflictDecision::Blocked`], never a
-//! silent overwrite: the CLI edge resolves `Ask` before services run, so a
-//! service seeing it means nobody resolved it. The rename path derives
-//! `name-<random>.ext`, so a full bucket cannot exhaust sequential names.
+//! Upload, download and copy/move all answer "the write target already
+//! exists — what should happen?" through [`resolve_conflict`]. Unresolved `Ask` is a
+//! per-item blocked decision, never a silent overwrite: the CLI edge resolves
+//! `Ask` before services run, so a service seeing it means nobody resolved
+//! it. The rename path derives `name-<random>.ext`, so a full bucket cannot
+//! exhaust sequential names.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -51,24 +51,54 @@ impl ConflictDecision {
     }
 }
 
-/// Existence probe: does `name` collide? Probe errors read as "no conflict"
-/// at this layer — the write itself surfaces real failures. Owned names keep
-/// the async probe independent of the caller's borrowed target.
-pub type ConflictProbe = dyn Fn(String) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync;
+/// What an existence probe concluded. Three states, because "the provider
+/// did not answer" is not "the name is free" — an `Unknown` verdict must
+/// never be read as permission to overwrite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Existence {
+    /// The name is free.
+    Free,
+    /// An object already holds the name.
+    Taken,
+    /// The probe could not decide (provider error).
+    Unknown,
+}
+
+/// Existence probe for one candidate target name. Owned names keep the async
+/// probe independent of the caller's borrowed target.
+pub type ConflictProbe =
+    dyn Fn(String) -> Pin<Box<dyn Future<Output = Existence> + Send>> + Send + Sync;
 
 /// How many random redraws `rename` attempts before giving up (`Blocked`).
 pub const RENAME_ATTEMPTS: u32 = 5;
 
-/// Resolve one write target against the policy. The initial probe decides
-/// whether a conflict exists at all; only then does the policy apply.
+async fn probe_verdict(name: &str, exists: &ConflictProbe) -> Existence {
+    match exists(name.to_string()).await {
+        Existence::Unknown => exists(name.to_string()).await,
+        verdict => verdict,
+    }
+}
+
+/// Resolve one write target against the policy.
+///
+/// The initial probe decides whether a conflict exists at all; only then does
+/// the policy apply. An unverifiable target blocks the item — the same
+/// reaction as an unresolved `Ask` — because a blind overwrite is the one
+/// outcome this table must never produce.
 pub async fn resolve_conflict(
     target: &str,
     policy: ConflictPolicy,
     exists: &ConflictProbe,
     mut random_hex: impl FnMut() -> String,
 ) -> ConflictDecision {
-    if !exists(target.to_string()).await {
-        return ConflictDecision::Proceed(target.to_string());
+    match probe_verdict(target, exists).await {
+        Existence::Free => return ConflictDecision::Proceed(target.to_string()),
+        Existence::Unknown => {
+            return ConflictDecision::Blocked(format!(
+                "target state could not be verified; refusing to overwrite {target}"
+            ))
+        }
+        Existence::Taken => {}
     }
     match policy {
         ConflictPolicy::Overwrite => ConflictDecision::Proceed(target.to_string()),
@@ -79,8 +109,10 @@ pub async fn resolve_conflict(
         ConflictPolicy::Rename => {
             for _ in 0..RENAME_ATTEMPTS {
                 let candidate = suffixed_name(target, &random_hex());
-                if !exists(candidate.clone()).await {
-                    return ConflictDecision::Proceed(candidate);
+                match probe_verdict(&candidate, exists).await {
+                    Existence::Free => return ConflictDecision::Proceed(candidate),
+                    // Taken or Unknown: the candidate is unusable, redraw.
+                    Existence::Taken | Existence::Unknown => continue,
                 }
             }
             ConflictDecision::Blocked(format!(
@@ -91,7 +123,8 @@ pub async fn resolve_conflict(
 }
 
 /// Production random suffix: 8 hex chars from a fresh v4 UUID. Tests inject
-/// their own source through the `random_hex` parameter.
+/// their own source through the `random_hex` parameter of
+/// [`resolve_conflict`].
 pub fn random_suffix8() -> String {
     uuid::Uuid::new_v4().simple().to_string()[..8].to_string()
 }
@@ -115,9 +148,9 @@ pub fn suffixed_name(name: &str, suffix: &str) -> String {
 mod tests {
     use super::*;
     use std::collections::HashSet;
-    use std::sync::{Arc, Mutex};
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
 
-    /// A scripted probe: exactly the listed names "collide".
     struct FixedProbe(Arc<HashSet<String>>);
 
     impl FixedProbe {
@@ -125,11 +158,17 @@ mod tests {
             Self(Arc::new(occupied.iter().map(|s| s.to_string()).collect()))
         }
 
-        fn probe(&self) -> impl Fn(String) -> Pin<Box<dyn Future<Output = bool> + Send>> {
+        fn probe(&self) -> impl Fn(String) -> Pin<Box<dyn Future<Output = Existence> + Send>> {
             let occupied = self.0.clone();
             move |name: String| {
                 let occupied = occupied.clone();
-                Box::pin(async move { occupied.contains(&name) })
+                Box::pin(async move {
+                    if occupied.contains(&name) {
+                        Existence::Taken
+                    } else {
+                        Existence::Free
+                    }
+                })
             }
         }
     }
@@ -166,12 +205,11 @@ mod tests {
             ConflictDecision::Skip("a.jpg".to_string())
         );
         let decision = resolve("a.jpg", ConflictPolicy::Ask, &["a.jpg"]).await;
-        assert!(matches!(decision, ConflictDecision::Blocked(ref r) if r.contains("ask")));
+        assert!(matches!(&decision, ConflictDecision::Blocked(r) if r.contains("ask")));
     }
 
     #[tokio::test]
     async fn rename_takes_first_free_random_suffix() {
-        // First redraw collides, second is free.
         let fixed = FixedProbe::new(&["a.jpg", "a-deadbeef.jpg"]);
         let probe = fixed.probe();
         let mut suffixes = vec!["deadbeef".to_string(), "cafebabe".to_string()].into_iter();
@@ -187,38 +225,65 @@ mod tests {
 
     #[tokio::test]
     async fn rename_blocks_after_exhausted_redraws() {
-        let calls = Arc::new(Mutex::new(0u32));
+        let calls = Arc::new(AtomicU32::new(0));
         let counter = calls.clone();
-        let p: Box<ConflictProbe> = Box::new(move |name: String| {
+        let p: Box<ConflictProbe> = Box::new(move |_| {
             let counter = counter.clone();
             Box::pin(async move {
-                *counter.lock().unwrap() += 1;
-                name.ends_with(".jpg") // every candidate "collides"
+                counter.fetch_add(1, Ordering::SeqCst);
+                Existence::Taken
             })
         });
         let decision = resolve_conflict("a.jpg", ConflictPolicy::Rename, p.as_ref(), || {
             "x1y2z3w4".to_string()
         })
         .await;
-        assert!(matches!(decision, ConflictDecision::Blocked(ref r) if r.contains("no free name")));
+        assert!(matches!(&decision, ConflictDecision::Blocked(r) if r.contains("no free name")));
         // initial probe + RENAME_ATTEMPTS redraws
-        assert_eq!(*calls.lock().unwrap(), 1 + RENAME_ATTEMPTS);
+        assert_eq!(calls.load(Ordering::SeqCst), 1 + RENAME_ATTEMPTS);
     }
 
-    #[test]
-    fn suffix_placement() {
-        assert_eq!(suffixed_name("photo.jpg", "aa"), "photo-aa.jpg");
-        assert_eq!(suffixed_name("dir/sub/a.b.c", "aa"), "dir/sub/a.b-aa.c");
-        assert_eq!(suffixed_name("dir/.hidden", "aa"), "dir/.hidden-aa");
-        assert_eq!(suffixed_name("Makefile", "aa"), "Makefile-aa");
-        assert_eq!(suffixed_name("archive.tar.gz", "aa"), "archive.tar-aa.gz");
+    #[tokio::test]
+    async fn unknown_verdict_blocks_instead_of_overwriting() {
+        for policy in [
+            ConflictPolicy::Ask,
+            ConflictPolicy::Skip,
+            ConflictPolicy::Rename,
+            ConflictPolicy::Overwrite,
+        ] {
+            let p: Box<ConflictProbe> = Box::new(|_| Box::pin(async { Existence::Unknown }));
+            let decision =
+                resolve_conflict("a.jpg", policy, p.as_ref(), || "deadbeef".into()).await;
+            assert!(
+                matches!(&decision, ConflictDecision::Blocked(r) if r.contains("could not be verified")),
+                "{policy:?}: {decision:?}"
+            );
+        }
     }
 
-    #[test]
-    fn random_suffix_is_eight_hex_chars() {
-        let s = random_suffix8();
-        assert_eq!(s.len(), 8);
-        assert!(s.chars().all(|c| c.is_ascii_hexdigit()));
+    #[tokio::test]
+    async fn single_transient_unknown_retries_once() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let counter = calls.clone();
+        let p: Box<ConflictProbe> = Box::new(move |name: String| {
+            let counter = counter.clone();
+            Box::pin(async move {
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    Existence::Unknown
+                } else if name == "a.jpg" {
+                    Existence::Taken
+                } else {
+                    Existence::Free
+                }
+            })
+        });
+        let decision = resolve_conflict("a.jpg", ConflictPolicy::Overwrite, p.as_ref(), || {
+            "x".into()
+        })
+        .await;
+        assert_eq!(decision, ConflictDecision::Proceed("a.jpg".to_string()));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -235,5 +300,21 @@ mod tests {
             ConflictDecision::Blocked("ask".into()).interpret(),
             Resolved::Blocked("ask".into())
         );
+    }
+
+    #[test]
+    fn suffix_placement() {
+        assert_eq!(suffixed_name("photo.jpg", "aa"), "photo-aa.jpg");
+        assert_eq!(suffixed_name("dir/sub/a.b.c", "aa"), "dir/sub/a.b-aa.c");
+        assert_eq!(suffixed_name("dir/.hidden", "aa"), "dir/.hidden-aa");
+        assert_eq!(suffixed_name("Makefile", "aa"), "Makefile-aa");
+        assert_eq!(suffixed_name("archive.tar.gz", "aa"), "archive.tar-aa.gz");
+    }
+
+    #[test]
+    fn random_suffix_is_eight_hex_chars() {
+        let s = random_suffix8();
+        assert_eq!(s.len(), 8);
+        assert!(s.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }

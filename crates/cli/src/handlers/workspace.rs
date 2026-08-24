@@ -92,7 +92,7 @@ pub(super) async fn workspace(
             description,
         } => {
             let ws = svc
-                .edit(
+                .update(
                     &WorkspaceRef::parse(reference),
                     UpdateWorkspaceInput {
                         name: name.clone(),

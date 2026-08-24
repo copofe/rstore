@@ -1,7 +1,7 @@
-//! Bounded span parsing (LINK-006/007, TAG-026).
+//! Bounded time-span parsing for `--ttl`-style flags.
 //!
-//! One parser for every `--ttl`-style flag: plain seconds (`30`) or unit
-//! sums (`1h30m`) over the caller's allowed unit set, overflow-checked and
+//! One parser for every such flag: plain seconds (`30`) or unit sums
+//! (`1h30m`) over the caller's allowed unit set, overflow-checked and
 //! bounded. Callers decide the unit set and the bound — presign TTLs cap at
 //! S3's seven days, tombstone retention at a year.
 
@@ -19,9 +19,14 @@ fn unit_secs(ch: char) -> Option<u64> {
 }
 
 /// Parse a span: plain seconds (`30`) or unit sums (`1h30m`) over `allowed`
-/// (a subset of `smhdw`), bounded to `[1s, max_secs]`. `what` names the
-/// value in error messages; `limit_note` completes the bound message
-/// (e.g. `7d (S3 presign limit)`).
+/// (a subset of `smhdw`), bounded to `[1s, max_secs]`.
+///
+/// `what` names the value in error messages; `limit_note` completes the bound
+/// message (e.g. `7d (S3 presign limit)`).
+///
+/// # Errors
+/// Returns [`Error::invalid_input`] for malformed input, unknown or
+/// disallowed units, and values outside `[1s, max_secs]`.
 pub fn parse_span(
     raw: &str,
     allowed: &str,

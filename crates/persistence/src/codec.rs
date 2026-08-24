@@ -1,11 +1,9 @@
-//! Row ↔ domain-struct codec shared by every repository (DATA-).
+//! Row codec shared by every repository.
 //!
-//! [`RowReader`] owns the loud-failure policy (see `CONTEXT.md`): a field that
-//! fails to decode is a bug in stored state, not user input, so it surfaces as
-//! `Error::database` naming the column and the raw value — never a silent
-//! default. The write-side helpers keep the reverse conversions in the same
-//! place, so each repository states only its SQL and field bindings.
-
+//! [`RowReader`] owns the loud-failure policy: a field that fails to decode is
+//! a bug in stored state, not user input, so it surfaces as a database error
+//! naming the column and raw value — never a silent default. The write-side
+//! helpers keep the reverse conversions in one place.
 use rstore_domain::{Error, Result, TypedId};
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
@@ -18,6 +16,7 @@ pub struct RowReader {
 }
 
 impl RowReader {
+    /// Wrap one fetched row.
     pub fn new(row: SqliteRow) -> Self {
         Self { row }
     }
@@ -84,9 +83,8 @@ impl RowReader {
             .map_err(|e| unreadable(column, e))
     }
 
-    /// TEXT column parsed through a domain token parser (closed vocabularies
-    /// such as `AddressingStyle`). The parse error is rewrapped as a database
-    /// error naming the column and raw value; the original stays as `source`.
+    /// TEXT column parsed through a domain token parser (a closed vocabulary); the parse failure is
+    /// rewrapped as a database error naming the column and raw value.
     pub fn token<T>(&self, column: &str, parse: fn(&str) -> Result<T>) -> Result<T> {
         let raw = self.text(column)?;
         parse(&raw).map_err(|e| {
@@ -106,7 +104,7 @@ fn unreadable(column: &str, e: sqlx::Error) -> Error {
     Error::database(format!("cannot read column `{column}`")).with_source(e)
 }
 
-/// Bind form of a typed ID: the UUID rendered as TEXT.
+/// Bind form of a typed ID: the bare UUID rendered as TEXT.
 pub fn uuid_to_text(id: &impl TypedId) -> String {
     id.as_uuid().to_string()
 }
@@ -122,7 +120,7 @@ mod tests {
 
     #[test]
     fn uuid_to_text_uses_the_bare_uuid() {
-        let id = rstore_domain::ConnectionId::new();
+        let id = rstore_domain::ConnectionId::new_random();
         assert_eq!(uuid_to_text(&id), id.as_uuid().to_string());
     }
 
@@ -133,12 +131,10 @@ mod tests {
     }
 }
 
-/// One bindable value, in the vocabulary repositories write with. Keeping
-/// the shapes typed (rather than passing `impl Encode` around) lets the
-/// [`Insert`]/[`Update`] builders collect column names and values as pairs
-/// and derive the placeholder list — the SQL column list, placeholder count
-/// and bind order can no longer disagree.
 #[derive(Debug, Clone)]
+/// One bindable value, in the vocabulary repositories write with. Typed shapes let the
+/// [`Insert`]/[`Update`] builders collect column names and values as pairs and derive the placeholder
+/// list, so the SQL column list, placeholder count and bind order cannot disagree.
 pub(crate) enum Bind {
     Text(String),
     NullText,
@@ -247,10 +243,8 @@ impl IntoBind for Bind {
     }
 }
 
-/// An INSERT under construction: column names and bind values join as one
-/// ordered list, so the generated SQL's column list, placeholder count and
-/// bind order derive from the same source. Raw suffixes (`ON CONFLICT …`)
-/// stay the caller's SQL.
+/// An INSERT under construction: column names and bind values join as one ordered list, so the generated
+/// SQL derives from a single source. Raw suffixes (`ON CONFLICT …`) stay the caller's SQL.
 pub(crate) struct Insert {
     table: &'static str,
     columns: Vec<&'static str>,
@@ -309,9 +303,9 @@ impl Insert {
     }
 }
 
-/// An UPDATE under construction: SET pairs (or raw fragments with their own
-/// bind, for expressions like `COALESCE(?, state)`) plus a WHERE clause with
-/// its trailing binds — position never leaves the pair it belongs to.
+/// An UPDATE under construction: SET pairs (or raw fragments carrying their own bind, e.g.
+/// `COALESCE(?, state)`) plus a WHERE clause whose binds trail the SET binds — position never leaves
+/// the pair it belongs to.
 pub(crate) struct Update {
     table: &'static str,
     assignments: Vec<String>,
@@ -335,16 +329,14 @@ impl Update {
         self
     }
 
-    /// A raw assignment expression with exactly one `?` of its own
-    /// (`state = COALESCE(?, state)`) — the fragment and its bind stay a
-    /// pair.
+    /// A raw assignment expression with exactly one `?` of its own; fragment and bind stay a pair.
     pub(crate) fn set_sql(mut self, fragment: &str, value: impl IntoBind) -> Self {
         self.assignments.push(fragment.to_string());
         self.values.push(value.into_bind());
         self
     }
 
-    /// The WHERE clause (without the keyword) and its trailing binds.
+    /// The WHERE clause (without the keyword) plus its trailing binds.
     pub(crate) fn filter(
         mut self,
         predicate: &str,
@@ -379,10 +371,8 @@ impl Update {
     }
 }
 
-/// One scalar COUNT query — the `SELECT COUNT(*) AS n …` shape every
-/// repository and `Database` shares. Binds ride the same [`Bind`]
-/// vocabulary as the write builders, and the read rides [`RowReader`]'s
-/// loud-failure policy.
+/// Run one scalar COUNT query (`SELECT COUNT(*) AS n …`). Binds use the same [`Bind`] vocabulary;
+/// the read rides [`RowReader`]'s loud-failure policy.
 pub(crate) async fn count_scalar(
     executor: impl sqlx::Executor<'_, Database = sqlx::Sqlite>,
     sql: &str,

@@ -72,12 +72,12 @@ pub(super) async fn task(
                 human.push_str(&format!(
                     "  [{:<9}] {} ({} / {} bytes)\n",
                     item.state.as_str(),
-                    item.remote_uri,
+                    item.label,
                     item.bytes_done,
                     item.bytes_total,
                 ));
                 if *errors {
-                    if let Some(code) = &item.error_code {
+                    if let Some(code) = &item.error {
                         human.push_str(&format!("      error: {code}\n"));
                     }
                 }

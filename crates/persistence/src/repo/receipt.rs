@@ -1,16 +1,15 @@
 //! Durable receipts for completed remote mutations.
-
 use async_trait::async_trait;
 use rstore_application_ports::{RemoteMutationReceipt, RemoteMutationRepository};
+use rstore_domain::id::ReceiptId;
 use rstore_domain::{Error, Result};
 use sqlx::sqlite::SqlitePool;
 
 use crate::codec::{unix_secs, RowReader};
 use crate::error::map_sqlx;
 
-/// Insert one remote-mutation receipt through any SQLite executor. Keeping the
-/// column list here prevents the standalone repository path and the outbox
-/// transaction path from drifting apart.
+/// Insert one remote-mutation receipt through any SQLite executor. Keeping the column list here prevents
+/// the standalone read path and the outbox transaction path from drifting apart.
 pub(crate) async fn insert_receipt<'e, E>(
     executor: E,
     receipt: &RemoteMutationReceipt,
@@ -24,8 +23,8 @@ where
           completed_at, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(receipt_id) DO NOTHING",
     )
-    .bind(&receipt.receipt_id)
-    .bind(&receipt.job_id)
+    .bind(receipt.receipt_id.to_string())
+    .bind(receipt.job_id.map(|id| id.to_string()))
     .bind(&receipt.operation)
     .bind(&receipt.locator_json)
     .bind(&receipt.remote_version)
@@ -38,10 +37,9 @@ where
     Ok(())
 }
 
-/// Read access to mutation receipts. Receipts are written only through the
-/// outbox transaction path (`insert_receipt` above, reached via
-/// `UnitOfWork::commit`); this repository exists for reads.
 #[derive(Clone)]
+/// Read access to mutation receipts. Receipts are written only through the outbox transaction path;
+/// this repository exists for reads.
 pub struct SqliteRemoteMutationRepository {
     read_pool: SqlitePool,
 }
@@ -54,12 +52,12 @@ impl SqliteRemoteMutationRepository {
 
 #[async_trait]
 impl RemoteMutationRepository for SqliteRemoteMutationRepository {
-    async fn get(&self, receipt_id: &str) -> Result<Option<RemoteMutationReceipt>> {
+    async fn get(&self, receipt_id: ReceiptId) -> Result<Option<RemoteMutationReceipt>> {
         let row = sqlx::query(
             "SELECT receipt_id, job_id, operation, locator_json, remote_version, remote_etag, \
                     completed_at, payload_json FROM remote_mutation_receipts WHERE receipt_id = ?",
         )
-        .bind(receipt_id)
+        .bind(receipt_id.to_string())
         .fetch_optional(&self.read_pool)
         .await
         .map_err(map_sqlx)?;
@@ -74,8 +72,11 @@ impl RemoteMutationRepository for SqliteRemoteMutationRepository {
                 })
                 .transpose()?;
             Ok(RemoteMutationReceipt {
-                receipt_id: reader.text("receipt_id")?,
-                job_id: reader.opt_text("job_id")?,
+                receipt_id: reader.text("receipt_id")?.parse()?,
+                job_id: reader
+                    .opt_text("job_id")?
+                    .map(|token| token.parse())
+                    .transpose()?,
                 operation: reader.text("operation")?,
                 locator_json: reader.text("locator_json")?,
                 remote_version: reader.opt_text("remote_version")?,

@@ -1,7 +1,11 @@
-//! An in-memory [`Storage`] for tests (QA-004 / CORE-014).
+//! An in-memory [`Storage`] for tests.
 //!
-//! Supports prefix/delimiter listing, ranged reads and the standard CRUD set,
-//! so repository and application contract tests can run with zero network.
+//! Supports prefix/delimiter listing, ranged reads, the standard CRUD set and
+//! multipart uploads, so repository and application contract tests run with
+//! zero network. Fault injection ([`FakeStorage::fail_next`] one-shot,
+//! [`FakeStorage::fail_until_cleared`] outage) drives adapter error paths;
+//! the multipart simulation enforces the provider's legality rules so
+//! engine bugs surface offline instead of only against a real bucket.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -87,7 +91,12 @@ pub struct FakeInner {
     read_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
-/// In-memory object store.
+/// In-memory [`Storage`] with fault injection and multipart simulation.
+///
+/// Clones share one store: every handle sees the same objects, uploads,
+/// parts and fault queues. The `fail_*` knobs queue errors per
+/// [`StorageMethod`]; the `seed*` methods install fixture state without
+/// going through the trait methods those faults would target.
 pub struct FakeStorage {
     inner: Arc<FakeInner>,
 }
@@ -224,7 +233,7 @@ impl FakeStorage {
         self.inner.register_bucket(name);
     }
 
-    /// Seed a part as if a previous (interrupted) run had uploaded it to the
+    /// Seed a part as if an interrupted run had already uploaded it to the
     /// provider — multipart-resume tests use this to model server-side state.
     pub fn seed_part(
         &self,
@@ -299,7 +308,7 @@ impl Storage for FakeStorage {
 
     /// A deterministic fake signature so link plumbing (TTL defaults,
     /// expiry propagation) is testable without crypto. The expiry rides the
-    /// same clock basis as the real adapter (`now + ttl`), pinned by
+    /// same clock basis as the real adapter (call time plus TTL), pinned by
     /// `storage_contract`.
     async fn presign(
         &self,
@@ -434,6 +443,27 @@ impl Storage for FakeStorage {
             self.run_read_hook();
         }
         result
+    }
+
+    /// In-memory copy: read the stored body and re-put it through the
+    /// normal path so metadata rules, bucket registration and fault
+    /// injection (`Read`, then `Put`) stay identical to a real round-trip.
+    async fn copy(
+        &self,
+        req: &rstore_storage_api::model::CopyRequest,
+        source: &ObjectMetadata,
+    ) -> Result<ObjectMetadata> {
+        let body = self.read(&req.source_bucket, &req.source_key, None).await?;
+        self.put(
+            &req.target_bucket,
+            &req.target_key,
+            body,
+            &PutOptions {
+                content_type: source.content_type.clone(),
+                ..PutOptions::default()
+            },
+        )
+        .await
     }
 
     async fn put(
@@ -792,7 +822,7 @@ mod tests {
         assert_eq!(s.active_upload_count(), 0);
     }
 
-    /// The S3 legality rules the fake now enforces at completion.
+    /// The S3 legality rules the fake enforces at completion.
     #[tokio::test]
     async fn complete_multipart_rejects_illegal_part_lists() {
         use rstore_storage_api::model::UploadedPart;

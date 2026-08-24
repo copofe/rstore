@@ -1,18 +1,5 @@
-//! Index service (IDX-001..017, 022/025).
-//!
-//! `start` scans a bucket from its root with paged listings, upserting each
-//! object into the catalog immediately (IDX-003: queryable before the scan
-//! ends). Ignore rules prune whole subtrees (IDX-004/IGN-005). The
-//! continuation token persists after every page (IDX-002), so a paused run
-//! resumes exactly where it stopped (IDX-006/007). `refresh` reconciles the
-//! full listing against the catalog and marks missing objects stale
-//! (IDX-012); `rebuild` marks the current rows stale, rescans, and only prunes
-//! rows left unseen after a complete scan while keeping tag definitions
-//! (IDX-013 / DATA-018).
-//!
-//! Pause and cancel act on persisted run state; an in-flight scan stops at the
-//! next page boundary via the cancellation token. Resume re-runs the scan from
-//! the persisted checkpoint.
+//! Indexing service: scan remote buckets into the catalog with persisted,
+//! resumable runs, plus catalog GC, stats, and per-bucket status.
 
 use std::sync::Arc;
 
@@ -32,7 +19,7 @@ use crate::expand::{scan_pages, PageSink};
 use crate::index_run::{IndexRunLifecycle, RunMode, ScanCompletion};
 use crate::locator::CatalogLocator;
 
-/// Progress and outcome of a scan run (IDX-005).
+/// Outcome of one index run.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct IndexReport {
     pub run_id: IndexRunId,
@@ -45,19 +32,22 @@ pub struct IndexReport {
     pub catalog_revision: i64,
 }
 
-/// Outcome of `catalog gc` (IDX-020).
+/// Result of a tombstone garbage-collection pass.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct GcReport {
     pub dry_run: bool,
-    /// Retention actually applied, in seconds.
+
+    /// Retention window applied, in seconds (override or setting).
     pub retention_seconds: u64,
-    /// Tombstones past retention (deleted, or counted when `dry_run`).
+
+    /// Tombstones purged (or that would be purged, under `dry_run`).
     pub expired: u64,
-    /// Tombstones still within retention.
+
+    /// Tombstones still within retention after the pass.
     pub retained: u64,
 }
 
-/// Catalog size overview for `index stats` (IDX-021).
+/// Catalog storage statistics.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct IndexStats {
     pub object_rows: u64,
@@ -66,7 +56,7 @@ pub struct IndexStats {
     pub db_bytes: u64,
 }
 
-/// Per-bucket status for `index status` (IDX-014).
+/// Per-bucket snapshot of index state for status output.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BucketIndexStatus {
     pub bucket: BucketId,
@@ -78,48 +68,53 @@ pub struct BucketIndexStatus {
     pub ignore_rules: u64,
 }
 
-/// Scan/reconcile orchestration (IDX-).
+/// Catalog indexing operations: runs (`start`/`refresh`/`rebuild`),
+/// lifecycle control (`pause`/`cancel`), reporting, and GC.
 #[async_trait]
 pub trait IndexService: Send + Sync {
-    /// Full scan from the bucket root (IDX-001); resumes from the persisted
-    /// checkpoint when one exists (IDX-007).
+    /// Scan the bucket into the catalog, resuming from any saved
+    /// checkpoint. Pauses cleanly when `cancel` fires, checkpointing
+    /// progress.
     async fn start(&self, bucket: &BucketRef, cancel: &CancellationToken) -> Result<IndexReport>;
-    /// Per-bucket status overview (IDX-014).
+
+    /// Status of every registered bucket.
     async fn status(&self) -> Result<Vec<BucketIndexStatus>>;
-    /// Mark a run paused (IDX-006); an in-flight scan stops at the next page.
-    /// Returns the persisted run — callers echo observed state, never
-    /// fabricated state.
+
+    /// Pause the bucket's running index without clearing its checkpoint.
+    /// Errors when no run is active.
     async fn pause(&self, bucket: &BucketRef) -> Result<IndexRun>;
-    /// Mark a run cancelled; completed data is kept (IDX-008). Returns the
-    /// persisted run.
+
+    /// Cancel the bucket's active (running or paused) index and clear its
+    /// checkpoint. Errors when no run is active.
     async fn cancel(&self, bucket: &BucketRef) -> Result<IndexRun>;
-    /// Purge tombstones past retention (IDX-020). Retention comes from the
-    /// `catalog.tombstone_retention_secs` setting unless `retention_override`
-    /// is given; `dry_run` counts without deleting.
+
+    /// Purge expired tombstones older than the retention window (setting
+    /// `catalog.tombstone_retention_secs`, overridable here); with
+    /// `dry_run`, only counts them.
     async fn gc(&self, retention_override: Option<u64>, dry_run: bool) -> Result<GcReport>;
 
-    /// Catalog size overview (IDX-021).
+    /// Aggregate catalog statistics.
     async fn stats(&self) -> Result<IndexStats>;
 
-    /// Full reconciliation: catalog rows missing remotely become stale
-    /// (IDX-012).
+    /// Fresh full scan from the bucket root; rows not reconfirmed by the
+    /// completed scan are marked stale.
     async fn refresh(&self, bucket: &BucketRef, cancel: &CancellationToken) -> Result<IndexReport>;
-    /// Rescan the bucket and prune rows left unseen only after a complete scan;
-    /// tag definitions survive (IDX-013 / DATA-018).
+
+    /// Fresh full scan after marking every existing row stale; rows not
+    /// reconfirmed by the completed scan are deleted.
     async fn rebuild(&self, bucket: &BucketRef, cancel: &CancellationToken) -> Result<IndexReport>;
 }
 
+/// Production [`IndexService`] over the locator, catalog repository,
+/// ignore rules, run store, settings, and runtime stats.
 pub struct DefaultIndexService {
-    /// Tier-1 resolution: a registered bucket row → its adapter (the one
-    /// path every live remote operation resolves through).
     locator: CatalogLocator,
     buckets: Arc<dyn BucketService>,
     catalog: Arc<dyn RemoteObjectRepository>,
     ignores: Arc<dyn IgnoreRuleStore>,
     runs: Arc<dyn IndexRunStore>,
     settings: Arc<dyn SettingsStore>,
-    /// Row/tombstone counts and the on-disk size come from the database the
-    /// composition root already opened (IDX-020/021).
+
     stats: Arc<dyn RuntimeStats>,
     clock: Arc<dyn Clock>,
 }
@@ -148,8 +143,8 @@ impl DefaultIndexService {
         }
     }
 
-    /// Retention in seconds: the `catalog.tombstone_retention_secs` setting
-    /// (TAG-026) with a 30-day default, or an explicit override (IDX-020).
+    /// Effective tombstone retention in seconds: the override when given,
+    /// else the setting, else 30 days.
     async fn retention_secs(&self, override_secs: Option<u64>) -> Result<u64> {
         Ok(match override_secs {
             Some(secs) => secs,
@@ -166,10 +161,12 @@ impl DefaultIndexService {
         self.buckets.resolve(bucket).await
     }
 
-    /// The one persisted-state transition behind `pause` and `cancel`: find
-    /// the bucket's active run among `active_states`, move it to `target`
-    /// through the domain transition table, finish it when asked, and
-    /// optionally drop the scan checkpoint.
+    /// Move the bucket's run in one of `active_states` to `target`,
+    /// persisting the transition and optionally stamping `finished_at`
+    /// and clearing the resume checkpoint.
+    ///
+    /// Errors with `none_message` when no matching run exists, or when the
+    /// state machine rejects the transition.
     #[allow(clippy::too_many_arguments)]
     async fn transition_active(
         &self,
@@ -187,7 +184,7 @@ impl DefaultIndexService {
             .into_iter()
             .find(|r| r.bucket_id == bucket_id && active_states.contains(&r.state));
         let Some(run) = active else {
-            return Err(Error::invalid_input(none_message));
+            return Err(Error::conflict(none_message));
         };
         let mut next = run;
         next.state = next.state.transition(target)?;
@@ -210,10 +207,9 @@ impl DefaultIndexService {
         Ok(next)
     }
 
-    /// One full pass of paged listing with ignore pruning + upserts
-    /// (IDX-002..004). Stops at a page boundary when cancelled, persisting
-    /// the cursor for `resume`. The walk itself is [`scan_pages`]; the
-    /// per-page policy lives in [`ScanSink`].
+    /// Drive the paginated scan for one run, feeding pages through
+    /// [`ScanSink`] until complete, cancelled (checkpoint saved, paused),
+    /// or exhausted.
     async fn scan(
         &self,
         bucket: &Bucket,
@@ -223,8 +219,7 @@ impl DefaultIndexService {
         lifecycle: &mut IndexRunLifecycle,
     ) -> Result<ScanCompletion> {
         let rules = self.ignores.list(bucket.id).await?;
-        // A run cancelled before it lists anything still persists its pause
-        // (the original loop checked ahead of every page, the first included).
+
         if cancel.check().is_err() {
             lifecycle.checkpoint_on_cancel(token.as_deref()).await?;
             return Ok(ScanCompletion::Paused);
@@ -242,9 +237,9 @@ impl DefaultIndexService {
         Ok(sink.completion)
     }
 
-    /// Own one complete Index run lifecycle. Callers choose the mode; this
-    /// module alone decides when reconciliation and revision changes are
-    /// valid, and every operational error attempts to persist `Failed`.
+    /// Execute one run end-to-end in `mode`; on any failure the run is
+    /// persisted as failed before the error propagates (a persistence
+    /// failure while doing so is logged, never masks the original error).
     async fn run(
         &self,
         bucket: &BucketRef,
@@ -279,7 +274,8 @@ impl DefaultIndexService {
         }
     }
 
-    /// Shared prelude: resolve bucket + adapter, create the run row.
+    /// Resolve the bucket, enforce indexing being enabled when required,
+    /// connect to it, and open the run's persisted lifecycle.
     async fn begin(
         &self,
         bucket: &BucketRef,
@@ -299,10 +295,8 @@ impl DefaultIndexService {
     }
 }
 
-/// The indexer's per-page policy inside one [`scan_pages`] walk: ignore
-/// pruning, confirmed upserts, atomic page publication (IDX-002), run
-/// bookkeeping, and the pause/complete
-/// decision at page boundaries (IDX-006/007).
+/// Page consumer for one scan: filters entries through the bucket's ignore
+/// rules, publishes each page durably, and pauses at cancellation.
 struct ScanSink<'a> {
     bucket: &'a Bucket,
     rules: Vec<IgnoreRule>,
@@ -324,7 +318,7 @@ impl PageSink for ScanSink<'_> {
         }
         let confirmed_at = self.lifecycle.now();
         self.lifecycle.observe_page(page.objects.len() as u64);
-        // IDX-004/IGN-005: skip ignored subtrees entirely.
+
         let kept = page
             .objects
             .iter()
@@ -515,9 +509,7 @@ mod tests {
             .start(&bucket, &CancellationToken::new())
             .await
             .unwrap_err();
-        // The scan propagates the adapter's own classification — the old
-        // `Error::network` wrap reclassified every listing failure as a
-        // network error.
+
         assert_eq!(error.code, ErrorCode::InvalidInput);
 
         let status = app.api().catalog().indexer().status().await.unwrap();

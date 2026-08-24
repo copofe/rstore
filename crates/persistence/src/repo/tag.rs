@@ -1,5 +1,4 @@
-//! Repository for tag definitions and their object associations (TAG-).
-
+//! Repository for tag definitions and their object associations.
 use async_trait::async_trait;
 use rstore_application_ports::{TagStore, TagSummary};
 use rstore_domain::id::{RemoteObjectId, TagId, WorkspaceId};
@@ -13,7 +12,6 @@ use crate::codec::{unix_secs, uuid_to_text, Bind, Insert, RowReader, Update};
 use crate::error::map_sqlx;
 use crate::tx::WriteGate;
 
-/// CRUD + associations over `tags` / `remote_object_tags`.
 #[derive(Clone)]
 pub struct TagRepository {
     gate: WriteGate,
@@ -26,17 +24,8 @@ impl TagRepository {
     }
 }
 
-/// The catalog seam's narrow port. MOVE-015 tag preservation goes through
-/// these two methods so the copy service can hold
-/// `Arc<dyn rstore_catalog::TagStore>`; the wide port below is a subtrait and
-/// inherits both — each body exists exactly once, here.
 #[async_trait::async_trait]
 impl rstore_catalog::TagStore for TagRepository {
-    /// Attach a tag to an object (TAG-009). The object must live in a bucket
-    /// belonging to the workspace. Application paths resolve objects through
-    /// the catalog locator, which already enforces workspace membership
-    /// (WSP-013); this id-level join is the adapter's own defense in depth
-    /// and never interprets a locator. Duplicate attaches are no-ops.
     async fn attach(
         &self,
         workspace: WorkspaceId,
@@ -47,8 +36,6 @@ impl rstore_catalog::TagStore for TagRepository {
         self.gate
             .write_unit("tag attach", |tx| {
                 Box::pin(async move {
-                    // WSP-013 isolation: the object's bucket must belong to the
-                    // workspace, checked in the same unit of work as the insert.
                     let member = sqlx::query(
                         "SELECT COUNT(*) FROM remote_objects ro \
                          JOIN workspace_buckets wb ON wb.bucket_id = ro.bucket_id \
@@ -77,9 +64,6 @@ impl rstore_catalog::TagStore for TagRepository {
             .await
     }
 
-    /// Every `(workspace, tag)` association of an object, across all
-    /// workspaces — the source list for tag preservation on copy/move
-    /// (MOVE-015).
     async fn associations_for_object(
         &self,
         object_id: RemoteObjectId,
@@ -107,9 +91,6 @@ impl rstore_catalog::TagStore for TagRepository {
 impl TagStore for TagRepository {
     async fn insert(&self, tag: &Tag) -> Result<()> {
         let _write = self.gate.permit().await?;
-        // Uniqueness is the schema's guarantee — UNIQUE(workspace_id,
-        // normalized_name); map_sqlx classifies the violation as Conflict
-        // and this remap adds the tag's name to the message.
         Insert::into("tags")
             .column("id", uuid_to_text(&tag.id))
             .column("workspace_id", uuid_to_text(&tag.workspace_id))
@@ -121,19 +102,13 @@ impl TagStore for TagRepository {
             .execute(self.gate.pool())
             .await
             .map_err(|e| {
-                if e.code == rstore_domain::ErrorCode::Conflict {
-                    Error::conflict(format!(
-                        "tag `{}` already exists in this workspace",
-                        tag.name
-                    ))
-                } else {
-                    e
-                }
+                crate::error::with_conflict_message(e, || {
+                    format!("tag `{}` already exists in this workspace", tag.name)
+                })
             })?;
         Ok(())
     }
 
-    /// Tags in a workspace with live object counts (TAG-005).
     async fn list(&self, workspace: WorkspaceId) -> Result<Vec<TagSummary>> {
         let rows = sqlx::query(
             "SELECT t.id, t.workspace_id, t.name, t.normalized_name, t.color, t.description, t.created_at, \
@@ -180,14 +155,12 @@ impl TagStore for TagRepository {
         row.map(|r| row_to_tag(&RowReader::new(r))).transpose()
     }
 
-    /// Update mutable fields; name conflicts within the workspace are rejected
-    /// (TAG-006).
     async fn update(
         &self,
         id: TagId,
         name: Option<&str>,
         color: Option<&str>,
-        description: Option<&str>,
+        description: Option<Option<&str>>,
     ) -> Result<()> {
         let _write = self.gate.permit().await?;
         let existing = self
@@ -197,13 +170,11 @@ impl TagStore for TagRepository {
         let new_name = name.unwrap_or(&existing.name).to_string();
         let normalized = rstore_domain::normalize_tag_name(&new_name);
         let new_description = match description {
-            Some("") => None,
             None => existing.description,
-            Some(d) => Some(d.to_string()),
+            Some(None) => None,
+            Some(Some(d)) => Some(d.to_string()),
         };
         let new_color = color.unwrap_or(&existing.color).to_string();
-        // Uniqueness rides the schema's UNIQUE(workspace_id,
-        // normalized_name); a rename to the same name does not violate it.
         Update::table("tags")
             .set("name", &new_name)
             .set("normalized_name", &normalized)
@@ -213,16 +184,13 @@ impl TagStore for TagRepository {
             .execute(self.gate.pool())
             .await
             .map_err(|e| {
-                if e.code == rstore_domain::ErrorCode::Conflict {
-                    Error::conflict(format!("tag `{new_name}` already exists in this workspace"))
-                } else {
-                    e
-                }
+                crate::error::with_conflict_message(e, || {
+                    format!("tag `{new_name}` already exists in this workspace")
+                })
             })?;
         Ok(())
     }
 
-    /// Delete a tag and its associations; `true` when a row went (TAG-007).
     async fn delete(&self, id: TagId) -> Result<bool> {
         let _write = self.gate.permit().await?;
         let affected = sqlx::query("DELETE FROM tags WHERE id = ?")
@@ -234,7 +202,6 @@ impl TagStore for TagRepository {
         Ok(affected > 0)
     }
 
-    /// Detach (TAG-010); `true` when an association was removed.
     async fn detach(
         &self,
         workspace: WorkspaceId,
@@ -256,7 +223,6 @@ impl TagStore for TagRepository {
         Ok(affected > 0)
     }
 
-    /// Tag names attached to an object within a workspace (MIX-007).
     async fn tags_for_object(
         &self,
         workspace: WorkspaceId,
@@ -276,9 +242,6 @@ impl TagStore for TagRepository {
             .collect()
     }
 
-    /// Move every association of `source` onto `target` within a workspace,
-    /// deduplicating rows that already exist (TAG-008). Returns the number
-    /// of associations moved.
     async fn merge_associations(
         &self,
         workspace: WorkspaceId,
@@ -318,7 +281,6 @@ impl TagStore for TagRepository {
             .await
     }
 
-    /// Remove every tag association for one object in a workspace (TAG-013).
     async fn clear_object(&self, workspace: WorkspaceId, object_id: RemoteObjectId) -> Result<()> {
         let _write = self.gate.permit().await?;
         sqlx::query(

@@ -1,4 +1,4 @@
-//! Repository and query contracts over the catalog (CORE-005).
+//! Repository and query contracts over the catalog.
 //!
 //! An [`InMemoryCatalog`] reference implementation lives here so service and
 //! contract tests can run without SQLite. Its semantics are pinned by the
@@ -19,10 +19,14 @@ use crate::query::{
     CatalogPage, CatalogPageItem, FileFilter, FileSort, Page, PageRequest, Scope, SortOrder,
 };
 
-/// Write/read access to indexed remote objects (used by the indexer — IDX-).
+/// Write/read access to the indexed remote objects of the catalog.
+///
+/// Implementations live behind this port so the indexer never sees SQLite.
 #[async_trait]
 pub trait RemoteObjectRepository: Send + Sync {
+    /// Insert or replace a row keyed by object id.
     async fn upsert(&self, object: &RemoteObject) -> Result<()>;
+
     /// Publish a page's object rows as one adapter-owned write unit. The
     /// default keeps simple adapters substitutable; durable adapters should
     /// override it with a transaction.
@@ -32,11 +36,18 @@ pub trait RemoteObjectRepository: Send + Sync {
         }
         Ok(())
     }
+
+    /// Fetch one row by id; `None` when absent or tombstoned away.
     async fn get(&self, id: RemoteObjectId) -> Result<Option<RemoteObject>>;
+
+    /// Remove a row outright (no tombstone is kept).
     async fn delete(&self, id: RemoteObjectId) -> Result<()>;
+
+    /// Number of rows currently indexed for `bucket`.
     async fn count_in_bucket(&self, bucket: BucketId) -> Result<u64>;
-    /// Record a deletion (DEL-009): drop the catalog row (if any) and keep a
-    /// tombstone carrying the locator for later index reconciliation.
+
+    /// Record a deletion: drop the catalog row (if any) and keep a tombstone
+    /// carrying the locator for later index reconciliation.
     async fn tombstone(
         &self,
         connection: rstore_domain::ConnectionId,
@@ -44,6 +55,7 @@ pub trait RemoteObjectRepository: Send + Sync {
         path: &rstore_domain::remote::ObjectPath,
         at: time::OffsetDateTime,
     ) -> Result<()>;
+
     /// Look up a full object row by its remote locator.
     async fn find_by_locator(
         &self,
@@ -51,25 +63,31 @@ pub trait RemoteObjectRepository: Send + Sync {
         bucket: BucketId,
         path: &rstore_domain::remote::ObjectPath,
     ) -> Result<Option<RemoteObject>>;
-    /// Rows in a bucket still marked stale (IDX-014 status surface).
+
+    /// Rows in a bucket still marked stale (status surface).
     async fn count_stale(&self, bucket: BucketId) -> Result<u64>;
-    /// IDX-012 reconciliation: rows confirmed before `before` flip to stale
-    /// (the refresh re-confirmed everything still remote). Returns how many.
+
+    /// Reconciliation step: rows last confirmed before `before` flip to stale
+    /// (the refresh re-confirmed everything still remote). Returns how many
+    /// rows flipped.
     async fn mark_stale_older_than(
         &self,
         bucket: BucketId,
         before: time::OffsetDateTime,
     ) -> Result<u64>;
+
     /// Mark every row in a bucket as stale before a rebuild. Existing rows
     /// remain visible until the replacement scan commits.
     async fn mark_all_stale_in_bucket(&self, bucket: BucketId) -> Result<u64>;
+
     /// Remove rows left stale by a completed rebuild.
     async fn delete_stale_in_bucket(&self, bucket: BucketId) -> Result<u64>;
-    /// Remove every catalog row of a bucket (IDX-013 rebuild). Tag
-    /// associations cascade; tag definitions survive.
+
+    /// Remove every catalog row of a bucket. Tag associations cascade; tag
+    /// definitions survive.
     async fn delete_all_in_bucket(&self, bucket: BucketId) -> Result<u64>;
 
-    /// Tombstones past retention: count only (IDX-020 dry run). Adapters
+    /// Tombstones past retention: count only (dry-run support). Adapters
     /// without tombstone records report zero.
     async fn count_expired_tombstones(
         &self,
@@ -79,8 +97,8 @@ pub trait RemoteObjectRepository: Send + Sync {
         Ok(0)
     }
 
-    /// Purge tombstones past retention, returning the number removed
-    /// (IDX-020). A row expires at its own `expires_at` when set, else
+    /// Purge tombstones past retention, returning the number removed. A row
+    /// expires at its own `expires_at` when set, else
     /// `created_at + retention`.
     async fn purge_expired_tombstones(
         &self,
@@ -91,9 +109,10 @@ pub trait RemoteObjectRepository: Send + Sync {
     }
 }
 
-/// Read-side search over the catalog (MIX- / IDX-024).
+/// Read-side search over the catalog: filtered, sorted keyset pagination.
 #[async_trait]
 pub trait CatalogQuery: Send + Sync {
+    /// One page of matching objects in walk order.
     async fn search(
         &self,
         scope: Scope,
@@ -102,6 +121,7 @@ pub trait CatalogQuery: Send + Sync {
         page: &PageRequest,
     ) -> Result<Page<RemoteObject>>;
 
+    /// Number of rows matching the filter, ignoring the cursor.
     async fn count(&self, scope: Scope, filter: &FileFilter) -> Result<u64>;
 
     /// Assemble the complete mixed files page in the catalog adapter.
@@ -114,7 +134,10 @@ pub trait CatalogQuery: Send + Sync {
     ) -> Result<CatalogPage>;
 }
 
-/// In-memory catalog (reference implementation + test fixture).
+/// In-memory catalog: reference implementation and test fixture.
+///
+/// Its observable behavior must match the persisted adapters; contract tests
+/// pin the overlap.
 pub struct InMemoryCatalog {
     objects: Mutex<HashMap<RemoteObjectId, RemoteObject>>,
     /// Workspace-scoped tag associations.
@@ -134,6 +157,7 @@ impl Default for InMemoryCatalog {
 }
 
 impl InMemoryCatalog {
+    /// An empty catalog with no names, memberships, or tags registered.
     pub fn new() -> Self {
         Self {
             objects: Mutex::new(HashMap::new()),
@@ -247,7 +271,7 @@ impl InMemoryCatalog {
         obj: &RemoteObject,
         filter: &FileFilter,
     ) -> bool {
-        // MIX-022: `None` hides deleted rows; `Some` is an exact match.
+        // `state: None` hides deleted rows; `Some` is an exact match.
         let state_ok = match filter.state {
             None => obj.state != rstore_domain::ObjectState::Deleted,
             Some(want) => obj.state == want,
@@ -255,7 +279,7 @@ impl InMemoryCatalog {
         if !state_ok {
             return false;
         }
-        // Workspace scoping: only member buckets are visible (WSP-).
+        // Workspace scoping: only member buckets are visible.
         if !self.is_member(workspace, obj.bucket_id) {
             return false;
         }
@@ -500,9 +524,9 @@ impl CatalogQuery for InMemoryCatalog {
             .cloned()
             .collect();
 
-        // Deterministic total order (IDX-024): (sort value, path, id), the
-        // tie-break in the same direction as the sort so a keyset cursor can
-        // resume the walk without skipping or repeating rows.
+        // Deterministic total order: (sort value, path, id), the tie-break in
+        // the same direction as the sort so a keyset cursor can resume the
+        // walk without skipping or repeating rows.
         matched.sort_by_cached_key(|o| order_key(o, sort.field));
         if sort.order == SortOrder::Desc {
             matched.reverse();

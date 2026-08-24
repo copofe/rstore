@@ -1,12 +1,12 @@
-//! Command dispatch and per-domain handlers.
+//! Command dispatch and the per-domain handler modules.
 //!
 //! Each domain owns one module (`connection`, `bucket`, `remote`, `task`,
 //! `transfer`, `url`, plus `misc` for config/doctor and `files` for index /
-//! files / catalog maintenance); interactive TTY policy lives in [`tty`] and
+//! files / catalog maintenance); interactive TTY policy lives in the `tty`
+//! module and
 //! shared formatting in [`format`]. Handlers produce a
 //! [`crate::output::HandlerOutput`] carrying both structured `data` and the
-//! pre-rendered human string — results go to stdout, diagnostics to stderr
-//! (CLI-006).
+//! pre-rendered human string — results go to stdout, diagnostics to stderr.
 
 mod bucket;
 mod connection;
@@ -36,16 +36,21 @@ pub type HandlerResult = Result<HandlerOutput>;
 /// Serialize handler data without silently replacing failures with JSON null.
 /// A serialization failure is an internal output-contract error and keeps its
 /// original cause in the domain error chain.
+///
+/// # Errors
+/// Returns a domain error when serialization fails.
 pub(super) fn json_value(value: impl Serialize) -> Result<serde_json::Value> {
     serde_json::to_value(value)
         .map_err(|error| rstore_domain::Error::unknown("serialize CLI output").with_source(error))
 }
 
 /// Merge one optional section into a JSON envelope object. A `None` section
-/// leaves the payload untouched; a serialisation failure or a non-object
-/// payload surfaces as an error instead of being silently dropped — the
-/// policy [`json_value`] established, extended to the "optional section
-/// rides the payload" assembly.
+/// leaves the payload untouched; a non-object payload surfaces as an error
+/// instead of being silently dropped — the same output-contract policy
+/// [`json_value`] enforces, extended to attaching an optional section.
+///
+/// # Errors
+/// Fails when a section is present but the payload is not a JSON object.
 pub(super) fn merge_field(
     data: serde_json::Value,
     name: &str,
@@ -66,14 +71,15 @@ pub(super) fn merge_field(
     Ok(serde_json::Value::Object(map))
 }
 
-/// Dispatch against the stable context-oriented Application API.
+/// Dispatch a parsed [`Cli`] invocation against the application API, sharing
+/// one TTY session across every handler in the run.
 pub async fn run_api(
     cli: &Cli,
     app: &rstore_application::ApplicationApi,
     dirs: &AppDirs,
     cancel: &CancellationToken,
 ) -> HandlerResult {
-    // One prompt policy per run: every confirmation, credential prompt and
+    // One prompt policy per run: every confirmation, credential prompt, and
     // conflict question reads it (`--json` closes the pipe).
     let session = tty::Session::detect(cli.json);
     match &cli.command {
@@ -123,7 +129,7 @@ pub async fn run_api(
         Command::Files { action } => files::files(action, app, &session).await,
         Command::Tag { action } => tag::tag(action, app, &session).await,
         Command::Url(args) => url::url(args, app).await,
-        Command::Catalog { action } => files::catalog(action, app).await,
+        Command::Catalog { action } => files::catalog(action, app, &session).await,
         Command::Cp(args) => {
             transfer::copy_move(false, args, app, cancel, cli.quiet, &session).await
         }
@@ -135,7 +141,7 @@ pub async fn run_api(
 
 /// Expand a user remote reference (short or canonical form) through the
 /// application's one grammar — the rule lives in
-/// `rstore_application::remote`, so the future desktop expands identically.
+/// `rstore_application::remote`, so other frontends expand identically.
 pub(super) async fn expand_remote(
     app: &rstore_application::ApplicationApi,
     reference: &str,
@@ -148,7 +154,7 @@ pub(super) async fn expand_remote(
     .await
 }
 
-/// Expand a batch through the same rule, preserving order.
+/// Expand a batch of references through the same rule, preserving order.
 pub(super) async fn expand_remote_batch(
     app: &rstore_application::ApplicationApi,
     references: &[String],
@@ -162,7 +168,7 @@ pub(super) async fn expand_remote_batch(
 }
 
 /// Resolve `--bucket` references (id / `<connection>/<name>` / bare name) to
-/// bucket ids for file filters (MIX-013).
+/// bucket ids for file filters.
 pub(super) async fn resolve_bucket_ids(
     app: &rstore_application::ApplicationApi,
     refs: &[String],
@@ -181,8 +187,8 @@ pub(super) async fn resolve_bucket_ids(
     Ok(ids)
 }
 
-/// Helper used by the binary: parse the top-level `--config` override into the
-/// resolved application directories.
+/// Parse the top-level `--config` override into the resolved application
+/// directories.
 pub fn resolve_dirs(cli: &Cli) -> AppDirs {
     rstore_platform::resolve_app_dirs(cli.config.as_deref())
 }

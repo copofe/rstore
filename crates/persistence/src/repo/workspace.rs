@@ -1,5 +1,4 @@
-//! Repository for workspaces and their bucket memberships (WSP-).
-
+//! Repository for workspaces and their bucket memberships.
 use async_trait::async_trait;
 use rstore_application_ports::{WorkspaceStore, WorkspaceSummary};
 use rstore_domain::id::{BucketId, WorkspaceId};
@@ -15,6 +14,7 @@ use crate::tx::WriteGate;
 const COLUMNS: &str = "id, name, description, created_at, updated_at";
 
 #[derive(Clone)]
+/// CRUD access to `workspaces` and `workspace_buckets`.
 pub struct WorkspaceRepository {
     gate: WriteGate,
     read_pool: SqlitePool,
@@ -28,11 +28,10 @@ impl WorkspaceRepository {
 
 #[async_trait]
 impl WorkspaceStore for WorkspaceRepository {
+    /// Insert a workspace. Case-insensitive name uniqueness is the schema's guarantee (the UNIQUE index
+    /// on `lower(name)`); a duplicate surfaces as `Conflict` naming the workspace.
     async fn insert(&self, workspace: &Workspace) -> Result<()> {
         let _write = self.gate.permit().await?;
-        // Uniqueness (case-insensitive) is the schema's guarantee — the
-        // UNIQUE index on lower(name); map_sqlx classifies the violation as
-        // Conflict and this remap adds the name to the message.
         Insert::into("workspaces")
             .column("id", uuid_to_text(&workspace.id))
             .column("name", &workspace.name)
@@ -42,11 +41,9 @@ impl WorkspaceStore for WorkspaceRepository {
             .execute(self.gate.pool())
             .await
             .map_err(|e| {
-                if e.code == rstore_domain::ErrorCode::Conflict {
-                    Error::conflict(format!("workspace `{}` already exists", workspace.name))
-                } else {
-                    e
-                }
+                crate::error::with_conflict_message(e, || {
+                    format!("workspace `{}` already exists", workspace.name)
+                })
             })?;
         Ok(())
     }
@@ -71,7 +68,7 @@ impl WorkspaceStore for WorkspaceRepository {
             .collect()
     }
 
-    /// Catalog object count per member bucket for workspace stats (WSP-012).
+    /// Catalog object count per member bucket, for workspace stats.
     async fn object_counts_by_bucket(
         &self,
         workspace: WorkspaceId,
@@ -121,7 +118,7 @@ impl WorkspaceStore for WorkspaceRepository {
         &self,
         id: WorkspaceId,
         name: Option<&str>,
-        description: Option<&str>,
+        description: Option<Option<&str>>,
         at: OffsetDateTime,
     ) -> Result<()> {
         let _write = self.gate.permit().await?;
@@ -131,18 +128,12 @@ impl WorkspaceStore for WorkspaceRepository {
             .ok_or_else(|| Error::not_found("workspace not found"))?;
         let new_name = name.unwrap_or(&existing.name).to_string();
         let new_description = match description {
-            Some(d) => {
-                if d.is_empty() {
-                    None
-                } else {
-                    Some(d.to_string())
-                }
-            }
+            Some(None) => None,
+            Some(Some(d)) => Some(d.to_string()),
             None => existing.description.clone(),
         };
-        // Uniqueness rides the schema's lower(name) index; a self-rename to
-        // the same name does not violate it (the final table state keeps
-        // exactly one row with that name).
+        // Uniqueness rides the schema's lower(name) index; a self-rename keeps exactly one row with that
+        // name, so it cannot violate the index.
         Update::table("workspaces")
             .set("name", &new_name)
             .set("description", &new_description)
@@ -151,11 +142,9 @@ impl WorkspaceStore for WorkspaceRepository {
             .execute(self.gate.pool())
             .await
             .map_err(|e| {
-                if e.code == rstore_domain::ErrorCode::Conflict {
-                    Error::conflict(format!("workspace `{new_name}` already exists"))
-                } else {
-                    e
-                }
+                crate::error::with_conflict_message(e, || {
+                    format!("workspace `{new_name}` already exists")
+                })
             })?;
         Ok(())
     }
@@ -171,7 +160,7 @@ impl WorkspaceStore for WorkspaceRepository {
         Ok(affected > 0)
     }
 
-    /// Buckets in a workspace (WSP-006), ordered by connection then name.
+    /// Buckets in a workspace, ordered by connection then name.
     async fn buckets(&self, id: WorkspaceId) -> Result<Vec<BucketId>> {
         let rows = sqlx::query(
             "SELECT wb.bucket_id FROM workspace_buckets wb \
@@ -191,7 +180,7 @@ impl WorkspaceStore for WorkspaceRepository {
             .collect()
     }
 
-    /// Add a bucket membership; duplicate pairs are a no-op (WSP-007).
+    /// Add a bucket membership; duplicate pairs are a no-op.
     async fn add_bucket(
         &self,
         workspace: WorkspaceId,

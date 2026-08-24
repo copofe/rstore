@@ -1,12 +1,11 @@
-//! SQLite-backed [`RemoteObjectRepository`] plus the tombstone write that
-//! records deletions for catalog staleness (DEL-009 / IDX-011).
-
+//! Catalog persistence for indexed remote objects, including the tombstone
+//! write that records deletions for staleness reconciliation.
 use async_trait::async_trait;
 use rstore_catalog::RemoteObjectRepository;
 use rstore_domain::id::{BucketId, ConnectionId, RemoteObjectId};
 use rstore_domain::remote::{ObjectPath, RemoteObject};
 use rstore_domain::ObjectState;
-use rstore_domain::{Error, Result, TypedId};
+use rstore_domain::{Error, Result};
 use sqlx::sqlite::SqlitePool;
 use time::OffsetDateTime;
 
@@ -16,7 +15,6 @@ use crate::error::map_sqlx;
 const COLUMNS: &str = "id, connection_id, bucket_id, object_path, size, etag, content_type, \
                        last_modified, storage_class, version_id, confirmed_at, state, file_type";
 
-/// Catalog persistence for indexed remote objects.
 #[derive(Clone)]
 pub struct SqliteRemoteObjectRepository {
     gate: crate::tx::WriteGate,
@@ -28,8 +26,6 @@ impl SqliteRemoteObjectRepository {
         Self { gate, read_pool }
     }
 
-    /// A tombstone expires at its own `expires_at` when set, else
-    /// `created_at + retention` (IDX-020 / TAG-026).
     fn expired_clause(retention_secs: u64) -> String {
         format!(
             "(expires_at IS NOT NULL AND expires_at <= ?1) \
@@ -73,8 +69,6 @@ impl SqliteRemoteObjectRepository {
     where
         E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
     {
-        // The row is stored as given: confirmation semantics belong to the
-        // `confirmed_object` constructor, not the repository.
         Insert::into("remote_objects")
             .column("id", uuid_to_text(&object.id))
             .column("connection_id", uuid_to_text(&object.connection_id))
@@ -109,9 +103,6 @@ impl SqliteRemoteObjectRepository {
 
 #[async_trait]
 impl RemoteObjectRepository for SqliteRemoteObjectRepository {
-    /// Record a deletion (DEL-009): drop the catalog row (if any) and insert
-    /// a tombstone carrying the locator for later index reconciliation —
-    /// one unit of work, so a crash between the two cannot lose the marker.
     async fn tombstone(
         &self,
         connection: ConnectionId,
@@ -135,12 +126,9 @@ impl RemoteObjectRepository for SqliteRemoteObjectRepository {
                     }
                     let object_id = existing
                         .map(|(id, _)| id)
-                        .unwrap_or_else(RemoteObjectId::new);
+                        .unwrap_or_else(RemoteObjectId::new_random);
                     Insert::into("metadata_tombstones")
-                        .column("workspace_id", Bind::NullText)
                         .column("remote_object_id", uuid_to_text(&object_id))
-                        .column("tag_id", Bind::NullText)
-                        .column("locator", format!("{}/{}", bucket.as_uuid(), path))
                         .column("created_at", unix_secs(at))
                         .column("expires_at", Bind::NullInteger)
                         .execute(&mut **tx)
@@ -345,10 +333,6 @@ fn object_from_reader(row: &RowReader) -> Result<RemoteObject> {
 
 #[async_trait]
 impl rstore_catalog::CatalogQuery for SqliteRemoteObjectRepository {
-    /// Mixed-list query (MIX-001..024): one SQL statement with dynamic
-    /// filters and keyset pagination over `(sort_field, path, id)` —
-    /// stable under concurrent upserts (IDX-024). The SQL itself is
-    /// assembled by [`crate::repo::catalog_sql`].
     async fn search(
         &self,
         scope: rstore_catalog::Scope,
@@ -356,17 +340,15 @@ impl rstore_catalog::CatalogQuery for SqliteRemoteObjectRepository {
         sort: rstore_catalog::FileSort,
         page: &rstore_catalog::PageRequest,
     ) -> Result<rstore_catalog::Page<RemoteObject>> {
+        let limit = page.limit.max(1);
         let query = super::catalog_sql::CatalogSql::select(COLUMNS, &scope.workspace, filter)?;
         let query = match &page.after {
             Some(cursor) => query.ordered_after(sort, cursor)?,
             None => query,
         };
-        let mut rows = query
-            .ordered(sort, page.limit)
-            .fetch(&self.read_pool)
-            .await?;
-        let has_more = rows.len() > page.limit as usize;
-        rows.truncate(page.limit as usize);
+        let mut rows = query.ordered(sort, limit).fetch(&self.read_pool).await?;
+        let has_more = rows.len() > limit as usize;
+        rows.truncate(limit as usize);
         let items: Vec<RemoteObject> =
             rows.into_iter().map(row_to_object).collect::<Result<_>>()?;
         let next_cursor = if has_more {
@@ -387,8 +369,10 @@ impl rstore_catalog::CatalogQuery for SqliteRemoteObjectRepository {
         let rows = super::catalog_sql::CatalogSql::count(&scope.workspace, filter)?
             .fetch(&self.read_pool)
             .await?;
-        let reader = RowReader::new(rows.into_iter().next().expect("COUNT returns one row"));
-        Ok(reader.integer("n")? as u64)
+        let Some(row) = rows.into_iter().next() else {
+            return Err(Error::database("count query returned no scalar row"));
+        };
+        Ok(RowReader::new(row).integer("n")? as u64)
     }
 
     async fn page(
@@ -399,10 +383,6 @@ impl rstore_catalog::CatalogQuery for SqliteRemoteObjectRepository {
         page: &rstore_catalog::PageRequest,
     ) -> Result<rstore_catalog::CatalogPage> {
         let limit = page.limit.max(1);
-        // Count and page rows from one read transaction. The count is taken
-        // before applying the keyset cursor, so `total` remains the full
-        // filtered relation on every page and on the empty page after the
-        // final cursor.
         let mut read = self.read_pool.begin().await.map_err(map_sqlx)?;
         let total_rows = super::catalog_sql::CatalogSql::count(&scope.workspace, filter)?
             .fetch(&mut *read)
@@ -411,7 +391,7 @@ impl rstore_catalog::CatalogQuery for SqliteRemoteObjectRepository {
             total_rows
                 .into_iter()
                 .next()
-                .expect("COUNT returns one row"),
+                .ok_or_else(|| Error::database("count query returned no scalar row"))?,
         )
         .integer("n")? as u64;
         let query = super::catalog_sql::CatalogSql::page(COLUMNS, &scope.workspace, filter)?;

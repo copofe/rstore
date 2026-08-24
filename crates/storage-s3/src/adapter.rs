@@ -1,8 +1,8 @@
-//! The S3-compatible [`Storage`] implementation (CORE-004 / STORE-008..014).
+//! The S3-compatible [`Storage`] implementation.
 //!
-//! `list`, `stat`, `read`, `put`, `delete`, server-side `copy` (STORE-016)
-//! and `presign` (STORE-017) are implemented; `copy` is verified against
-//! MinIO through the shared storage contract.
+//! `list`, `stat`, `read`, `put`, `delete`, server-side `copy` and
+//! `presign` are implemented; `copy` is verified against MinIO through the
+//! shared storage contract.
 
 use async_trait::async_trait;
 use aws_sdk_s3::primitives::ByteStream;
@@ -15,6 +15,8 @@ use rstore_storage_api::model::{
     PresignMethod, PresignRequest, PresignedUrl, PutOptions, ReadRange, UploadedPart,
 };
 use rstore_storage_api::{MultipartSession, Storage};
+
+use std::num::NonZeroU64;
 
 use crate::multipart::S3MultipartSession;
 use time::OffsetDateTime;
@@ -40,12 +42,12 @@ impl S3Storage {
         }
     }
 
-    /// The provider-fixed atomic copy limit, lowered by tests only.
-    pub fn with_single_copy_limit(client: aws_sdk_s3::Client, limit: u64) -> Self {
-        assert!(limit > 0, "copy limit must be positive");
+    /// The provider-fixed atomic copy limit, lowered by tests only. `NonZero`
+    /// makes a zero limit unrepresentable instead of a runtime panic.
+    pub fn with_single_copy_limit(client: aws_sdk_s3::Client, limit: NonZeroU64) -> Self {
         Self {
             client,
-            single_copy_limit: limit,
+            single_copy_limit: limit.get(),
         }
     }
 
@@ -305,11 +307,11 @@ impl Storage for S3Storage {
         Ok(meta)
     }
 
-    /// Server-side copy (STORE-016): one `CopyObject` action up to S3's
-    /// 5 GiB atomic limit, a part-copy session beyond it — no object
-    /// bytes transit the local device either way. The target's metadata is
-    /// derived from the caller's source stat plus the provider's copy result
-    /// (which carries the new ETag and modification time but no size).
+    /// Server-side copy: one `CopyObject` action up to S3's 5 GiB atomic
+    /// limit, a part-copy session beyond it — no object bytes transit the
+    /// local device either way. The target's metadata is derived from the
+    /// caller's source stat plus the provider's copy result (which carries
+    /// the new ETag and modification time but no size).
     async fn copy(&self, req: &CopyRequest, source: &ObjectMetadata) -> Result<ObjectMetadata> {
         let copy_source = copy_source_header(&req.source_bucket, req.source_key.as_str());
         if source.size <= self.single_copy_limit {
@@ -377,9 +379,9 @@ impl Storage for S3Storage {
         )))
     }
 
-    /// Generate a presigned URL locally (STORE-017 / LINK-005): the request is
-    /// never sent, so no credentials touch the network and the signature
-    /// query stays out of logs (LINK-012).
+    /// Generate a presigned URL locally: the request itself is never sent,
+    /// so no credentials touch the network and the signature query stays
+    /// out of logs.
     async fn presign(&self, req: &PresignRequest) -> Result<PresignedUrl> {
         use aws_sdk_s3::presigning::PresigningConfig;
         let config = PresigningConfig::expires_in(std::time::Duration::from_secs(req.ttl_seconds))

@@ -1,7 +1,6 @@
-//! Seam test (QA-003 / CORE-005): the file list runs against the
-//! in-memory catalog adapter through the composition root, proving
-//! `with_catalog` reaches every service the catalog seam touches — no
-//! hand-assembled wiring required.
+//! Seam test: the catalog file list runs against the in-memory adapter
+//! through the composition root, proving `with_catalog` reaches every
+//! service the catalog seam touches — no hand-assembled wiring required.
 
 use std::sync::Arc;
 
@@ -24,7 +23,7 @@ async fn files_list_runs_over_the_in_memory_catalog() {
     let db = Database::open_in_memory().await.unwrap();
     let now = OffsetDateTime::now_utc();
     let conn = ConnectionConfig {
-        id: rstore_domain::ConnectionId::new(),
+        id: rstore_domain::ConnectionId::new_random(),
         name: "nas".into(),
         endpoint: "http://localhost:9000".into(),
         public_base_url: None,
@@ -41,7 +40,7 @@ async fn files_list_runs_over_the_in_memory_catalog() {
     };
     db.connections().insert(&conn).await.unwrap();
     let bucket = Bucket {
-        id: BucketId::new(),
+        id: BucketId::new_random(),
         connection_id: conn.id,
         name: "media".into(),
         config: BucketConfig::default(),
@@ -50,7 +49,7 @@ async fn files_list_runs_over_the_in_memory_catalog() {
     };
     db.buckets().insert(&bucket).await.unwrap();
     let workspace = Workspace {
-        id: WorkspaceId::new(),
+        id: WorkspaceId::new_random(),
         name: "w".into(),
         description: None,
         created_at: now,
@@ -68,7 +67,7 @@ async fn files_list_runs_over_the_in_memory_catalog() {
     catalog.add_bucket(workspace.id, bucket.id);
     catalog
         .upsert(&RemoteObject {
-            id: RemoteObjectId::new(),
+            id: RemoteObjectId::new_random(),
             connection_id: conn.id,
             bucket_id: bucket.id,
             path: ObjectPath::new("photos/pic.bmp").unwrap(),

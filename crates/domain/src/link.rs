@@ -1,4 +1,4 @@
-//! Per-bucket link settings (LINK-003..007): URL overrides and permissions.
+//! Per-bucket link settings: URL overrides and permissions.
 
 /// Link generation settings for one bucket. Stored in `link_profiles`
 /// (one row per bucket, defaults when absent).
@@ -12,7 +12,7 @@ pub struct LinkProfile {
     pub allow_public_url: bool,
     /// Whether presigned URLs may be produced for this bucket.
     pub allow_presigned: bool,
-    /// TTL used when `--signed` carries no explicit `--ttl` (LINK-006).
+    /// TTL used when `--signed` carries no explicit `--ttl`.
     pub default_ttl_seconds: u64,
 }
 

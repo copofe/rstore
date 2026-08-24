@@ -1,5 +1,5 @@
 //! Shared behavioral contract for every catalog adapter behind the
-//! `RemoteObjectRepository` / `CatalogQuery` seam (QA-003, MIX-, IDX-024).
+//! `RemoteObjectRepository` / `CatalogQuery` seam.
 //!
 //! The same suite runs against the SQLite repositories and the in-memory
 //! reference implementation. It pins the semantics the two adapters drifted
@@ -34,9 +34,9 @@ pub trait CatalogFixture: Send + Sync {
     /// need them; idempotent, so it can be called per topology unit.
     async fn seed(&self, connection: &ConnectionConfig, bucket: &Bucket, workspace: &Workspace);
     /// Register query-scope membership — the SQL adapters' `workspace_buckets`
-    /// join (WSP-).
+    /// join.
     async fn add_bucket_to_workspace(&self, workspace: WorkspaceId, bucket: BucketId);
-    /// Record a tag association for the filter cases (TAG-).
+    /// Record a tag association for the filter cases.
     async fn tag_object(&self, workspace: WorkspaceId, object: RemoteObjectId, tag: TagId);
 }
 
@@ -70,7 +70,7 @@ fn order_key(o: &RemoteObject, field: SortField) -> (SortKey, String, String) {
         SortField::Name => SortKey::Text(o.path.file_name().to_string()),
         SortField::Size => SortKey::Num(o.size as i64),
         SortField::Modified => SortKey::Num(o.last_modified.unix_timestamp()),
-        // MIX-015: the domain classifier is the sort key (never the
+        // The domain classifier is the sort key (never the
         // provider-supplied content type).
         SortField::Type => SortKey::Text(o.type_hint().as_str().to_string()),
         SortField::Bucket => SortKey::Text(o.bucket_id.as_uuid().to_string()),
@@ -89,7 +89,7 @@ fn t(secs: i64) -> OffsetDateTime {
 
 fn conn(name: &str) -> ConnectionConfig {
     ConnectionConfig {
-        id: rstore_domain::ConnectionId::new(),
+        id: rstore_domain::ConnectionId::new_random(),
         name: name.into(),
         endpoint: "https://s3.example.com".into(),
         public_base_url: None,
@@ -108,7 +108,7 @@ fn conn(name: &str) -> ConnectionConfig {
 
 fn bucket(connection: rstore_domain::ConnectionId, name: &str) -> Bucket {
     Bucket {
-        id: BucketId::new(),
+        id: BucketId::new_random(),
         connection_id: connection,
         name: name.into(),
         config: rstore_domain::bucket::BucketConfig::default(),
@@ -127,7 +127,7 @@ fn obj(
     content_type: Option<&str>,
 ) -> RemoteObject {
     RemoteObject {
-        id: RemoteObjectId::new(),
+        id: RemoteObjectId::new_random(),
         connection_id: connection,
         bucket_id: bucket,
         path: ObjectPath::new(path).expect("contract path"),
@@ -179,7 +179,7 @@ async fn walk(
 }
 
 /// A walk that upserts `mid_walk` after its first page, inside the run —
-/// the cursor stability case (IDX-024).
+/// the cursor-stability case.
 async fn walk_with_midwalk_upsert(
     query: &dyn CatalogQuery,
     objects: &dyn RemoteObjectRepository,
@@ -216,14 +216,14 @@ async fn walk_with_midwalk_upsert(
 pub async fn catalog_contract(fx: &dyn CatalogFixture) {
     // --- topology -----------------------------------------------------------
     let ws = Workspace {
-        id: WorkspaceId::new(),
+        id: WorkspaceId::new_random(),
         name: "w".into(),
         description: None,
         created_at: t(0),
         updated_at: t(0),
     };
     let ws2 = Workspace {
-        id: WorkspaceId::new(),
+        id: WorkspaceId::new_random(),
         name: "w2".into(),
         description: None,
         created_at: t(0),
@@ -305,7 +305,7 @@ pub async fn catalog_contract(fx: &dyn CatalogFixture) {
         None,
     );
     // Same size and path in two member buckets: only the id tie-break
-    // separates them (IDX-024 total order).
+    // separates them in the total order.
     let o8 = obj(
         conn_a.id,
         mem1.id,
@@ -369,7 +369,7 @@ pub async fn catalog_contract(fx: &dyn CatalogFixture) {
     assert_eq!(typed.content_type.as_deref(), Some("image/png"));
     assert_eq!(typed.last_modified, t(1000));
 
-    // --- state filter and workspace scoping (MIX-022 / WSP-) -----------------
+    // --- state filter and workspace scoping -----------------------------------
     assert_eq!(
         count_filtered(&*query, scope, &default).await,
         7,
@@ -417,7 +417,7 @@ pub async fn catalog_contract(fx: &dyn CatalogFixture) {
         "non-member bucket rows never leak into the scope"
     );
 
-    // --- filters (MIX-011..021) ----------------------------------------------
+    // --- filters ----------------------------------------------------------------
     for (case, filter, want) in [
         (
             "name",
@@ -508,7 +508,8 @@ pub async fn catalog_contract(fx: &dyn CatalogFixture) {
     }
     for (kind, want) in [
         (FileType::Image, 2u64),
-        (FileType::Document, 1),
+        // report.pdf plus the .txt rows (extension classification).
+        (FileType::Document, 4),
         (FileType::Archive, 1),
     ] {
         assert_eq!(
@@ -526,9 +527,9 @@ pub async fn catalog_contract(fx: &dyn CatalogFixture) {
         );
     }
 
-    // --- tags (TAG- / MIX-019) ------------------------------------------------
-    let red = TagId::new();
-    let green = TagId::new();
+    // --- tags --------------------------------------------------------------------
+    let red = TagId::new_random();
+    let green = TagId::new_random();
     fx.tag_object(ws.id, o1.id, red).await;
     fx.tag_object(ws2.id, o3.id, green).await;
 
@@ -737,7 +738,7 @@ pub async fn catalog_contract(fx: &dyn CatalogFixture) {
         );
     }
 
-    // --- keyset stability under mid-walk upserts (IDX-024) --------------------
+    // --- keyset stability under mid-walk upserts ---------------------------------
     let name_desc = FileSort {
         field: SortField::Name,
         order: SortOrder::Desc,

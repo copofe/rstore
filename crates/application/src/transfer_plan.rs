@@ -1,8 +1,6 @@
-//! Stateless transfer planning.
-//!
-//! This module validates plans before adapter construction, expands local
-//! upload trees or remote download prefixes, mirrors paths, and constructs
-//! typed engine items. Transfer execution remains in `transfer`.
+//! Plan validation and expansion for uploads and downloads: turns a user
+//! plan into concrete [`EngineItem`]s before any storage endpoint is built,
+//! so local validation errors never pay the cost of adapter construction.
 
 use std::path::{Path, PathBuf};
 
@@ -14,31 +12,35 @@ use rstore_transfer::{DownloadRequest, UploadRequest};
 
 use crate::connection::ConnectionRef;
 
-/// An upload target: local path(s) plus a `conn/bucket/prefix/` base.
+/// A pending upload: local sources into one bucket under a key prefix.
 #[derive(Debug, Clone)]
 pub struct UploadPlan {
     pub connection: ConnectionRef,
     pub bucket: String,
-    /// Key prefix under the bucket ("" = root).
+
+    /// Key prefix applied to every uploaded object.
     pub prefix: String,
+    /// Local files or directories (directories only with `recursive`).
     pub sources: Vec<PathBuf>,
     pub conflict: ConflictPolicy,
     pub recursive: bool,
 }
 
-/// A download target: `conn/bucket/key…` plus a local base.
+/// A pending download: remote objects under a prefix onto a local target.
 #[derive(Debug, Clone)]
 pub struct DownloadPlan {
     pub connection: ConnectionRef,
     pub bucket: String,
-    /// Remote prefix to fetch (recursively lists when `recursive`).
+
+    /// Object key or directory-style prefix (trailing `/`) to fetch.
     pub prefix: String,
+    /// Local file (single object) or directory (expanded tree).
     pub target: PathBuf,
     pub conflict: ConflictPolicy,
     pub recursive: bool,
 }
 
-/// One typed item ready for the transfer engine.
+/// One executable unit handed to the transfer engine.
 pub(crate) enum EngineItem {
     Upload(UploadRequest),
     Download {
@@ -62,13 +64,13 @@ impl EngineItem {
         }
     }
 
+    /// Wraps the item as a job-run record carrying its display labels.
     pub(crate) fn into_run_item(self) -> crate::job_run::RunItem<Self> {
         let (job_label, source, target) = self.labels();
         crate::job_run::RunItem::new(job_label, source, target, self)
     }
 
-    /// The dry-run narration: what a real run would do with this item — the
-    /// same "would \<verb\> \<target\>" grammar cp/rm use.
+    /// Human-readable dry-run description of the pending operation.
     pub(crate) fn preview(&self) -> String {
         match self {
             Self::Upload(request) => format!(
@@ -83,16 +85,20 @@ impl EngineItem {
     }
 }
 
-/// Validated, expanded upload input. It is produced before resolving a remote
-/// endpoint, so local input failures never construct an adapter.
+/// Upload pairs resolved against a concrete connection and bucket.
 pub(crate) struct PreparedUpload {
     pairs: Vec<(PathBuf, ObjectPath)>,
     conflict: ConflictPolicy,
 }
 
-/// Expand local sources while preserving their tree beneath `plan.prefix`.
-/// This function needs only the local filesystem and is the direct planning
-/// test surface.
+/// Maps local sources to (path, object key) pairs without touching storage.
+///
+/// Recursive directory sources are walked relative to the source root so each
+/// file keeps its nested structure under the plan prefix.
+///
+/// # Errors
+/// Returns `not_found` for missing paths or directories without `recursive`,
+/// and `invalid_input` when expansion yields no uploadable file.
 pub fn expand_upload(plan: &UploadPlan) -> Result<Vec<(PathBuf, ObjectPath)>> {
     let mut raw = Vec::new();
     for source in &plan.sources {
@@ -121,6 +127,10 @@ pub fn expand_upload(plan: &UploadPlan) -> Result<Vec<(PathBuf, ObjectPath)>> {
         .collect()
 }
 
+/// Expands and validates an upload plan entirely on local inputs.
+///
+/// Cheap enough to run before endpoint resolution; rejects empty plans here
+/// so no storage adapter is ever built for them.
 pub(crate) fn prepare_upload(plan: &UploadPlan) -> Result<PreparedUpload> {
     let pairs = expand_upload(plan)?;
     if pairs.is_empty() {
@@ -132,12 +142,12 @@ pub(crate) fn prepare_upload(plan: &UploadPlan) -> Result<PreparedUpload> {
     })
 }
 
+/// Binds prepared upload pairs to a resolved endpoint as engine items.
 pub(crate) fn upload_items(
     prepared: PreparedUpload,
     connection: ConnectionId,
     bucket: &str,
 ) -> Vec<EngineItem> {
-    let connection = connection.to_string();
     prepared
         .pairs
         .into_iter()
@@ -148,15 +158,13 @@ pub(crate) fn upload_items(
                 source,
                 content_type: None,
                 conflict: prepared.conflict,
-                connection: connection.clone(),
+                connection,
             })
         })
         .collect()
 }
 
-/// Locally validated download input: the source key plus whether it pairs
-/// as a directory (expansion) or an exact object. Validation runs before
-/// resolving or constructing a remote adapter.
+/// Download entries resolved against a concrete endpoint.
 pub(crate) struct PreparedDownload {
     key: String,
     expand: bool,
@@ -166,9 +174,14 @@ pub(crate) struct PreparedDownload {
     mirror_into_directory: bool,
 }
 
+/// Validates a download plan against local rules only, never storage.
+///
+/// Directory references require `recursive` up front, and an unslashed prefix
+/// is checked as a valid exact key so malformed input fails before the
+/// endpoint is resolved. An existing-directory target (or recursion) mirrors
+/// the remote tree beneath it; otherwise every entry lands on `target`.
 pub(crate) fn prepare_download(plan: &DownloadPlan) -> Result<PreparedDownload> {
-    // The shared validation arm; download preparation re-runs it locally so
-    // bad syntax never constructs an adapter.
+    // Directory syntax must be rejected locally; storage is not consulted yet.
     crate::expand::require_recursive(&plan.prefix, &plan.prefix, plan.recursive)?;
     let expand = crate::expand::is_directory_ref(&plan.prefix);
     if !expand {
@@ -184,8 +197,10 @@ pub(crate) fn prepare_download(plan: &DownloadPlan) -> Result<PreparedDownload> 
     })
 }
 
-/// Expand a validated download against one already-resolved adapter and build
-/// typed engine items with canonical source labels.
+/// Lists the objects behind a prepared download and turns them into items.
+///
+/// # Errors
+/// Returns `not_found` when the prefix matches no stored objects.
 pub(crate) async fn download_items(
     prepared: PreparedDownload,
     connection: ConnectionId,
@@ -222,6 +237,7 @@ pub(crate) async fn download_items(
         .collect())
 }
 
+/// Recursively collects files under `root`, recording keys relative to it.
 fn collect_files(root: &Path, current: &Path, out: &mut Vec<(PathBuf, String)>) -> Result<()> {
     let entries = std::fs::read_dir(current)
         .map_err(|error| Error::database("read directory").with_source(error))?;
@@ -241,6 +257,8 @@ fn collect_files(root: &Path, current: &Path, out: &mut Vec<(PathBuf, String)>) 
     Ok(())
 }
 
+/// Joins a name onto a prefix, inserting `/` unless the prefix already ends
+/// with one (or is empty).
 fn join_key(prefix: &str, name: &str) -> String {
     if prefix.is_empty() {
         name.to_string()
@@ -359,7 +377,7 @@ mod tests {
         let target = temp_dir("download-mirror");
         let prepared = prepare_download(&download_plan("docs/", target.clone(), true)).unwrap();
 
-        let items = download_items(prepared, ConnectionId::new(), "media", &storage)
+        let items = download_items(prepared, ConnectionId::new_random(), "media", &storage)
             .await
             .unwrap();
         let mut targets = items
@@ -391,7 +409,7 @@ mod tests {
         let prepared =
             prepare_download(&download_plan("docs/", temp_dir("download-sibling"), true)).unwrap();
 
-        let items = download_items(prepared, ConnectionId::new(), "media", &storage)
+        let items = download_items(prepared, ConnectionId::new_random(), "media", &storage)
             .await
             .unwrap();
         let keys = items
@@ -428,7 +446,7 @@ mod tests {
         ))
         .unwrap();
 
-        let items = download_items(prepared, ConnectionId::new(), "media", &storage)
+        let items = download_items(prepared, ConnectionId::new_random(), "media", &storage)
             .await
             .unwrap();
         let keys = items

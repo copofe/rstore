@@ -1,5 +1,5 @@
-//! The in-memory reference adapter runs the shared catalog contract
-//! (QA-003): the same suite the SQLite repositories must pass.
+//! The in-memory reference adapter runs the shared catalog contract: the
+//! same suite the SQLite repositories must pass.
 
 use std::sync::Arc;
 

@@ -1,9 +1,6 @@
-//! Shared service-test fixture reachable from integration tests through the
-//! `test-util` feature.
-//!
-//! One builder for an Application with registered connections and buckets over
-//! FakeStorage. Connections get fake endpoints and test credentials; buckets
-//! are added with default config.
+//! Test fixtures for application-layer tests: assemble an [`Application`]
+//! over an in-memory database backed by a fake storage factory, with
+//! connections and buckets pre-registered.
 
 use std::sync::Arc;
 
@@ -15,23 +12,16 @@ use rstore_domain::Clock;
 use rstore_persistence::Database;
 use rstore_test_support::FakeStorageFactory;
 
-/// Assemble the SQLite-backed test graph without exposing a database handle
-/// from the production `Application` API.
-///
-/// Deliberately routes through `rstore_persistence::assemble` — the same
-/// assembly point `bootstrap::Runtime::open` uses — so a store added to the
-/// production wiring is automatically visible to every service test.
-/// Skips [`Application::initialize`](crate::app::Application::initialize):
-/// construction stays deterministic; startup recovery rules are covered by
-/// the bootstrap integration test instead.
+/// Assemble an [`Application`] from an existing database using the
+/// production dependency wiring.
 pub fn application_from_db(db: Database) -> Application {
-    let clock: Arc<dyn Clock> = Arc::new(rstore_domain::SystemClock);
-    Application::from_dependencies(rstore_persistence::assemble(&db, None, clock))
+    Application::from_dependencies(rstore_persistence::assemble(&db, None))
 }
 
-/// Build an [`Application`] over in-memory SQLite + fake storage with the
-/// given topology: `conns` are connection names, `buckets` are
-/// `(connection, bucket)` pairs registered against them.
+/// An application over an in-memory database with a fake storage factory
+/// and the given connections (`names`) and buckets (`connection, bucket`
+/// pairs). Connections get distinct localhost endpoints and placeholder
+/// credentials; every registration asserts success.
 pub async fn app_with(
     conns: &[&str],
     buckets: &[(&str, &str)],
@@ -39,8 +29,8 @@ pub async fn app_with(
     wire(conns, buckets, None).await
 }
 
-/// [`app_with`] with an injected clock, for expiry-sensitive behaviour
-/// (tombstone GC, retention).
+/// [`app_with`] plus a caller-controlled clock, for tests that assert on
+/// timestamps.
 pub async fn app_with_clock(
     conns: &[&str],
     buckets: &[(&str, &str)],
@@ -49,7 +39,7 @@ pub async fn app_with_clock(
     wire(conns, buckets, Some(clock)).await
 }
 
-/// An app with an empty registry, used by import tests.
+/// An application with a fake storage factory and an empty registry.
 pub async fn app_with_empty_registry() -> Application {
     let factory = Arc::new(FakeStorageFactory::new());
     application_from_db(Database::open_in_memory().await.unwrap()).with_storage_factory(factory)

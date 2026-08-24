@@ -1,8 +1,8 @@
-//! Transfer engine (CORE-006).
+//! Resumable, cancellable upload/download engine over a
+//! [`rstore_storage_api::Storage`] adapter.
 //!
-//! The engine streams uploads and downloads with resumable checkpoints,
-//! retries provider-classified transient errors, and shares cooperative
-//! cancellation with copy, move, relay and indexing.
+//! Retries live at the storage seam ([`RetryingStorage`]); cooperative
+//! cancellation is shared with copy, move, relay and indexing callers.
 
 pub mod cancel;
 mod conflict;

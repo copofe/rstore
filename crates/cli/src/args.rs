@@ -1,7 +1,6 @@
-//! Command-line argument definitions (CLI-001).
-//!
-//! The command tree is the CLI presentation contract. Every command is
-//! dispatched through the Bootstrap-created Application API.
+//! Command-line argument definitions: the full clap command tree of the CLI.
+//! Every command is dispatched through the Bootstrap-created Application API,
+//! and [`Command::path`] feeds the envelope `command` field.
 
 use std::path::PathBuf;
 
@@ -38,6 +37,7 @@ pub struct Cli {
     pub command: Command,
 }
 
+/// The top-level command grammar; variant order matches help output.
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Manage storage connections.
@@ -91,7 +91,7 @@ pub enum Command {
         uris: Vec<String>,
         /// Delete every object under a prefix URI; the
         /// confirmation count is precomputed from the listing.
-        #[arg(long)]
+        #[arg(long, short = 'r')]
         recursive: bool,
         /// Preview without deleting anything.
         #[arg(long)]
@@ -221,8 +221,8 @@ impl Command {
     }
 }
 
-/// Top-level command domains derived from clap's command tree. Command names
-/// therefore live in the enum/path table, never in a third manual list.
+/// Top-level command domains derived from clap's command tree, so command
+/// names live in the enum/path table and never in a second manual list.
 pub fn command_domains() -> Vec<String> {
     Cli::command()
         .get_subcommands()
@@ -265,6 +265,7 @@ pub enum ConnectionCommand {
     },
 }
 
+/// Arguments for `connection edit`; only the flags passed change the record.
 #[derive(Args, Debug)]
 pub struct ConnectionEditArgs {
     /// Connection to edit (name or `conn_…` id).
@@ -328,6 +329,7 @@ pub enum BucketCommand {
     },
 }
 
+/// Arguments for `bucket add`.
 #[derive(Args, Debug)]
 pub struct BucketAddArgs {
     /// Connection the bucket belongs to (name or `conn_…` id).
@@ -353,6 +355,7 @@ pub struct BucketAddArgs {
     pub skip_verify: bool,
 }
 
+/// Arguments for `bucket edit`; only the flags passed change the record.
 #[derive(Args, Debug)]
 pub struct BucketEditArgs {
     /// Bucket to edit (`bkt_…` id, `<connection>/<name>`, or bare name).
@@ -382,7 +385,7 @@ pub struct BucketEditArgs {
 }
 
 /// The link-profile flag set `bucket edit` and `bucket link set` share —
-/// one spelling of the five editable profile knobs (LKT-flags).
+/// one spelling of the five editable profile knobs.
 #[derive(Args, Debug, Default)]
 pub struct LinkProfileFlags {
     /// Public-object base override for this bucket; an empty value clears it.
@@ -452,7 +455,7 @@ pub enum RemoteCommand {
         /// `<connection>/<bucket>/[prefix/]` (or bare `<bucket>/…`) —
         /// trailing `/` lists.
         uri: String,
-        /// Continuation token from the previous page.
+        /// Continuation token from the prior page.
         #[arg(long)]
         cursor: Option<String>,
         /// Page size.
@@ -466,7 +469,7 @@ pub enum RemoteCommand {
     Stat { uri: String },
 }
 
-/// Shared transfer flags (UP-/DOWN-).
+/// Shared transfer flags for upload and download.
 #[derive(Args, Debug)]
 pub struct TransferArgs {
     /// Sources: local paths for upload; remote references
@@ -639,6 +642,7 @@ pub enum FilesCommand {
         /// `name:size:modified:type` + `asc|desc`, e.g. `size:desc`.
         #[arg(long, default_value = "modified:desc")]
         sort: String,
+        /// Page size.
         #[arg(long, default_value_t = 50)]
         limit: u32,
         /// Cursor from the previous page.
@@ -709,6 +713,9 @@ pub enum TagCommand {
         source: String,
         /// Tag that keeps the associations.
         target: String,
+        /// Skip the confirmation prompt (non-interactive runs require it).
+        #[arg(long)]
+        yes: bool,
     },
     /// Attach tags to an object.
     Add {
@@ -789,7 +796,7 @@ pub struct CopyArgs {
     #[arg(long)]
     pub yes: bool,
     /// Copy/move every object under a source prefix.
-    #[arg(long)]
+    #[arg(long, short = 'r')]
     pub recursive: bool,
     /// Carry tag associations from source to target.
     #[arg(long)]
@@ -825,5 +832,8 @@ pub enum CatalogCommand {
         /// Override the retention setting: plain seconds or 30m/1h/1d/2w.
         #[arg(long)]
         retention: Option<String>,
+        /// Skip the confirmation prompt (non-interactive runs require it).
+        #[arg(long)]
+        yes: bool,
     },
 }

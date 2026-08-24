@@ -1,41 +1,45 @@
 //! One renderer for batch per-item results.
 //!
-//! Every command that reports one line per URI — upload/download, cp/mv, rm —
-//! renders through [`BatchLines`]: a padded marker, the item label, an
-//! indented detail line. Marker text comes from [`Outcome::marker`] /
-//! [`RemoveOutcome::marker`], and the exit-13 partial-failure policy
-//! (DEL-011 / PRD §11.3) comes from [`with_partial_failure`], so a new batch
-//! command gets the same grammar and exit semantics for free. The JSON
-//! envelopes stay per-command — they are view types at the service seam, not
-//! one shape.
+//! Every command that reports one line per URI — upload/download, cp/mv,
+//! rm, tag attach/detach — renders through [`BatchLines`]: a padded marker,
+//! the item label, an indented detail line. Marker text comes from
+//! `outcome_marker` / `remove_marker`, and the exit policy lives here too:
+//! any failed item exits 13 while every per-item result is still printed,
+//! and an interrupted run exits 130 after the envelope is emitted. A new
+//! batch command inherits the same grammar and exit semantics for free.
+//! The JSON envelopes stay per-command — they are view types at the service
+//! seam, not one shape.
 
-use rstore_application::{Outcome, RemoveOutcome, TransferReportItem};
+use rstore_application::{Disposition, Severity, SkipReason, TransferReportItem};
 
 use crate::output::HandlerOutput;
 
 use super::HandlerResult;
 
-/// Marker text for a copy/move/transfer item outcome.
-pub(super) fn outcome_marker(outcome: Outcome) -> &'static str {
-    match outcome {
-        Outcome::Succeeded => "ok",
-        Outcome::Skipped => "skipped",
-        Outcome::Failed => "failed",
-        Outcome::Blocked => "blocked",
+/// Marker text for a transfer-shaped item (upload/download/cp/mv): the
+/// unified disposition renders to the same glyphs as before the vocabulary
+/// existed.
+pub(super) fn outcome_marker(disposition: &Disposition) -> &'static str {
+    match disposition {
+        Disposition::Succeeded => "ok",
+        Disposition::Skipped(_) => "skipped",
+        Disposition::Blocked(_) => "blocked",
+        Disposition::Failed(_) => "failed",
     }
 }
 
-/// Marker text for an rm item outcome.
-pub(super) fn remove_marker(outcome: RemoveOutcome) -> &'static str {
-    match outcome {
-        RemoveOutcome::Deleted => "deleted",
-        RemoveOutcome::WouldDelete => "would-delete",
-        RemoveOutcome::GuardBlocked => "blocked",
-        RemoveOutcome::Failed => "failed",
+/// Marker text for an rm item: removals keep their deletion-flavoured
+/// success and dry-run glyphs.
+pub(super) fn remove_marker(disposition: &Disposition) -> &'static str {
+    match disposition {
+        Disposition::Succeeded => "deleted",
+        Disposition::Skipped(SkipReason::DryRun) => "would-delete",
+        Disposition::Skipped(_) | Disposition::Blocked(_) => "blocked",
+        Disposition::Failed(_) => "failed",
     }
 }
 
-/// Accumulates `  {marker:<width}} {label}` lines with indented details.
+/// Accumulates `  {marker:<width} {label}` lines with indented details.
 pub(super) struct BatchLines {
     buf: String,
     marker_width: usize,
@@ -51,8 +55,8 @@ impl BatchLines {
         }
     }
 
-    /// One item line; a `detail` (when the command shows it) indents under
-    /// the label.
+    /// Appends one item line; `detail`, when the command shows it, indents
+    /// under the label.
     pub fn push(&mut self, marker: &str, label: &str, detail: Option<&str>) {
         self.buf.push_str(&format!(
             "  {:<width$} {}\n",
@@ -75,14 +79,12 @@ impl BatchLines {
     }
 }
 
-/// Apply the partial-failure exit policy: some items failed and some
-/// succeeded → exit 13 while still printing every per-item result (DEL-011).
-pub(super) fn with_partial_failure(
-    mut out: HandlerOutput,
-    failed: usize,
-    succeeded: usize,
-) -> HandlerOutput {
-    if failed > 0 && succeeded > 0 {
+/// Applies the severity policy from the unified batch vocabulary: a
+/// `Severity::Failed` batch exits 13 while every per-item result is still
+/// printed. The single home of "did this batch succeed" for every entry
+/// layer — CLI exit codes here, desktop semantics from the same value.
+pub(super) fn with_severity(mut out: HandlerOutput, severity: Severity) -> HandlerOutput {
+    if severity == Severity::Failed {
         out = out.with_exit_code(13);
     }
     out
@@ -96,22 +98,21 @@ pub(super) struct BatchEntry {
     pub detail: Option<String>,
 }
 
-/// Batch-level facts the grammar needs beyond its lines.
 pub(super) struct BatchFacts {
     /// The closing summary line (omitted when the dry-run banner says it all).
     pub summary: Option<String>,
     pub interrupted: bool,
-    pub failed: usize,
-    pub succeeded: usize,
+    /// The batch verdict from the application core — the only input to the
+    /// exit policy.
+    pub severity: Severity,
 }
 
-/// One batch-report grammar: the optional dry-run banner, one
-/// [`BatchLines`] line per entry, an optional summary line, and the exit
-/// policy — 130 with `interrupt_hint` when the run was interrupted, else the
-/// partial-failure 13. Transfer-shaped callers go through [`render_batch`];
-/// rm and tag map their outcomes onto [`BatchEntry`] directly. (`url` is a
-/// deliberate exception: its human output is one pipeable link per line, not
-/// a per-item report.)
+/// Renders one batch report: the optional dry-run banner, one [`BatchLines`]
+/// line per entry, an optional summary line, and the exit policy — 130 with
+/// `interrupt_hint` when the run was interrupted, else the partial-failure 13.
+/// Transfer-shaped callers go through [`render_batch`]; rm and tag map their
+/// outcomes onto [`BatchEntry`] directly. (`url` is a deliberate exception:
+/// its human output is one pipeable link per line, not a per-item report.)
 pub(super) fn render_entries(
     data: serde_json::Value,
     dry_banner: Option<&str>,
@@ -138,10 +139,10 @@ pub(super) fn render_entries(
     if facts.interrupted {
         out = out
             .with_warning(format!("interrupted (Ctrl+C) — {interrupt_hint}"))
-            // CLI-013: SIGINT exits 130 after the envelope is emitted.
+            // SIGINT still prints the full envelope before exiting.
             .with_exit_code(130);
     } else {
-        out = with_partial_failure(out, facts.failed, facts.succeeded);
+        out = with_severity(out, facts.severity);
     }
     Ok(out)
 }
@@ -155,11 +156,10 @@ pub(super) fn render_batch<'a>(
     items: impl IntoIterator<Item = &'a TransferReportItem>,
     summary: String,
     interrupted: bool,
-    failed: usize,
-    succeeded: usize,
+    severity: Severity,
 ) -> HandlerResult {
     let entries = items.into_iter().map(|item| BatchEntry {
-        marker: outcome_marker(item.outcome).to_string(),
+        marker: outcome_marker(&item.disposition).to_string(),
         label: format!("{} → {}", item.source, item.target),
         detail: item.detail.clone(),
     });
@@ -171,8 +171,7 @@ pub(super) fn render_batch<'a>(
         &BatchFacts {
             summary: Some(summary),
             interrupted,
-            failed,
-            succeeded,
+            severity,
         },
     )
 }

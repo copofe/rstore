@@ -1,13 +1,12 @@
-//! Storage connection domain model (CON-/DATA-).
+//! Storage connection configuration model.
 //!
-//! ConnectionConfig holds the complete local connection configuration,
-//! including credentials wrapped in Secret. Credential values are persisted
-//! with the connection but skipped by serde so they never enter export JSON or
-//! logs (SEC-001).
-//!
-//! The wire formats for [`Region`] and [`AddressingStyle`] live ON the enums
-//! here (locality): the CLI, the SQLite column, and JSON all go through these
-//! methods instead of each leaf re-implementing the mapping.
+//! [`ConnectionConfig`] holds the complete local connection definition,
+//! including credentials wrapped in [`Secret`]. Credential values are
+//! persisted with the connection but skipped by serde, so they never enter
+//! export JSON or logs. The wire formats for [`Region`] and
+//! [`AddressingStyle`] live on the enums themselves (locality): the CLI, the
+//! SQLite column and JSON all go through these methods instead of each leaf
+//! re-implementing the mapping.
 
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -19,7 +18,8 @@ use crate::Secret;
 /// AWS region resolution.
 ///
 /// Serialises as its token string (`"auto"` or an explicit region like
-/// `"us-east-1"`) — the same token the CLI accepts and the SQLite column stores.
+/// `"us-east-1"`) — the same token the CLI accepts and the SQLite column
+/// stores.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(into = "String", from = "String")]
 pub enum Region {
@@ -70,7 +70,7 @@ impl From<String> for Region {
     }
 }
 
-/// S3 bucket addressing style (STORE-004).
+/// S3 bucket addressing style.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AddressingStyle {
@@ -94,6 +94,10 @@ impl AddressingStyle {
     }
 
     /// Parse a token, accepting common aliases (`virtual-host`, `vhost`, …).
+    ///
+    /// # Errors
+    /// Returns [`Error::invalid_input`] for any token outside the accepted
+    /// vocabulary.
     pub fn parse(token: &str) -> Result<Self> {
         match token.trim().to_ascii_lowercase().as_str() {
             "" | "auto" => Ok(Self::Auto),
@@ -106,8 +110,8 @@ impl AddressingStyle {
     }
 }
 
-/// Outcome of the last connection test (CON-007/010), persisted so
-/// `connection list` can surface health without re-probing.
+/// Outcome of the last connection test, persisted so `connection list` can
+/// surface health without re-probing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectionTestStatus {
@@ -118,6 +122,7 @@ pub enum ConnectionTestStatus {
 }
 
 impl ConnectionTestStatus {
+    /// Canonical token used by the SQLite column and serde.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Ok => "ok",
@@ -125,6 +130,7 @@ impl ConnectionTestStatus {
         }
     }
 
+    /// Parse a canonical token; `None` for anything unrecognised.
     pub fn parse(token: &str) -> Option<Self> {
         match token.trim().to_ascii_lowercase().as_str() {
             "ok" => Some(Self::Ok),
@@ -149,7 +155,7 @@ pub struct ConnectionConfig {
     pub cdn_base_url: Option<String>,
     pub region: Region,
     pub addressing_style: AddressingStyle,
-    /// TLS certificate verification (default on — SEC-003).
+    /// TLS certificate verification; on unless explicitly disabled.
     pub tls_verify: bool,
     /// Access key stored with this connection. It is omitted from serde
     /// representations and must be explicitly masked for display.
@@ -163,10 +169,10 @@ pub struct ConnectionConfig {
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
-    /// When the connection was last tested, if ever (CON-010).
+    /// When the connection was last tested, if ever.
     #[serde(default, with = "time::serde::rfc3339::option")]
     pub last_tested_at: Option<OffsetDateTime>,
-    /// Result of that test (CON-010).
+    /// Result of that test.
     #[serde(default)]
     pub last_test_status: Option<ConnectionTestStatus>,
 }
@@ -175,10 +181,21 @@ impl ConnectionConfig {
     /// Returns `true` if the name obeys the uniqueness/character rules.
     ///
     /// Names are case-sensitive and must be 1..=64 chars of printable,
-    /// whitespace-trimmed text (CON-002). This is intentionally permissive.
+    /// whitespace-trimmed text. This check is intentionally permissive;
+    /// uniqueness itself is enforced by the registry port.
     pub fn is_valid_name(name: &str) -> bool {
         let trimmed = name.trim();
         !trimmed.is_empty() && trimmed.len() <= 64 && !trimmed.chars().any(|c| c.is_control())
+    }
+
+    /// Normalize a user-supplied base URL: trim whitespace and trailing
+    /// slashes; an empty value normalizes to `None` ("no override"). The one
+    /// home for this rule — connection fields and link profiles share it.
+    pub fn normalize_base_url(value: Option<String>) -> Option<String> {
+        value.and_then(|base| {
+            let base = base.trim().trim_end_matches('/');
+            (!base.is_empty()).then(|| base.to_string())
+        })
     }
 }
 
@@ -202,7 +219,6 @@ mod tests {
 
     #[test]
     fn region_serde_is_token_string() {
-        // The explicit representation preserves the Specific region string.
         let json = serde_json::to_string(&Region::specific("eu-west-1")).unwrap();
         assert_eq!(json, "\"eu-west-1\"");
         let back: Region = serde_json::from_str(&json).unwrap();

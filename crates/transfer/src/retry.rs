@@ -1,12 +1,15 @@
-//! Retry policy for transferable operations (STORE-024 / JOB-009).
+//! Exponential-backoff retry policy shared by transfer operations.
 
 use serde::{Deserialize, Serialize};
 
 /// Exponential backoff with a cap and a maximum attempt count.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct RetryPolicy {
+    /// Total attempts allowed, including the first.
     pub max_attempts: u32,
+    /// Backoff before the first retry, in milliseconds.
     pub initial_backoff_ms: u64,
+    /// Upper bound on any single backoff, in milliseconds.
     pub max_backoff_ms: u64,
 }
 

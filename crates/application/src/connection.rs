@@ -1,9 +1,8 @@
-//! Connection lifecycle service (CON-001..013).
+//! Connection lifecycle service.
 //!
-//! Owns CRUD over [`ConnectionConfig`] and credential storage. Diagnostics —
-//! the connection test and capability probe — live in
-//! [`crate::diagnostics::ConnectionDiagnostics`]; both services share the same
-//! repositories but neither knows about the other.
+//! Owns CRUD over [`ConnectionConfig`] and credential storage. Diagnostics — the connection
+//! test and capability probe — live in [`crate::diagnostics::ConnectionDiagnostics`]; both
+//! services share the same repositories but neither knows about the other.
 
 use std::sync::Arc;
 
@@ -39,9 +38,24 @@ impl ConnectionRef {
     }
 }
 
-/// A credential pair supplied by the user (CON-005). Wrapped in
-/// `Secret<…>` at the CLI boundary so it never reaches logs or Debug output
-/// (SEC-001).
+/// Resolve a connection reference against a store.
+///
+/// The single lookup and the single not-found message, shared by [`ConnectionService`] and the
+/// gateway so every caller reports identical failures.
+pub(crate) async fn resolve_connection(
+    store: &dyn ConnectionStore,
+    reference: &ConnectionRef,
+) -> Result<ConnectionConfig> {
+    let found = match reference {
+        ConnectionRef::Id(id) => store.get(*id).await?,
+        ConnectionRef::Name(name) => store.get_by_name(name).await?,
+    };
+    found.ok_or_else(|| Error::not_found(format!("connection `{}` not found", reference.display())))
+}
+
+/// A credential pair supplied by the user.
+///
+/// Wrapped in `Secret<…>` at the CLI boundary so it never reaches logs or `Debug` output.
 #[derive(Clone)]
 pub struct CredentialInput {
     pub access_key: String,
@@ -50,8 +64,8 @@ pub struct CredentialInput {
 
 type StoredCredentials = (Option<Secret<String>>, Option<Secret<String>>);
 
-/// Input for creating a connection. Credentials are stored directly with the
-/// connection when supplied.
+/// Input for creating a connection. Credentials are stored directly with the connection when
+/// supplied.
 #[derive(Debug, Clone)]
 pub struct AddConnectionInput {
     pub name: String,
@@ -68,14 +82,21 @@ pub struct AddConnectionInput {
 }
 
 /// Input for editing a connection's mutable fields.
+///
+/// Clearing convention: a field of type `Option<Option<T>>` is left untouched when the outer
+/// value is `None`; `Some(None)` explicitly clears the stored value; `Some(Some(v))` replaces
+/// it. Base-URL values are normalized through
+/// [`ConnectionConfig::normalize_base_url`] — that method is the single home for the
+/// trim-trailing-slashes / empty-to-`None` rule, applied here and by every other writer.
 #[derive(Debug, Clone, Default)]
 pub struct UpdateConnectionInput {
     pub name: Option<String>,
     pub endpoint: Option<String>,
-    /// Replace the public-object base URL; an empty value clears it.
-    pub public_base_url: Option<String>,
-    /// Replace the accelerated/proxy delivery base; an empty value clears it.
-    pub cdn_base_url: Option<String>,
+    /// Replace the public-object base URL; the inner `None` clears the override (an empty
+    /// string normalizes to a clear as well).
+    pub public_base_url: Option<Option<String>>,
+    /// Replace the accelerated/proxy delivery base (same clearing rule).
+    pub cdn_base_url: Option<Option<String>>,
     pub region: Option<Region>,
     pub addressing_style: Option<AddressingStyle>,
     pub tls_verify: Option<bool>,
@@ -88,9 +109,10 @@ pub struct UpdateConnectionInput {
 pub trait ConnectionService: Send + Sync {
     async fn add(&self, input: AddConnectionInput) -> Result<ConnectionConfig>;
     async fn list(&self) -> Result<Vec<ConnectionConfig>>;
-    /// CON-015: narrow by a case-insensitive substring over name/endpoint.
-    /// One implementation of the filter semantics, so the CLI and the future
-    /// desktop agree on what `--filter` matches.
+    /// Narrow [`Self::list`] by a case-insensitive substring over name and endpoint.
+    ///
+    /// One implementation of the filter semantics, so the CLI and the desktop agree on what
+    /// `--filter` matches.
     async fn list_matching(&self, needle: &str) -> Result<Vec<ConnectionConfig>> {
         let needle = needle.to_lowercase();
         Ok(self
@@ -123,13 +145,8 @@ impl DefaultConnectionService {
         Self { repo, clock }
     }
 
-    fn normalize_base_url(value: Option<String>) -> Option<String> {
-        value.and_then(|base| {
-            let base = base.trim().trim_end_matches('/');
-            (!base.is_empty()).then(|| base.to_string())
-        })
-    }
-
+    /// Split a credential pair into the stored form, trimming whitespace and rejecting
+    /// blank halves.
     fn split_credentials(
         credentials: Option<Secret<CredentialInput>>,
     ) -> Result<StoredCredentials> {
@@ -171,11 +188,11 @@ impl ConnectionService for DefaultConnectionService {
         let (access_key, secret_key) = Self::split_credentials(input.credentials)?;
         let now = self.clock.now();
         let config = ConnectionConfig {
-            id: ConnectionId::new(),
+            id: ConnectionId::new_random(),
             name: input.name,
             endpoint: input.endpoint,
-            public_base_url: Self::normalize_base_url(input.public_base_url),
-            cdn_base_url: Self::normalize_base_url(input.cdn_base_url),
+            public_base_url: ConnectionConfig::normalize_base_url(input.public_base_url),
+            cdn_base_url: ConnectionConfig::normalize_base_url(input.cdn_base_url),
             region: input.region,
             addressing_style: input.addressing_style,
             tls_verify: input.tls_verify,
@@ -195,19 +212,7 @@ impl ConnectionService for DefaultConnectionService {
     }
 
     async fn resolve(&self, reference: &ConnectionRef) -> Result<ConnectionConfig> {
-        let found = match reference {
-            ConnectionRef::Id(id) => self.repo.get(*id).await?,
-            ConnectionRef::Name(name) => self.repo.get_by_name(name).await?,
-        };
-        found.ok_or_else(|| {
-            Error::not_found(format!(
-                "connection `{}` not found",
-                match reference {
-                    ConnectionRef::Id(id) => id.to_string(),
-                    ConnectionRef::Name(n) => n.clone(),
-                }
-            ))
-        })
+        crate::connection::resolve_connection(self.repo.as_ref(), reference).await
     }
 
     async fn update(
@@ -238,11 +243,11 @@ impl ConnectionService for DefaultConnectionService {
             }
             config.endpoint = endpoint;
         }
-        if let Some(public_base_url) = input.public_base_url {
-            config.public_base_url = Self::normalize_base_url(Some(public_base_url));
+        if let Some(base) = input.public_base_url {
+            config.public_base_url = ConnectionConfig::normalize_base_url(base);
         }
-        if let Some(cdn_base_url) = input.cdn_base_url {
-            config.cdn_base_url = Self::normalize_base_url(Some(cdn_base_url));
+        if let Some(base) = input.cdn_base_url {
+            config.cdn_base_url = ConnectionConfig::normalize_base_url(base);
         }
         if let Some(region) = input.region {
             config.region = region;

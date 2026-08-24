@@ -201,6 +201,10 @@ pub(super) async fn connection(
             let mut out = HandlerOutput::human(human).with_data(data);
             if report.status == rstore_domain::connection::ConnectionTestStatus::Failed {
                 out = out.with_warning("one or more connection checks failed");
+                // A failed probe is a failed check: scripts chaining on
+                // `connection test &&` must see it. Same partial-failure
+                // code the batch vocabulary uses.
+                out = out.with_exit_code(13);
             }
             Ok(out)
         }
@@ -211,8 +215,8 @@ pub(super) async fn connection(
             let input = UpdateConnectionInput {
                 name: args.name.clone(),
                 endpoint: args.endpoint.clone(),
-                public_base_url: args.public_base.clone(),
-                cdn_base_url: args.cdn_base.clone(),
+                public_base_url: args.public_base.clone().map(Some),
+                cdn_base_url: args.cdn_base.clone().map(Some),
                 region: args.region.as_deref().map(Region::parse_token),
                 addressing_style: match &args.addressing_style {
                     Some(token) => Some(AddressingStyle::parse(token)?),

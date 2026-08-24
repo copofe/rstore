@@ -1,12 +1,16 @@
-//! Query, filter, sort and pagination value types for the mixed file list
-//! (MIX- / IDX-024 Keyset pagination).
+//! Query, filter, sort and pagination value types for the mixed file list.
+//!
+//! The keyset pagination contract lives here: a [`PageRequest`] carries an
+//! opaque cursor issued by the producing adapter, and a stable total order
+//! (`sort value`, `path`, `id` — see `crate::order`) makes cursor walks
+//! repeatable across pages.
 
 use serde::{Deserialize, Serialize};
 
 use rstore_domain::remote::FileType;
 use rstore_domain::{BucketId, ConnectionId, TagId, WorkspaceId};
 
-/// Sortable fields (MIX-023).
+/// A field of the mixed file list a page can be sorted by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SortField {
@@ -18,6 +22,7 @@ pub enum SortField {
     Connection,
 }
 
+/// Direction of a sort; the default listing is most recently modified first.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SortOrder {
@@ -26,6 +31,7 @@ pub enum SortOrder {
     Desc,
 }
 
+/// The sort clause of a mixed files query: one field plus one direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileSort {
     pub field: SortField,
@@ -34,7 +40,6 @@ pub struct FileSort {
 
 impl Default for FileSort {
     fn default() -> Self {
-        // PRD §10.7.4: default modified desc.
         Self {
             field: SortField::Modified,
             order: SortOrder::Desc,
@@ -42,7 +47,8 @@ impl Default for FileSort {
     }
 }
 
-/// Mixed-list filter expression (MIX-011..022).
+/// Filter expression narrowing the mixed file list. Every set field narrows
+/// with AND semantics.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct FileFilter {
     pub name_contains: Option<String>,
@@ -57,23 +63,23 @@ pub struct FileFilter {
     pub modified_after: Option<time::OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub modified_before: Option<time::OffsetDateTime>,
-    /// Tags required to be present (default AND semantics — MIX-019).
+    /// Tags required to be present (AND semantics unless
+    /// [`FileFilter::tag_mode_or`] is set).
     pub tags: Vec<TagId>,
     pub tag_mode_or: bool,
     pub untagged: bool,
-    /// Catalog state filter (MIX-022); `None` = anything not deleted.
+    /// Catalog state filter; `None` matches anything not deleted.
     pub state: Option<rstore_domain::ObjectState>,
 }
 
-/// Keyset pagination request (IDX-024): a stable cursor + page size.
+/// Keyset pagination request: a page size plus the cursor to resume from.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PageRequest {
     pub limit: u32,
     /// Opaque cursor from a previous page's `next_cursor`. Its encoding is
-    /// private to the producing adapter: a cursor issued by the SQLite
-    /// implementation must be replayed against the same adapter (the
-    /// in-memory reference implementation encodes cursors differently).
-    /// Never parse, construct, or forward one across adapters.
+    /// private to the producing adapter: a cursor issued by one adapter must
+    /// be replayed against that same adapter (implementations encode cursors
+    /// differently). Never parse, construct, or forward one across adapters.
     pub after: Option<String>,
 }
 
@@ -118,6 +124,7 @@ pub struct CatalogPage {
 }
 
 impl<T> Page<T> {
+    /// Maps the items to another type, carrying the cursor over unchanged.
     pub fn map<U>(self, f: impl Fn(T) -> U) -> Page<U> {
         Page {
             items: self.items.into_iter().map(f).collect(),
@@ -126,7 +133,8 @@ impl<T> Page<T> {
     }
 }
 
-/// Which workspace scope a query runs in (WSP-).
+/// The workspace a query runs in; only buckets joined into the workspace are
+/// visible to its queries.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Scope {
     pub workspace: WorkspaceId,

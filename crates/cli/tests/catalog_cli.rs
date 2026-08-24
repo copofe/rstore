@@ -1,5 +1,5 @@
-//! CLI acceptance: workspace → ignore → index → files → tag, through the
-//! Application API against FakeStorage (CLI-030 / QA-013).
+//! CLI acceptance flow through the Application API against FakeStorage:
+//! workspace setup, ignore rules, indexing, and file listing/tagging.
 
 use std::sync::Arc;
 
@@ -365,7 +365,7 @@ async fn catalog_destructive_commands_require_yes() {
         &CancellationToken::new(),
     )
     .await;
-    // SEC-006: non-interactive destructive commands need --yes.
+    // Destructive commands are rejected without the explicit confirmation flag.
     let err = res.unwrap_err();
     assert_eq!(err.code, rstore_domain::ErrorCode::InvalidInput);
 }

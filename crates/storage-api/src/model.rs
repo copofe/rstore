@@ -1,10 +1,17 @@
-//! Request/response value types shared by every [`Storage`] implementation.
+//! Request/response value types shared by every [`crate::storage::Storage`]
+//! implementation.
+//!
+//! The metadata fabrication policy has one owner per shape:
+//! [`ObjectMetadata::after_put`] for single writes, [`ObjectMetadata::from_parts`]
+//! for completed multipart uploads, and [`PresignedUrl::expiring`] for
+//! presign expiry — adapters must not invent their own clocks or bases.
 
 use rstore_domain::remote::ObjectPath;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-/// A half-open byte range `[start, end)` for ranged reads (STORE-011).
+/// A half-open byte range `[start, end)` for ranged reads. `end: None`
+/// reads to end of object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadRange {
     pub start: u64,
@@ -34,7 +41,7 @@ impl ReadRange {
     }
 }
 
-/// Metadata for a single object (STORE-010).
+/// Metadata for a single object, as reported by stat/list/write paths.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObjectMetadata {
     pub key: String,
@@ -48,11 +55,11 @@ pub struct ObjectMetadata {
 }
 
 impl ObjectMetadata {
-    /// Metadata for an object the adapter just wrote. The fabrication
-    /// policy, one owner: the write happened at `now`, the size is the
-    /// body's, and the content type echoes what was sent (the provider
-    /// stores exactly that). `storage_contract` pins the `last_modified`
-    /// basis so every adapter agrees.
+    /// Metadata for an object the adapter just wrote. The fabrication policy,
+    /// one owner: the write happened at `now`, the size is the body's, and
+    /// the content type echoes what was sent (the provider stores exactly
+    /// that). The storage contract pins the `last_modified` basis so every
+    /// adapter agrees.
     pub fn after_put(
         key: &str,
         size: u64,
@@ -93,13 +100,13 @@ impl ObjectMetadata {
 }
 
 /// One entry in a listing (a leaf object). Folders are derived by the caller
-/// from common prefixes and are never returned as objects (PRD §10.7.1).
+/// from common prefixes and are never returned as objects.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObjectEntry {
     pub metadata: ObjectMetadata,
 }
 
-/// A bucket visible on the remote (STORE-008).
+/// A bucket visible on the remote.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BucketSummary {
     pub name: String,
@@ -107,18 +114,18 @@ pub struct BucketSummary {
     pub created_at: Option<OffsetDateTime>,
 }
 
-/// A page of results from [`Storage::list`] (STORE-009).
+/// A page of results from [`crate::storage::Storage::list`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListPage {
     pub objects: Vec<ObjectEntry>,
-    /// Common-prefix "folders" under the queried prefix (STORE-009).
+    /// Common-prefix "folders" under the queried prefix.
     pub common_prefixes: Vec<String>,
-    /// Opaque continuation token for the next page (REM-003).
+    /// Opaque continuation token for the next page.
     pub continuation_token: Option<String>,
     pub is_truncated: bool,
 }
 
-/// Options for [`Storage::list`].
+/// Options for [`crate::storage::Storage::list`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ListOptions {
     /// Restrict listing to this key prefix (`None` = bucket root).
@@ -131,21 +138,26 @@ pub struct ListOptions {
     pub max_keys: Option<u32>,
 }
 
-/// Options for [`Storage::put`] (STORE-012 / UP-005).
+/// Options for [`crate::storage::Storage::put`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PutOptions {
     pub content_type: Option<String>,
     pub cache_control: Option<String>,
-    /// Object metadata returned by a provider or synthesized after a successful
-    /// write.
+    /// User-defined metadata pairs stored alongside the object.
     pub metadata: Vec<(String, String)>,
 }
 
-/// Content-type guess from a local file's extension (UP-005). The put-side
-/// metadata concern lives beside [`PutOptions`]: a tiny fixed table keeps the
-/// crate dependency-free and callers can always override explicitly.
-pub fn guess_content_type(path: &std::path::Path) -> Option<String> {
-    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+/// Content-type guess from a local file's extension.
+///
+/// The put-side metadata concern lives beside [`PutOptions`]: a tiny fixed
+/// table keeps the crate dependency-free and callers can always override
+/// explicitly. Unknown extensions map to `application/octet-stream`.
+pub fn guess_content_type(path: &std::path::Path) -> String {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
     let mime = match ext.as_str() {
         "txt" | "md" | "log" => "text/plain",
         "html" | "htm" => "text/html",
@@ -167,13 +179,13 @@ pub fn guess_content_type(path: &std::path::Path) -> Option<String> {
         "wav" => "audio/wav",
         _ => "application/octet-stream",
     };
-    Some(mime.to_string())
+    mime.to_string()
 }
 
-/// A copy request (STORE-016 / MOVE-). The caller supplies the source's
-/// metadata alongside the locators — server-side copy needs the source size
-/// to choose its strategy (single-action versus part copy), and the target's
-/// metadata is derived from it.
+/// A copy request. The caller supplies the source's metadata alongside the
+/// locators — server-side copy needs the source size to choose its strategy
+/// (single-action versus part copy), and the target's metadata is derived
+/// from it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CopyRequest {
     pub source_bucket: String,
@@ -182,14 +194,17 @@ pub struct CopyRequest {
     pub target_key: ObjectPath,
 }
 
-/// Outcome of a single-object delete (STORE-014).
+/// Outcome of a single-object delete.
+///
+/// `deleted: false` means the provider reports the object was already gone —
+/// not an error.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DeleteOutcome {
     pub deleted: bool,
     pub version_id: Option<String>,
 }
 
-/// A presigned URL request (STORE-017 / LINK-).
+/// A presigned URL request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PresignRequest {
     pub bucket: String,
@@ -200,6 +215,7 @@ pub struct PresignRequest {
     pub ttl_seconds: u64,
 }
 
+/// HTTP method a presigned URL is valid for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum PresignMethod {
@@ -207,7 +223,7 @@ pub enum PresignMethod {
     Put,
 }
 
-/// A generated presigned URL (STORE-017).
+/// A generated presigned URL.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PresignedUrl {
     pub url: String,
@@ -217,8 +233,8 @@ pub struct PresignedUrl {
 }
 
 impl PresignedUrl {
-    /// A URL expiring at `now + ttl` — the one expiry basis; `storage_contract`
-    /// pins it so adapters cannot drift to a different clock anchor.
+    /// A URL expiring at `now + ttl` — the one expiry basis; the storage
+    /// contract pins it so adapters cannot drift to a different clock anchor.
     pub fn expiring(
         url: String,
         method: PresignMethod,
@@ -234,7 +250,7 @@ impl PresignedUrl {
 }
 
 /// One uploaded part of a multipart upload: its number and the provider ETag
-/// required to complete the upload (STORE-013).
+/// required to complete the upload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UploadedPart {
     /// 1-based part number.

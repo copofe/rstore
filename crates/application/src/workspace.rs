@@ -1,20 +1,19 @@
-//! Workspace management service (WSP-).
+//! Workspace management service.
 //!
-//! A workspace is a local grouping of registered buckets; creating, editing
-//! or removing one never touches remote state (WSP-005: removing a workspace
-//! removes neither buckets nor remote data).
+//! A workspace is a local grouping of registered buckets; creating, editing, or removing one
+//! never touches remote state — removing a workspace removes neither buckets nor remote data.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use rstore_application_ports::{IgnoreRuleStore, WorkspaceStore};
 use rstore_domain::id::{BucketId, WorkspaceId};
-use rstore_domain::workspace::{IgnoreRule, Workspace};
+use rstore_domain::workspace::{IgnoreRule, IgnoreRuleId, Workspace};
 use rstore_domain::{Clock, Error, Result};
 
 use crate::bucket::{BucketRef, BucketService};
 
-/// Reference a workspace by id or name (WSP-011: never an implicit default).
+/// Reference a workspace by id or name. There is never an implicit default workspace.
 #[derive(Debug, Clone)]
 pub enum WorkspaceRef {
     Id(WorkspaceId),
@@ -32,6 +31,7 @@ impl WorkspaceRef {
         WorkspaceRef::Name(s.to_string())
     }
 
+    /// Human-readable form for messages.
     pub fn display(&self) -> String {
         match self {
             WorkspaceRef::Id(id) => id.to_string(),
@@ -40,30 +40,33 @@ impl WorkspaceRef {
     }
 }
 
-/// Input for `workspace create` (WSP-001).
+/// Input for creating a workspace.
 #[derive(Debug, Clone)]
 pub struct CreateWorkspaceInput {
     pub name: String,
     pub description: Option<String>,
 }
 
-/// Editable fields (WSP-004).
+/// Editable workspace fields.
+///
+/// `description` follows the `Option<Option<T>>` clearing convention: outer `None` keeps the
+/// value, the inner `None` clears it.
 #[derive(Debug, Clone, Default)]
 pub struct UpdateWorkspaceInput {
     pub name: Option<String>,
-    /// `Some(None)` clears the description.
+    /// The outer `None` keeps the description; the inner `None` clears it.
     pub description: Option<Option<String>>,
 }
 
-/// A workspace plus its bucket-count summary (WSP-002) — the application's
-/// view type; storage shapes never cross this seam.
+/// A workspace plus its bucket-count summary — the application's view type; storage shapes
+/// never cross this seam.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WorkspaceWithCount {
     pub workspace: Workspace,
     pub bucket_count: u64,
 }
 
-/// A workspace with its bucket membership resolved (WSP-003).
+/// A workspace with its bucket membership resolved.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WorkspaceDetail {
     pub workspace: Workspace,
@@ -71,8 +74,9 @@ pub struct WorkspaceDetail {
     pub object_count: u64,
 }
 
-/// Resolve a [`WorkspaceRef`] against the registry — the one not-found
-/// message for a workspace reference (WSP-011), shared by every service.
+/// Resolve a [`WorkspaceRef`] against the registry.
+///
+/// The one not-found message for a workspace reference, shared by every service.
 pub(crate) async fn resolve_workspace(
     workspaces: &dyn WorkspaceStore,
     reference: &WorkspaceRef,
@@ -84,14 +88,14 @@ pub(crate) async fn resolve_workspace(
     found.ok_or_else(|| Error::not_found(format!("workspace `{}` not found", reference.display())))
 }
 
-/// Workspace lifecycle + bucket membership (WSP-001..008).
+/// Workspace lifecycle and bucket membership.
 #[async_trait]
 pub trait WorkspaceService: Send + Sync {
     async fn create(&self, input: CreateWorkspaceInput) -> Result<Workspace>;
     async fn list(&self) -> Result<Vec<WorkspaceWithCount>>;
     async fn resolve(&self, reference: &WorkspaceRef) -> Result<Workspace>;
     async fn show(&self, reference: &WorkspaceRef) -> Result<WorkspaceDetail>;
-    async fn edit(
+    async fn update(
         &self,
         reference: &WorkspaceRef,
         input: UpdateWorkspaceInput,
@@ -99,13 +103,14 @@ pub trait WorkspaceService: Send + Sync {
     async fn remove(&self, reference: &WorkspaceRef) -> Result<()>;
     async fn add_bucket(&self, reference: &WorkspaceRef, bucket: &BucketRef) -> Result<BucketId>;
     async fn remove_bucket(&self, reference: &WorkspaceRef, bucket: &BucketRef) -> Result<()>;
-    /// Ignore rules operate bucket-globally (IGN-012): every workspace that
-    /// contains the bucket sees them.
+    /// Ignore rules operate bucket-globally: every workspace that contains the bucket sees
+    /// them.
     async fn ignore_add(&self, bucket: &BucketRef, directory: &str) -> Result<IgnoreRule>;
     async fn ignore_list(&self, bucket: &BucketRef) -> Result<Vec<IgnoreRule>>;
     async fn ignore_remove(&self, bucket: &BucketRef, directory: &str) -> Result<()>;
 }
 
+/// Default workspace implementation over the registry stores.
 pub struct DefaultWorkspaceService {
     workspaces: Arc<dyn WorkspaceStore>,
     buckets: Arc<dyn BucketService>,
@@ -144,7 +149,7 @@ impl WorkspaceService for DefaultWorkspaceService {
         if name.is_empty() {
             return Err(Error::invalid_input("workspace name is empty"));
         }
-        let mut workspace = Workspace::new(WorkspaceId::new(), name, self.clock.now());
+        let mut workspace = Workspace::new(WorkspaceId::new_random(), name, self.clock.now());
         workspace.description = input.description;
         self.workspaces.insert(&workspace).await?;
         Ok(workspace)
@@ -185,7 +190,7 @@ impl WorkspaceService for DefaultWorkspaceService {
         })
     }
 
-    async fn edit(
+    async fn update(
         &self,
         reference: &WorkspaceRef,
         input: UpdateWorkspaceInput,
@@ -195,10 +200,7 @@ impl WorkspaceService for DefaultWorkspaceService {
             .update(
                 workspace.id,
                 input.name.as_deref(),
-                input
-                    .description
-                    .as_ref()
-                    .map(|d| d.as_deref().unwrap_or("")),
+                input.description.as_ref().map(|d| d.as_deref()),
                 self.clock.now(),
             )
             .await?;
@@ -208,8 +210,8 @@ impl WorkspaceService for DefaultWorkspaceService {
     async fn remove(&self, reference: &WorkspaceRef) -> Result<()> {
         let workspace = self.find(reference).await?;
         self.workspaces.delete(workspace.id).await?;
-        // Tag associations cascade with the workspace row (WSP-013 isolation
-        // ends with the workspace itself); bucket rows are untouched (WSP-005).
+        // Tag associations cascade with the workspace row (workspace isolation ends with the
+        // workspace itself); bucket rows are untouched.
         Ok(())
     }
 
@@ -236,16 +238,16 @@ impl WorkspaceService for DefaultWorkspaceService {
                 workspace.name
             )));
         }
-        // WSP-008: tag relations enter the retention window (kept in the
-        // remote_object_tags rows until the catalog retention job purges them.
+        // Tag relations enter the retention window: kept in the remote_object_tags rows until
+        // the catalog retention job purges them.
         Ok(())
     }
 
     async fn ignore_add(&self, bucket: &BucketRef, directory: &str) -> Result<IgnoreRule> {
         let bucket_id = self.bucket_id(bucket).await?;
         let directory = IgnoreRule::normalise_directory(directory)?;
-        // IGN-013: reject a rule that duplicates or nests inside an existing
-        // one (and vice versa) so pruning stays deterministic.
+        // Reject a rule that duplicates or nests inside an existing one (and vice versa) so
+        // pruning stays deterministic.
         for existing in self.ignores.list(bucket_id).await? {
             if existing.directory == directory
                 || directory.starts_with(&existing.directory)
@@ -258,7 +260,7 @@ impl WorkspaceService for DefaultWorkspaceService {
             }
         }
         let rule = IgnoreRule {
-            id: 0,
+            id: IgnoreRuleId(0),
             bucket_id,
             directory,
             enabled: true,
@@ -282,8 +284,8 @@ impl WorkspaceService for DefaultWorkspaceService {
                 "no ignore rule for `{directory}`"
             )));
         }
-        // IGN-010: a later `index start` re-scans the freed subtree; tags on
-        // those objects survive because their rows were never deleted.
+        // A later index start re-scans the freed subtree; tags on those objects survive
+        // because their rows were never deleted.
         Ok(())
     }
 }

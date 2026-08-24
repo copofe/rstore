@@ -2,10 +2,10 @@
 //!
 //! The narrow slice of tag bookkeeping a service needs when it follows
 //! objects across copies: list a source's associations and attach them to
-//! the target (MOVE-015). `rstore_persistence::TagRepository` implements
-//! this over SQLite; `rstore_test_support::InMemoryTagStore` is the second
-//! adapter, so services can hold `Arc<dyn TagStore>` instead of the
-//! concrete repository (CORE-003 — no per-service SQLite).
+//! the target. Implemented over SQLite by `rstore_persistence::TagRepository`
+//! with an in-memory second adapter in `rstore_test_support`, so services can
+//! hold `Arc<dyn TagStore>` instead of the concrete repository (no per-service
+//! SQLite).
 
 use async_trait::async_trait;
 use rstore_domain::id::{TagId, WorkspaceId};
@@ -26,8 +26,7 @@ pub trait TagStore: Send + Sync {
     ) -> Result<()>;
 
     /// Every `(workspace, tag)` association of an object, across all
-    /// workspaces — the source list for tag preservation on copy/move
-    /// (MOVE-015).
+    /// workspaces — the source list for tag preservation on copy/move.
     async fn associations_for_object(
         &self,
         object: rstore_domain::RemoteObjectId,

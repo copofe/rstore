@@ -1,11 +1,10 @@
-//! Download staging (DOWN-004/009): the `.part` file policy.
+//! Download staging: the `.part` file policy.
 //!
 //! One module owns where staged bytes live, when a staged file is safe to
 //! resume, and how it promotes to the final name. Resume is validated
-//! against the remote object's identity — size **and** etag, recorded in a
-//! sidecar when staging starts — so a stale `.part` from a different object
-//! restarts instead of reusing bytes from another object. The
-//! A length-only check could not catch same-sized objects.
+//! against the remote object's identity — size and etag, recorded in a
+//! sidecar when staging starts — so stale `.part` bytes restart instead of
+//! being spliced into another object.
 
 use std::path::{Path, PathBuf};
 
@@ -48,14 +47,17 @@ fn identity_path(target: &Path) -> PathBuf {
 /// Truncate-then-record: if the run dies between the two, the next run sees
 /// staged bytes with no (or a stale) sidecar and restarts — never unrelated bytes
 /// promoted as fresh.
-fn write_identity(path: &Path, meta: &ObjectMetadata) -> Result<()> {
+async fn write_identity(path: &Path, meta: &ObjectMetadata) -> Result<()> {
     let etag = meta.etag.as_deref().unwrap_or("-");
-    std::fs::write(path, format!("{}\n{etag}\n", meta.size))
+    tokio::fs::write(path, format!("{}\n{etag}\n", meta.size))
+        .await
         .map_err(|e| Error::io("write .part identity").with_source(e))
 }
 
-fn identity_matches(path: &Path, meta: &ObjectMetadata) -> bool {
-    let Ok(raw) = std::fs::read_to_string(path) else {
+/// Whether the sidecar records exactly this object (size + etag). A missing
+/// or unreadable sidecar reads as "no match" — the caller restarts staging.
+async fn identity_matches(path: &Path, meta: &ObjectMetadata) -> bool {
+    let Ok(raw) = tokio::fs::read_to_string(path).await else {
         return false;
     };
     let mut lines = raw.lines();
@@ -76,7 +78,7 @@ pub(crate) async fn stage(target: &Path, meta: &ObjectMetadata) -> Result<Staged
 
     let staged_len = tokio::fs::metadata(&path).await.map(|m| m.len()).ok();
     let resume =
-        identity_matches(&identity, meta) && staged_len.is_some_and(|len| len <= meta.size);
+        identity_matches(&identity, meta).await && staged_len.is_some_and(|len| len <= meta.size);
     let offset = if resume { staged_len.unwrap_or(0) } else { 0 };
 
     let file = tokio::fs::OpenOptions::new()
@@ -90,7 +92,7 @@ pub(crate) async fn stage(target: &Path, meta: &ObjectMetadata) -> Result<Staged
         file.set_len(0)
             .await
             .map_err(|e| Error::io("truncate .part file").with_source(e))?;
-        write_identity(&identity, meta)?;
+        write_identity(&identity, meta).await?;
     }
     Ok(StagedDownload {
         file,
@@ -118,10 +120,9 @@ impl StagedDownload {
         Ok(self.offset)
     }
 
-    /// Promote the staged bytes to `target` atomically (DOWN-009): the final
-    /// name appears only when fully written. The sidecar removal is
-    /// best-effort — a leftover is inert because identity is re-checked
-    /// per run.
+    /// Promote the staged bytes to `target` atomically: the final name
+    /// appears only when fully written. The sidecar removal is best-effort —
+    /// a leftover is inert because identity is re-checked per run.
     pub(crate) async fn complete(self, target: &Path) -> Result<()> {
         tokio::fs::rename(&self.path, target)
             .await
@@ -201,8 +202,8 @@ mod tests {
         staged.append(b"01234").await.unwrap();
         drop(staged);
 
-        // Same size, different etag: the old length-only check resumed here
-        // and spliced the two objects together on rename.
+        // Same size, different etag: a length-only check would splice the
+        // two objects together on rename.
         let staged = stage(&target, &meta(10, Some("\"etag-b\""))).await.unwrap();
         assert_eq!(staged.offset, 0, "changed object restarts");
         assert_eq!(
@@ -227,8 +228,6 @@ mod tests {
     async fn missing_sidecar_restarts_conservatively() {
         let dir = temp_dir("nosidecar");
         let target = dir.join("doc.bin");
-        // A `.part` without an identity sidecar, or a crash before the sidecar
-        // is written.
         std::fs::write(staged_path(&target), b"untrusted").unwrap();
 
         let staged = stage(&target, &meta(9, Some("\"etag-a\""))).await.unwrap();

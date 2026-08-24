@@ -1,8 +1,8 @@
-//! Mixed file list and search over the workspace catalog (MIX-/IDX-015..017).
+//! Mixed file list and search over the workspace catalog.
 //!
-//! All queries run through the [`CatalogQuery`] seam against the local
-//! index — offline-safe and explicitly staleness-flagged (IDX-017). The
-//! catalog adapter assembles list pages, while `show` enriches one object.
+//! All queries run through the [`CatalogQuery`] seam against the local index — offline-safe and
+//! explicitly staleness-flagged. The catalog adapter assembles list pages, while `show`
+//! enriches one object.
 
 use std::sync::Arc;
 
@@ -14,8 +14,8 @@ use rstore_domain::{Error, Result};
 
 use crate::workspace::WorkspaceRef;
 
-/// One row of the mixed list (MIX-003..010): the object plus its resolved
-/// source identity and the workspace's tag names.
+/// One row of the mixed list: the object plus its resolved source identity and the workspace's
+/// tag names.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FileEntry {
     pub uri: String,
@@ -33,7 +33,7 @@ pub struct FileEntry {
     pub tags: Vec<String>,
 }
 
-/// A page plus the total match count for the filter (MIX-024).
+/// A page plus the total match count for the filter.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FilesPage {
     pub items: Vec<FileEntry>,
@@ -41,7 +41,7 @@ pub struct FilesPage {
     pub next_cursor: Option<String>,
 }
 
-/// Mixed-list queries (MIX-).
+/// Mixed-list queries over the indexed catalog.
 #[async_trait]
 pub trait FilesService: Send + Sync {
     /// `files list` / `files search` — one filtered, sorted, paginated query.
@@ -52,10 +52,11 @@ pub trait FilesService: Send + Sync {
         sort: FileSort,
         page: &PageRequest,
     ) -> Result<FilesPage>;
-    /// `files show` — one object with tags and staleness (IDX-015/016).
+    /// `files show` — one object with tags and staleness state.
     async fn show(&self, workspace: &WorkspaceRef, uri: &str) -> Result<FileEntry>;
 }
 
+/// Default files implementation over the catalog query seam and the registry stores.
 pub struct DefaultFilesService {
     catalog: Arc<dyn CatalogQuery>,
     workspaces: Arc<dyn WorkspaceStore>,
@@ -109,13 +110,31 @@ impl DefaultFilesService {
             .map(|c| c.name)
             .unwrap_or_else(|| object.connection_id.to_string());
         let tags = self.tags.tags_for_object(workspace, object.id).await?;
-        Ok(FileEntry {
-            // Canonical address display: `conn/bucket/key`, the CLI's short
-            // Canonical remote-reference shape.
-            uri: format!("{}/{}/{}", connection, bucket.name, object.path.as_str()),
+        Ok(Self::from_parts(
+            // Canonical address display: `conn/bucket/key`, the CLI's short remote-reference
+            // shape.
+            &format!("{}/{}/{}", connection, bucket.name, object.path.as_str()),
+            bucket.name,
+            connection,
+            object,
+            tags,
+        ))
+    }
+
+    /// The one 12-field mapping from catalog primitives; both lookup paths go through it so
+    /// the views cannot drift.
+    fn from_parts(
+        uri: &str,
+        bucket: String,
+        connection: String,
+        object: &RemoteObject,
+        tags: Vec<String>,
+    ) -> FileEntry {
+        FileEntry {
+            uri: uri.to_string(),
             name: object.path.file_name().to_string(),
             directory: object.path.parent().unwrap_or_default(),
-            bucket: bucket.name,
+            bucket,
             connection,
             size: object.size,
             last_modified: object.last_modified,
@@ -123,31 +142,23 @@ impl DefaultFilesService {
             state: object.state,
             content_type: object.content_type.clone(),
             tags,
-        })
+        }
     }
 
     fn entry_from_page(item: CatalogPageItem) -> FileEntry {
         let object = item.object;
-        FileEntry {
-            // Canonical address display: `conn/bucket/key`, the CLI's short
-            // canonical remote-reference shape.
-            uri: format!(
+        Self::from_parts(
+            &format!(
                 "{}/{}/{}",
                 item.connection_name,
                 item.bucket_name,
                 object.path.as_str()
             ),
-            name: object.path.file_name().to_string(),
-            directory: object.path.parent().unwrap_or_default(),
-            bucket: item.bucket_name,
-            connection: item.connection_name,
-            size: object.size,
-            last_modified: object.last_modified,
-            confirmed_at: object.confirmed_at,
-            state: object.state,
-            content_type: object.content_type,
-            tags: item.tags,
-        }
+            item.bucket_name,
+            item.connection_name,
+            &object,
+            item.tags,
+        )
     }
 }
 

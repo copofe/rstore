@@ -1,5 +1,4 @@
-//! Repository for locally registered [`Bucket`] rows (BKT-).
-
+//! Repository for locally registered buckets.
 use async_trait::async_trait;
 use rstore_application_ports::BucketStore;
 use rstore_domain::bucket::{Bucket, BucketConfig};
@@ -15,8 +14,8 @@ use crate::tx::WriteGate;
 const COLUMNS: &str = "id, connection_id, name, display_name, read_only, allow_delete, \
                        index_enabled, default_conflict, concurrency, created_at, updated_at";
 
-/// CRUD access to `buckets`.
 #[derive(Clone)]
+/// CRUD access to `buckets`.
 pub struct BucketRepository {
     gate: WriteGate,
     read_pool: SqlitePool,
@@ -30,8 +29,7 @@ impl BucketRepository {
 
 #[async_trait]
 impl BucketStore for BucketRepository {
-    /// Insert a bucket registration. A duplicate `(connection, name)` surfaces
-    /// as `Conflict` (BKT-002).
+    /// Insert a bucket registration; a duplicate `(connection, name)` surfaces as `Conflict`.
     async fn insert(&self, bucket: &Bucket) -> Result<()> {
         let _write = self.gate.permit().await?;
         Insert::into("buckets")
@@ -83,7 +81,7 @@ impl BucketStore for BucketRepository {
         row.map(row_to_bucket).transpose()
     }
 
-    /// All buckets registered under a connection (CON-013 reference check).
+    /// All buckets registered under a connection.
     async fn list_by_connection(&self, connection: ConnectionId) -> Result<Vec<Bucket>> {
         let rows = sqlx::query(&format!(
             "SELECT {COLUMNS} FROM buckets WHERE connection_id = ? ORDER BY name"
@@ -95,7 +93,7 @@ impl BucketStore for BucketRepository {
         rows.into_iter().map(row_to_bucket).collect()
     }
 
-    /// Update an existing bucket's mutable fields.
+    /// Update an existing bucket's mutable fields; a missing row is `NotFound`.
     async fn update(&self, bucket: &Bucket) -> Result<()> {
         let _write = self.gate.permit().await?;
         let affected = Update::table("buckets")
@@ -116,7 +114,7 @@ impl BucketStore for BucketRepository {
         Ok(())
     }
 
-    /// Delete a bucket registration (workspace links cascade via FK).
+    /// Delete a bucket registration; workspace links cascade via foreign key.
     async fn delete(&self, id: BucketId) -> Result<bool> {
         let _write = self.gate.permit().await?;
         let affected = sqlx::query("DELETE FROM buckets WHERE id = ?")

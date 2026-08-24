@@ -6,7 +6,7 @@
 //! render human/JSON and map to a stable exit code.
 //!
 //! Command identity and the version renderer come from the library (single
-//! source); the envelope timestamp flows from the injected clock (CORE-009).
+//! source); the envelope timestamp flows from the injected clock.
 
 use clap::Parser;
 use rstore_bootstrap::Runtime;
@@ -31,10 +31,10 @@ async fn main() {
     let command = cli.command.path();
     let now = SystemClock.now();
 
-    // Full startup sequence (CONTEXT.md: 启动编排): create data directories,
-    // acquire the cross-process write lock (DATA-008), open + migrate +
-    // recover. Startup failures flow through the same envelope and the
-    // single-source exit-code mapping as every other domain error.
+    // Full startup sequence: create data directories, acquire the
+    // cross-process write lock, open + migrate + recover. Startup failures
+    // flow through the same envelope and the single-source exit-code mapping
+    // as every other domain error.
     let runtime = match Runtime::open_locked(&dirs).await {
         Ok(runtime) => runtime,
         Err(e) => {
@@ -43,9 +43,9 @@ async fn main() {
         }
     };
 
-    // Ctrl+C (CLI-013 / JOB-014): cancel the cooperative token; the running
-    // transfer persists its checkpoints and reports state `interrupted`, which
-    // emit() turns into exit 130.
+    // Ctrl+C: cancel the cooperative token; the running transfer persists its
+    // checkpoints and reports state `interrupted`, which emit() turns into
+    // exit 130.
     let cancel = rstore_transfer::CancellationToken::new();
     {
         let cancel = cancel.clone();
@@ -60,16 +60,16 @@ async fn main() {
         });
     }
 
-    // Honour the injected clock for the result envelope (CORE-009).
+    // Honour the injected clock for the result envelope.
     let app = runtime.application();
     let api = app.api();
     let result = rstore_cli::run_api(&cli, &api, &dirs, &cancel).await;
     emit(result, &cli, command, app.now());
 }
 
-/// Initialise structured logging (OBS-001/002): stderr for the console and a
-/// daily-rolling file under `log_dir` to bound disk usage. Progress/logs never
-/// go to stdout (CLI-006).
+/// Initialise structured logging: stderr for the console and a daily-rolling
+/// file under `log_dir` to bound disk usage. Progress and logs never go to
+/// stdout.
 fn init_tracing(level: &str, dirs: &rstore_platform::AppDirs) {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::prelude::*;
@@ -112,8 +112,8 @@ fn init_tracing(level: &str, dirs: &rstore_platform::AppDirs) {
 }
 
 /// Render a handler result to stdout (result) / stderr (human diagnostics) and
-/// exit with the mapped code. `now` supplies the envelope timestamp so the
-/// injected clock controls it end-to-end.
+/// exit with the mapped code. The timestamp argument comes from the injected
+/// clock, so envelopes carry the same time source as domain stamps.
 fn emit(result: HandlerResult, cli: &Cli, command: &str, now: OffsetDateTime) {
     match result {
         Ok(out) => {
@@ -126,9 +126,8 @@ fn emit(result: HandlerResult, cli: &Cli, command: &str, now: OffsetDateTime) {
                 }
                 print!("{}", out.human);
             }
-            // Handlers can override the exit code for non-error outcomes
-            // (CLI-013: an interrupted transfer still emits its envelope but
-            // exits 130).
+            // Handlers can override the exit code for non-error outcomes (an
+            // interrupted transfer still emits its envelope but exits 130).
             std::process::exit(out.exit_code.unwrap_or(0));
         }
         Err(e) => {

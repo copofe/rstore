@@ -1,4 +1,4 @@
-//! Cross-process write lock (DATA-008).
+//! Cross-process write lock.
 //!
 //! The catalog has a single logical writer. A second runtime attempting to
 //! acquire the lock receives [`LockError::Busy`] so the CLI can surface a clear

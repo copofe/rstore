@@ -1,8 +1,6 @@
-//! Persistent lifecycle for one catalog index run.
-//!
-//! The storage page walker reports facts to this module. This module owns the
-//! state transitions and the rules for checkpoints, failures, refresh
-//! reconciliation, and catalog revisions.
+//! Persisted index-run lifecycle: create the run row, page-by-page
+//! checkpointed publication, and terminal-state reconciliation against the
+//! catalog.
 
 use std::sync::Arc;
 
@@ -15,20 +13,27 @@ use rstore_domain::{Clock, Result};
 
 use super::IndexReport;
 
+/// What a run starts from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RunMode {
+    /// Resume from the bucket's saved checkpoint, if any.
     Start,
+    /// Fresh scan from the bucket root; stale rows are marked afterwards.
     Refresh,
+    /// Fresh scan after marking every existing row stale; unreached rows
+    /// are deleted afterwards.
     Rebuild,
 }
 
+/// Whether a scan finished or was paused at a checkpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ScanCompletion {
     Complete,
     Paused,
 }
 
-/// The stateful, persisted part of one index run.
+/// Stateful helper owning one index run's persisted progress: the run row,
+/// per-page commits, checkpoints, and the final report.
 pub(crate) struct IndexRunLifecycle {
     bucket_id: BucketId,
     runs: Arc<dyn IndexRunStore>,
@@ -38,13 +43,15 @@ pub(crate) struct IndexRunLifecycle {
 }
 
 impl IndexRunLifecycle {
+    /// Create and persist a new `Running` run row for `bucket_id` with a
+    /// zeroed report.
     pub(crate) async fn begin(
         bucket_id: BucketId,
         runs: Arc<dyn IndexRunStore>,
         clock: Arc<dyn Clock>,
     ) -> Result<Self> {
         let run = IndexRun {
-            id: IndexRunId::new(),
+            id: IndexRunId::new_random(),
             bucket_id,
             state: IndexRunState::Running,
             started_at: clock.now(),
@@ -72,6 +79,9 @@ impl IndexRunLifecycle {
         })
     }
 
+    /// Prepare the scan start position for `mode`, returning an optional
+    /// continuation token to resume from. Rebuild additionally marks all
+    /// existing catalog rows in the bucket stale before scanning.
     pub(crate) async fn prepare(
         &mut self,
         mode: RunMode,
@@ -95,6 +105,7 @@ impl IndexRunLifecycle {
         }
     }
 
+    /// Record one listing page's object count toward `objects_seen`.
     pub(crate) fn observe_page(&mut self, objects: u64) {
         self.run.objects_seen += objects;
     }
@@ -103,12 +114,16 @@ impl IndexRunLifecycle {
         self.clock.now()
     }
 
+    /// Persist `token` as the bucket's resume checkpoint (used when a scan
+    /// is cancelled mid-run).
     pub(crate) async fn checkpoint_on_cancel(&self, token: Option<&str>) -> Result<()> {
         self.runs
             .save_checkpoint(self.bucket_id, token, self.clock.now())
             .await
     }
 
+    /// Commit one scanned page — upserts, continuation token, counters —
+    /// as a single durable unit and advance the report's upsert count.
     pub(crate) async fn publish_page(
         &mut self,
         objects: &[RemoteObject],
@@ -128,6 +143,10 @@ impl IndexRunLifecycle {
         Ok(())
     }
 
+    /// Apply mode-specific reconciliation over stale rows once the scan is
+    /// known to be complete: refresh marks pre-run rows stale, rebuild
+    /// deletes them. Paused scans reconcile nothing — their stale marks
+    /// belong to the resuming run.
     pub(crate) async fn reconcile(
         &mut self,
         mode: RunMode,
@@ -135,8 +154,8 @@ impl IndexRunLifecycle {
         catalog: &dyn RemoteObjectRepository,
     ) -> Result<()> {
         if mode == RunMode::Refresh && completion == ScanCompletion::Complete {
-            // Only a complete root scan proves that unseen rows are missing
-            // remotely. A paused scan must not reconcile.
+            // Rows not seen by this scan were last confirmed before it
+            // started, i.e. they may have vanished remotely.
             self.report.objects_stale = catalog
                 .mark_stale_older_than(self.bucket_id, self.run.started_at)
                 .await?;
@@ -147,6 +166,12 @@ impl IndexRunLifecycle {
         Ok(())
     }
 
+    /// Transition the run to its terminal state (`Succeeded` on complete,
+    /// `Paused` otherwise), persist the finish commit, and return the
+    /// final report with the post-run catalog revision.
+    ///
+    /// Errors when the persisted run's current state does not allow the
+    /// transition (e.g. it was failed concurrently).
     pub(crate) async fn finish(&mut self, completion: ScanCompletion) -> Result<IndexReport> {
         let target = match completion {
             ScanCompletion::Complete => IndexRunState::Succeeded,
@@ -178,6 +203,7 @@ impl IndexRunLifecycle {
         Ok(self.report.clone())
     }
 
+    /// Persist a `Failed` transition with a bumped error count.
     pub(crate) async fn fail(&mut self) -> Result<()> {
         self.run.state = self.run.state.transition(IndexRunState::Failed)?;
         self.run.error_count += 1;

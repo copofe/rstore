@@ -1,9 +1,8 @@
-//! Bucket management service (BKT-).
+//! Bucket management service.
 //!
-//! Discover lists remote buckets (BKT-001); manual add works without
-//! ListBuckets permission (BKT-002) and optionally verifies readability at
-//! add time (BKT-003). The read-only and allow-delete guards (SEC-004/005)
-//! live here so every later write path funnels through them.
+//! Discover lists remote buckets; manual add works without ListBuckets permission and
+//! optionally verifies readability at add time. The read-only and allow-delete guards live
+//! here so every later write path funnels through them.
 
 use std::sync::Arc;
 
@@ -58,21 +57,21 @@ impl BucketRef {
     }
 }
 
-/// Result of the add-time readability probe (BKT-003).
+/// Result of the add-time readability probe.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ReadabilityCheck {
     pub can_list: bool,
     pub detail: String,
 }
 
-/// A remote bucket discovered via ListBuckets (BKT-001).
+/// A remote bucket discovered via ListBuckets.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DiscoveredBucket {
     pub name: String,
     pub already_registered: bool,
 }
 
-/// Input for registering a bucket (BKT-002).
+/// Input for registering a bucket.
 #[derive(Debug, Clone)]
 pub struct AddBucketInput {
     pub connection: ConnectionRef,
@@ -80,7 +79,10 @@ pub struct AddBucketInput {
     pub config: BucketConfig,
 }
 
-/// Editable fields (BKT-006..010).
+/// Editable bucket fields.
+///
+/// Follows the `Option<Option<T>>` clearing convention: outer `None` keeps the value,
+/// `Some(None)` clears it, `Some(Some(v))` replaces it (`display_name`, `concurrency`).
 #[derive(Debug, Clone, Default)]
 pub struct UpdateBucketInput {
     pub display_name: Option<Option<String>>,
@@ -94,9 +96,12 @@ pub struct UpdateBucketInput {
 /// Bucket lifecycle operations.
 #[async_trait]
 pub trait BucketService: Send + Sync {
-    /// List remote buckets and whether each is already registered (BKT-001).
+    /// List remote buckets and whether each is already registered.
     async fn discover(&self, connection: &ConnectionRef) -> Result<Vec<DiscoveredBucket>>;
     /// Register a bucket locally; `verify` runs the readability probe.
+    ///
+    /// Returns the registered bucket plus the probe outcome when requested. A failed probe is
+    /// reported, not fatal — manual add is the escape hatch for restricted credentials.
     async fn add(
         &self,
         input: AddBucketInput,
@@ -106,10 +111,6 @@ pub trait BucketService: Send + Sync {
     async fn resolve(&self, reference: &BucketRef) -> Result<Bucket>;
     async fn update(&self, id: BucketId, input: UpdateBucketInput) -> Result<Bucket>;
     async fn remove(&self, reference: &BucketRef) -> Result<()>;
-    /// Guard: the bucket must accept writes (SEC-004).
-    async fn assert_writable(&self, id: BucketId) -> Result<()>;
-    /// Guard: the bucket must accept deletions (SEC-005).
-    async fn assert_deletable(&self, id: BucketId) -> Result<()>;
 }
 
 /// SQLite-backed default implementation.
@@ -142,7 +143,7 @@ impl BucketService for DefaultBucketService {
     async fn discover(&self, connection: &ConnectionRef) -> Result<Vec<DiscoveredBucket>> {
         let (config, storage) = self.gateway.storage(connection).await?;
         let remote = storage.list_buckets().await.map_err(|e| {
-            // BKT-001: no ListBuckets permission must not block manual add.
+            // No ListBuckets permission must not block manual add.
             e.with_context("hint", "manual `bucket add` works without list permission")
         })?;
         let registered = self.buckets.list_by_connection(config.id).await?;
@@ -176,8 +177,8 @@ impl BucketService for DefaultBucketService {
             )));
         }
 
-        // BKT-003: probe readability unless explicitly skipped. A failed probe
-        // does not block registration (manual add is the escape hatch).
+        // Probe readability unless explicitly skipped. A failed probe does not block
+        // registration (manual add is the escape hatch).
         let check = if verify {
             let storage = self.gateway.storage_for_config(&config).await?;
             let probe = match storage
@@ -206,7 +207,7 @@ impl BucketService for DefaultBucketService {
 
         let now = self.clock.now();
         let bucket = Bucket {
-            id: BucketId::new(),
+            id: BucketId::new_random(),
             connection_id: config.id,
             name: input.name.trim().to_string(),
             config: input.config,
@@ -284,34 +285,6 @@ impl BucketService for DefaultBucketService {
         }
         Ok(())
     }
-
-    async fn assert_writable(&self, id: BucketId) -> Result<()> {
-        let bucket = self.buckets.get(id).await?.ok_or_else(|| not_found(id))?;
-        if bucket.config.read_only {
-            return Err(Error::forbidden(format!(
-                "bucket `{}` is read-only (SEC-004); disable with `bucket edit`",
-                bucket.name
-            )));
-        }
-        Ok(())
-    }
-
-    async fn assert_deletable(&self, id: BucketId) -> Result<()> {
-        let bucket = self.buckets.get(id).await?.ok_or_else(|| not_found(id))?;
-        if !bucket.config.allow_delete {
-            return Err(Error::forbidden(format!(
-                "bucket `{}` does not allow deletions (SEC-005); enable with `bucket edit`",
-                bucket.name
-            )));
-        }
-        if bucket.config.read_only {
-            return Err(Error::forbidden(format!(
-                "bucket `{}` is read-only (SEC-004)",
-                bucket.name
-            )));
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -342,7 +315,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discover_add_list_edit_remove_and_guards() {
+    async fn discover_add_list_edit_remove() {
         let (buckets, connections, _factory) = setup().await;
         let conn = connections
             .add(AddConnectionInput {
@@ -419,36 +392,6 @@ mod tests {
                 .id,
             bucket.id
         );
-
-        // Read-only guard blocks writes (SEC-004)…
-        buckets
-            .update(
-                bucket.id,
-                UpdateBucketInput {
-                    read_only: Some(true),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        let blocked = buckets.assert_writable(bucket.id).await.unwrap_err();
-        assert_eq!(blocked.code, ErrorCode::Forbidden);
-
-        // …and delete guard is independent (SEC-005).
-        buckets
-            .update(
-                bucket.id,
-                UpdateBucketInput {
-                    read_only: Some(false),
-                    allow_delete: Some(false),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        let no_delete = buckets.assert_deletable(bucket.id).await.unwrap_err();
-        assert_eq!(no_delete.code, ErrorCode::Forbidden);
-        assert!(buckets.assert_writable(bucket.id).await.is_ok());
 
         buckets.remove(&BucketRef::Id(bucket.id)).await.unwrap();
         assert!(buckets.list().await.unwrap().is_empty());

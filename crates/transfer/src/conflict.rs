@@ -1,24 +1,25 @@
-//! Probe adapters and the one target reaction for
-//! [`ConflictProbe`](rstore_domain::conflict::ConflictProbe): the one place a
-//! storage handle (or the local filesystem) becomes the existence probe
-//! `domain::conflict::resolve_conflict` consumes — and the one interpretation
-//! of its decision at a transfer target. Engine upload and copy share
-//! `stat_probe`; download targets use `path_probe`; all three funnel through
-//! [`decide_target`].
+//! Existence probes and the single target reaction for the domain conflict
+//! decision table: a storage handle (or the local filesystem) becomes the
+//! probe `domain::conflict::resolve_conflict` consumes, and its decision is
+//! interpreted once at a transfer target via [`decide_target`].
 
 use std::sync::Arc;
 
-use rstore_domain::conflict::{random_suffix8, resolve_conflict, ConflictProbe, Resolved};
+use rstore_domain::conflict::{
+    random_suffix8, resolve_conflict, ConflictProbe, Existence, Resolved,
+};
 use rstore_domain::policy::ConflictPolicy;
 use rstore_domain::remote::ObjectPath;
-use rstore_domain::Result;
+use rstore_domain::{ErrorCode, Result};
 use rstore_storage_api::Storage;
 
 use crate::engine::ItemOutcome;
 
-/// A storage-backed existence probe: a name collides when the target bucket
-/// already holds an object with that key. Probe errors read as "no conflict"
-/// at the decision layer — the write itself surfaces real failures.
+/// A storage-backed existence probe: a name is taken when the target bucket
+/// holds an object with that key. A missing object reads `Free`; anything
+/// else — timeouts, 5xx, auth failures — reads `Unknown`, so the decision
+/// layer can retry once and then block the item instead of overwriting a
+/// target it never verified.
 pub fn stat_probe(storage: &Arc<dyn Storage>, bucket: &str) -> Box<ConflictProbe> {
     let storage = storage.clone();
     let bucket = bucket.to_string();
@@ -26,10 +27,14 @@ pub fn stat_probe(storage: &Arc<dyn Storage>, bucket: &str) -> Box<ConflictProbe
         let storage = storage.clone();
         let bucket = bucket.clone();
         Box::pin(async move {
-            match ObjectPath::new(&name) {
+            let Ok(key) = ObjectPath::new(&name) else {
                 // An unparseable candidate cannot exist as an object.
-                Err(_) => false,
-                Ok(key) => storage.stat(&bucket, &key).await.is_ok(),
+                return Existence::Free;
+            };
+            match storage.stat(&bucket, &key).await {
+                Ok(_) => Existence::Taken,
+                Err(error) if error.code == ErrorCode::NotFound => Existence::Free,
+                Err(_) => Existence::Unknown,
             }
         })
     })
@@ -37,12 +42,20 @@ pub fn stat_probe(storage: &Arc<dyn Storage>, bucket: &str) -> Box<ConflictProbe
 
 /// A local-filesystem existence probe (download targets on disk).
 pub fn path_probe() -> Box<ConflictProbe> {
-    Box::new(|name: String| Box::pin(async move { std::path::Path::new(&name).exists() }))
+    Box::new(|name: String| {
+        Box::pin(async move {
+            if std::path::Path::new(&name).exists() {
+                Existence::Taken
+            } else {
+                Existence::Free
+            }
+        })
+    })
 }
 
 /// The one reaction to a conflict decision at a transfer target: write —
 /// under the policy's final name — or finish the item untouched. The rename
-/// Rename re-entry is a loop, so a renamed item does not re-run the caller's
+/// re-entry is a loop, so a renamed item does not re-run the caller's
 /// preamble.
 pub enum TargetDecision<T> {
     /// Write the item (the target differs from the given name when the policy

@@ -1,9 +1,6 @@
-//! Catalog projections for live storage observations.
-//!
-//! Read paths such as indexing and `remote ls --update-catalog` propagate their
-//! catalog errors. Completed remote mutations are settled by
-//! [`crate::mutation::MutationCoordinator`], which owns the fact, projection
-//! and repair sequence.
+//! Catalog write helpers shared by confirmation flows (listing sync,
+//! transfer receipts): build confirmed catalog rows from storage metadata
+//! and upsert them.
 
 use rstore_catalog::RemoteObjectRepository;
 use rstore_domain::id::RemoteObjectId;
@@ -19,7 +16,7 @@ fn confirmed_object(
     at: OffsetDateTime,
 ) -> Result<RemoteObject> {
     Ok(RemoteObject {
-        id: RemoteObjectId::new(),
+        id: RemoteObjectId::new_random(),
         connection_id: connection,
         bucket_id: bucket,
         path: ObjectPath::new(&metadata.key)?,
@@ -34,6 +31,10 @@ fn confirmed_object(
     })
 }
 
+/// Build confirmed catalog rows for one listing page.
+///
+/// Errors when any entry's key violates [`ObjectPath`] rules; the whole
+/// page fails rather than being silently partial.
 pub(crate) fn confirmed_objects<'a>(
     connection: ConnectionId,
     bucket: BucketId,
@@ -46,8 +47,8 @@ pub(crate) fn confirmed_objects<'a>(
         .collect()
 }
 
-/// Persist one storage-confirmed object. Indexing and explicit catalog update
-/// commands propagate this result because the catalog write is their work.
+/// Upsert a single object into the catalog in [`RemoteObject`] confirmed
+/// state, stamped at `at`. Errors on path validation or repository failure.
 pub(crate) async fn upsert_confirmed(
     catalog: &dyn RemoteObjectRepository,
     connection: ConnectionId,
@@ -59,10 +60,7 @@ pub(crate) async fn upsert_confirmed(
     catalog.upsert(&object).await
 }
 
-/// Upsert a page of listed objects as confirmed rows — the shared loop
-/// behind the indexer's scan and `remote ls`'s catalog update
-/// (IDX-002..004). Cataloguing reads propagate failures. Returns how many
-/// rows were written.
+/// Upsert one listing page and report how many rows were written.
 pub(crate) async fn sync_page<'a>(
     catalog: &dyn RemoteObjectRepository,
     connection: ConnectionId,

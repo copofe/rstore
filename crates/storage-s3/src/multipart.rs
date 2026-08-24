@@ -1,8 +1,8 @@
-//! The S3 multipart session: one home for the provider-side protocol
-//! (STORE-012/013). Part upload, server-side part copy, completion and the
-//! abort dispositions all live behind
-//! [`rstore_storage_api::MultipartSession`]; the adapter never re-rolls the
-//! protocol for its own copy path.
+//! The S3 multipart session: one home for the provider-side protocol.
+//!
+//! Part upload, server-side part copy, completion and the abort dispositions
+//! all live behind [`rstore_storage_api::MultipartSession`]; the adapter
+//! never re-rolls the protocol for its own copy path.
 
 use async_trait::async_trait;
 use aws_sdk_s3::primitives::ByteStream;
@@ -73,6 +73,10 @@ impl MultipartSession for S3MultipartSession {
 
     /// Server-side part copy (`UploadPartCopy`): the part's bytes are copied
     /// by the provider — no object bytes transit the local device.
+    ///
+    /// # Errors
+    /// Fails when `range` is unbounded — S3's UploadPartCopy requires an
+    /// explicit CopySourceRange; an open-ended range is not expressible.
     async fn copy_part(
         &self,
         part_number: u32,
@@ -80,8 +84,6 @@ impl MultipartSession for S3MultipartSession {
         source_key: &ObjectPath,
         range: ReadRange,
     ) -> Result<UploadedPart> {
-        // S3's UploadPartCopy requires an explicit CopySourceRange; an
-        // open-ended range is not expressible.
         let Some(end) = range.end else {
             return Err(Error::invalid_input(
                 "copy_part requires a bounded range (end must be set)",

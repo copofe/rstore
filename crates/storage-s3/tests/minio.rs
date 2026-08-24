@@ -1,4 +1,4 @@
-//! MinIO integration test (QA-005).
+//! Live MinIO integration tests for the S3 storage adapter.
 //!
 //! Gated behind `RSTORE_MINIO_ENDPOINT` so it only runs when a MinIO instance is
 //! reachable. Run locally, e.g.:
@@ -35,7 +35,7 @@ fn load_minio() -> Option<Minio> {
 
 fn make_storage(m: &Minio, addressing: AddressingStyle) -> S3Storage {
     let config = ConnectionConfig {
-        id: rstore_domain::ConnectionId::new(),
+        id: rstore_domain::ConnectionId::new_random(),
         name: "minio-test".into(),
         endpoint: m.endpoint.clone(),
         public_base_url: None,
@@ -70,7 +70,7 @@ async fn ensure_bucket(client: &aws_sdk_s3::Client, bucket: &str) {
 /// `build_client` path as the adapter under test.
 fn creds_for(m: &Minio) -> aws_sdk_s3::Client {
     let config = ConnectionConfig {
-        id: rstore_domain::ConnectionId::new(),
+        id: rstore_domain::ConnectionId::new_random(),
         name: "minio-admin".into(),
         endpoint: m.endpoint.clone(),
         public_base_url: None,
@@ -112,8 +112,8 @@ async fn minio_satisfies_storage_contract() {
     let storage = make_storage(&minio, AddressingStyle::Path);
     rstore_test_support::storage_contract(&storage, &bucket).await;
 
-    // The part-copy path (STORE-016, objects beyond the atomic limit) with
-    // the limit lowered so a small object exercises `UploadPartCopy`: the
+    // The part-copy path for objects beyond the atomic limit, with the
+    // limit lowered so a small object exercises `UploadPartCopy`: the
     // copied bytes are identical and the size survives the part assembly.
     use rstore_domain::remote::ObjectPath;
     use rstore_storage_api::model::{CopyRequest, PutOptions};
@@ -121,7 +121,10 @@ async fn minio_satisfies_storage_contract() {
     // S3 requires non-final parts of at least 5 MiB, so the limit stays at
     // the real minimum and the source exceeds it by two parts plus a tail.
     const PART: u64 = 5 * 1024 * 1024;
-    let small_limit = S3Storage::with_single_copy_limit(creds_for(&minio), PART);
+    let small_limit = S3Storage::with_single_copy_limit(
+        creds_for(&minio),
+        std::num::NonZeroU64::new(PART).unwrap(),
+    );
     let source = ObjectPath::new("contract/parted-source.bin").unwrap();
     let target = ObjectPath::new("contract/parted-target.bin").unwrap();
     let payload: Vec<u8> = (0..(PART * 2 + 1024) as usize)
@@ -193,6 +196,12 @@ async fn minio_engine_resumes_an_interrupted_upload_byte_exact() {
 
     const PART: u64 = 5 * 1024 * 1024;
 
+    /// Deterministic checkpoint identity for the resumed upload.
+    fn conn() -> rstore_domain::ConnectionId {
+        use std::str::FromStr as _;
+        rstore_domain::ConnectionId::from_str("conn_00000000-0000-0000-0000-000000000000").unwrap()
+    }
+
     /// Cancels the run once a part boundary is crossed: deterministic
     /// mid-flight interruption. `done` is the engine's cumulative counter,
     /// so a single comparison suffices.
@@ -226,7 +235,7 @@ async fn minio_engine_resumes_an_interrupted_upload_byte_exact() {
     // The database handle must outlive the checkpoint store (the store owns
     // only cloned pools).
     let checkpoints_db = Database::open_in_memory().await.unwrap();
-    let checkpoints = Arc::new(checkpoints_db.multipart(Arc::new(rstore_domain::SystemClock)));
+    let checkpoints = Arc::new(checkpoints_db.multipart());
     let engine = TransferEngine::new(
         storage.clone(),
         checkpoints.clone(),
@@ -252,7 +261,7 @@ async fn minio_engine_resumes_an_interrupted_upload_byte_exact() {
         source: source.clone(),
         content_type: None,
         conflict: ConflictPolicy::Overwrite,
-        connection: "conn_minio".into(),
+        connection: conn(),
     };
 
     // Run 1: cancelled right after the first part lands on the provider.

@@ -1,12 +1,11 @@
-//! `config show` / `config export` / `config import` and `doctor` handlers
-//! (DATA-001 / DATA-015/016 / OBS-004).
+//! Handlers for configuration inspection and transfer (`config show`,
+//! `config export`, `config import`) plus environment diagnostics (`doctor`).
 
 use super::HandlerResult;
 use crate::output::HandlerOutput;
 use rstore_platform::AppDirs;
 
-// --- config show ----------------------------------------------------------
-
+/// Render the resolved application directories as a labeled detail view.
 pub(super) fn config_show(dirs: &AppDirs) -> HandlerResult {
     let data = super::json_value(dirs)?;
     let mut fields = super::format::Fields::new();
@@ -20,8 +19,11 @@ pub(super) fn config_show(dirs: &AppDirs) -> HandlerResult {
     Ok(HandlerOutput::human(fields.render()).with_data(data))
 }
 
-// --- doctor ---------------------------------------------------------------
-
+/// Report environment health: pending outbox and repair items, connection
+/// counts, database location, and storage adapter.
+///
+/// Pending repairs and interrupted jobs are surfaced as warnings on top of
+/// the detail view so they cannot scroll by unnoticed.
 pub(super) async fn doctor(
     app: &rstore_application::ApplicationApi,
     dirs: &AppDirs,
@@ -54,7 +56,7 @@ pub(super) async fn doctor(
 
     if report.pending_repairs > 0 {
         out = out.with_warning(format!(
-            "{} repair item(s) require attention — inspect with `job list` or `doctor`",
+            "{} repair item(s) require attention — inspect with `task list` or `doctor`",
             report.pending_repairs
         ));
     }
@@ -67,20 +69,22 @@ pub(super) async fn doctor(
     Ok(out)
 }
 
-// --- config export / import (DATA-015/016) ----------------------------------
-
+/// Export connections and buckets as a JSON config bundle, either to a file
+/// or to stdout when `out` is `None`.
+///
+/// # Errors
+/// Fails on serialization, file write, or any transfer-service error.
 pub(super) async fn config_export(
     out: Option<&str>,
     app: &rstore_application::ApplicationApi,
 ) -> HandlerResult {
     let bundle = app.config().transfer().export().await?;
     let json = serde_json::to_string_pretty(&bundle)
-        .map_err(|e| rstore_domain::Error::database("serialise config bundle").with_source(e))?;
+        .map_err(|e| rstore_domain::Error::unknown("serialise config bundle").with_source(e))?;
     match out {
         Some(path) => {
-            std::fs::write(path, format!("{json}\n")).map_err(|e| {
-                rstore_domain::Error::invalid_input("write export file").with_source(e)
-            })?;
+            std::fs::write(path, format!("{json}\n"))
+                .map_err(|e| rstore_domain::Error::io("write export file").with_source(e))?;
             Ok(HandlerOutput::human(format!("exported to {path}\n"))
                 .with_data(serde_json::json!({"path": path, "connections": bundle.connections.len(), "buckets": bundle.buckets.len()})))
         }
@@ -88,13 +92,18 @@ pub(super) async fn config_export(
     }
 }
 
+/// Import a JSON config bundle from `path`; `dry_run` reports what would be
+/// added or skipped without persisting anything.
+///
+/// # Errors
+/// Fails on file read, bundle deserialization, or any transfer-service error.
 pub(super) async fn config_import(
     path: &str,
     dry_run: bool,
     app: &rstore_application::ApplicationApi,
 ) -> HandlerResult {
     let raw = std::fs::read_to_string(path)
-        .map_err(|e| rstore_domain::Error::invalid_input("read bundle").with_source(e))?;
+        .map_err(|e| rstore_domain::Error::io("read bundle").with_source(e))?;
     let bundle: rstore_application::ConfigBundle = serde_json::from_str(&raw)
         .map_err(|e| rstore_domain::Error::invalid_input("parse bundle").with_source(e))?;
     let report = app.config().transfer().import(&bundle, dry_run).await?;

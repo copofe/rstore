@@ -1,5 +1,4 @@
-//! Repository contract + migration tests (QA-003 / QA-017).
-
+//! Repository contract and migration-upgrade tests.
 use rstore_application_ports::{BucketStore, ConnectionStore, TagStore, WorkspaceStore};
 use rstore_catalog::TagStore as _;
 use rstore_domain::connection::{AddressingStyle, ConnectionConfig, Region};
@@ -11,7 +10,7 @@ use time::OffsetDateTime;
 fn sample(name: &str) -> ConnectionConfig {
     let now = OffsetDateTime::now_utc();
     ConnectionConfig {
-        id: ConnectionId::new(),
+        id: ConnectionId::new_random(),
         name: name.into(),
         endpoint: "https://s3.example.com".into(),
         public_base_url: Some("https://public.example.com".into()),
@@ -34,14 +33,12 @@ async fn connection_crud_round_trip() {
 
     let mut cfg = sample("prod-r2");
     db.connections().insert(&cfg).await.unwrap();
-    assert_eq!(db.connections().count().await.unwrap(), 1);
+    assert_eq!(db.connections().list().await.unwrap().len(), 1);
 
-    // Duplicate name must surface as a Conflict (CON-002).
     let dup = sample("prod-r2");
     let err = db.connections().insert(&dup).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::Conflict);
 
-    // Region/addressing survive a round trip.
     let fetched = db
         .connections()
         .get_by_name("prod-r2")
@@ -63,18 +60,15 @@ async fn connection_crud_round_trip() {
     assert_eq!(fetched.access_key.as_ref().unwrap().expose(), "AK");
     assert_eq!(fetched.secret_key.as_ref().unwrap().expose(), "SK");
 
-    // Update mutates and persists.
     cfg.endpoint = "https://s3.new.example.com".into();
     db.connections().update(&cfg).await.unwrap();
     let after = db.connections().get(cfg.id).await.unwrap().unwrap();
     assert_eq!(after.endpoint, "https://s3.new.example.com");
 
-    // Delete then missing.
     assert!(db.connections().delete(cfg.id).await.unwrap());
     assert!(db.connections().get(cfg.id).await.unwrap().is_none());
 }
 
-/// The connection test status columns round-trip (CON-007/010).
 #[tokio::test]
 async fn connection_test_status_round_trip() {
     use rstore_domain::connection::ConnectionTestStatus;
@@ -118,7 +112,6 @@ async fn migrations_are_idempotent_on_reopen() {
     {
         let _db = Database::open(&db_path).await.unwrap();
     }
-    // Reopening the same file must not re-run / fail migrations.
     let _db = Database::open(&db_path).await.unwrap();
 }
 
@@ -234,15 +227,12 @@ async fn legacy_migration_history_is_upgraded() {
     assert_eq!(outbox_exists, 1);
 }
 
-/// Corrupt stored state fails loud (see `CONTEXT.md`): the error names the
-/// column and the raw value instead of silently coercing a default.
 #[tokio::test]
 async fn corrupt_rows_fail_loudly() {
     let db = Database::open_in_memory().await.unwrap();
     let cfg = sample("broken");
     db.connections().insert(&cfg).await.unwrap();
 
-    // A closed-vocabulary token that no version ever wrote.
     sqlx::query("UPDATE storage_connections SET addressing_style = 'gibberish'")
         .execute(db.pool())
         .await
@@ -255,7 +245,6 @@ async fn corrupt_rows_fail_loudly() {
         err.message
     );
 
-    // An out-of-range timestamp is equally loud.
     sqlx::query(
         "UPDATE storage_connections
          SET addressing_style = 'path', created_at = 99999999999999",
@@ -271,8 +260,6 @@ async fn corrupt_rows_fail_loudly() {
         err.message
     );
 }
-
-// --- CatalogQuery seam contract (MIX-011/015, IDX-024, QA-003) -------------
 
 use std::sync::Arc;
 
@@ -290,7 +277,7 @@ async fn catalog_fixture() -> (rstore_persistence::Database, Scope) {
     let conn = sample("catalog-conn");
     db.connections().insert(&conn).await.unwrap();
     let bucket = Bucket {
-        id: BucketId::new(),
+        id: BucketId::new_random(),
         connection_id: conn.id,
         name: "media".into(),
         config: BucketConfig::default(),
@@ -299,7 +286,7 @@ async fn catalog_fixture() -> (rstore_persistence::Database, Scope) {
     };
     db.buckets().insert(&bucket).await.unwrap();
     let workspace = Workspace {
-        id: WorkspaceId::new(),
+        id: WorkspaceId::new_random(),
         name: "w".into(),
         description: None,
         created_at: now,
@@ -321,9 +308,9 @@ async fn catalog_fixture() -> (rstore_persistence::Database, Scope) {
 fn object(path: &str, size: u64) -> RemoteObject {
     let now = OffsetDateTime::now_utc();
     RemoteObject {
-        id: RemoteObjectId::new(),
-        connection_id: ConnectionId::new(), // corrected below per fixture
-        bucket_id: BucketId::new(),
+        id: RemoteObjectId::new_random(),
+        connection_id: ConnectionId::new_random(),
+        bucket_id: BucketId::new_random(),
         path: ObjectPath::new(path).unwrap(),
         size,
         etag: None,
@@ -336,10 +323,6 @@ fn object(path: &str, size: u64) -> RemoteObject {
     }
 }
 
-/// The SQLite repositories run the shared catalog contract (QA-003): the
-/// same suite as the in-memory reference adapter — filters, workspace
-/// scoping, state handling, total order, keyset-cursor stability under
-/// mid-walk upserts, and the write face.
 struct SqliteCatalogFixture {
     db: Database,
 }
@@ -453,11 +436,9 @@ async fn fts_index_follows_deletes_and_updates() {
     }
     assert_eq!(count(&repo, &scope, "vanish").await, 1);
 
-    // Deleting the row must drop it from the FTS index (trigger-maintained).
     repo.delete(o.id).await.unwrap();
     assert_eq!(count(&repo, &scope, "vanish").await, 0);
 
-    // A fresh upsert is searchable again.
     let mut again = object("dir/returned.txt", 1);
     again.connection_id = conn_id;
     again.bucket_id = bucket_id;
@@ -478,12 +459,7 @@ async fn name_filter_escapes_like_metacharacters() {
         repo.upsert(&o).await.unwrap();
     }
 
-    for (needle, expected) in [
-        ("a%b", 1), // literal % must not match "axb"
-        ("a_b", 1), // literal _ must not match "axb"
-        ("plain", 1),
-        ("a", 4),
-    ] {
+    for (needle, expected) in [("a%b", 1), ("a_b", 1), ("plain", 1), ("a", 4)] {
         let n = repo
             .count(
                 scope,
@@ -506,9 +482,9 @@ async fn file_type_filter_uses_stored_classification() {
     let repo = db.remote_objects();
     let mut expected = std::collections::BTreeMap::new();
     for (path, kind) in [
-        ("img/pic.bmp", "image"),   // missed by the pre-column SQL clause
-        ("vid/clip.avi", "video"),  //
-        ("aud/track.m4a", "audio"), //
+        ("img/pic.bmp", "image"),
+        ("vid/clip.avi", "video"),
+        ("aud/track.m4a", "audio"),
         ("doc/report.pdf", "document"),
         ("arch/bundle.rar", "archive"),
         ("misc/noext", "other"),

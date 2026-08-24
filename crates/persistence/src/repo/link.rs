@@ -1,5 +1,4 @@
-//! Repository for per-bucket link settings (LINK-003..007).
-
+//! Repository for per-bucket link settings.
 use async_trait::async_trait;
 use rstore_application_ports::LinkProfileStore;
 use rstore_domain::id::BucketId;
@@ -11,8 +10,8 @@ use crate::codec::{Insert, RowReader};
 use crate::error::map_sqlx;
 use crate::tx::WriteGate;
 
-/// CRUD over `link_profiles`; absent rows mean [`LinkProfile::default`].
 #[derive(Clone)]
+/// CRUD over `link_profiles`; absent rows mean [`LinkProfile::default`].
 pub struct LinkRepository {
     gate: WriteGate,
     read_pool: SqlitePool,
@@ -51,7 +50,7 @@ impl LinkProfileStore for LinkRepository {
         }
     }
 
-    /// Insert or replace the bucket's profile (LINK-003).
+    /// Insert or replace the bucket's profile.
     async fn upsert(&self, bucket: BucketId, profile: &LinkProfile) -> Result<()> {
         let _write = self.gate.permit().await?;
         Insert::into("link_profiles")

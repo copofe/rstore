@@ -1,7 +1,11 @@
 //! Test-only SQLite composition helper.
 //!
 //! Keeping this in a separate crate means `rstore-application` itself has no
-//! persistence dependency, even when integration tests want a real database.
+//! persistence dependency in its published build; the feature-gated fixture
+//! inside the application crate serves its own unit tests. The split exists
+//! because a support crate wrapping `Application` cannot be consumed by the
+//! application's internal tests — the dev-cycle would put two distinct
+//! `Application` types in one dependency graph.
 
 use rstore_application::Application;
 use rstore_persistence::Database;

@@ -1,4 +1,4 @@
-//! Progress reporting for transfers (JOB-005/016/018).
+//! Progress reporting for transfers.
 
 use serde::{Deserialize, Serialize};
 
@@ -28,10 +28,10 @@ impl Progress {
     }
 }
 
-/// Sink for progress events. Implementations coalesce high-frequency updates so
-/// the UI/CLI isn't flooded (PRD §10.13.5). Progress MUST go to stderr, never
-/// stdout (CLI-006).
+/// Sink for progress events. Implementations coalesce high-frequency updates
+/// so the UI/CLI isn't flooded; progress MUST go to stderr, never stdout.
 pub trait ProgressSink: Send + Sync {
+    /// Receive one progress snapshot.
     fn report(&self, progress: Progress);
 }
 

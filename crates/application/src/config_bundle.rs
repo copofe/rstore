@@ -1,9 +1,8 @@
-//! Config import/export (DATA-015/016).
+//! Config import/export.
 //!
-//! A ConfigBundle is the portable JSON form of the registry: every connection
-//! and bucket, with credential values omitted by serde (SEC-001). Importing
-//! re-adds entries through the ordinary services with conflict checks
-//! (existing name → skipped) and an optional dry run.
+//! A ConfigBundle is the portable JSON form of the registry: every connection and bucket, with
+//! credential values omitted by serde. Importing re-adds entries through the ordinary services
+//! with conflict checks (existing name → skipped) and an optional dry run.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -25,15 +24,15 @@ pub struct BucketExport {
     pub config: rstore_domain::BucketConfig,
 }
 
-/// The portable registry (DATA-015).
+/// The portable registry snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigBundle {
     pub connections: Vec<ConnectionConfig>,
     pub buckets: Vec<BucketExport>,
 }
 
-/// Outcome of an import (DATA-016): per-section counts, never an error —
-/// conflicts are skips, and a dry run adds nothing.
+/// Outcome of an import: per-section counts, never an error — conflicts are skips, and a dry
+/// run adds nothing.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ImportReport {
     pub dry_run: bool,
@@ -62,8 +61,10 @@ struct PlannedBucket {
     decision: ImportDecision,
 }
 
-/// The registry snapshot's decisions for one import. Dry-run and execution
-/// both consume this value so they cannot disagree about logical identities.
+/// The registry snapshot's decisions for one import.
+///
+/// Dry-run and execution both consume this value so they cannot disagree about logical
+/// identities.
 #[derive(Debug, Clone)]
 struct ImportPlan {
     connections: Vec<PlannedConnection>,
@@ -112,7 +113,8 @@ impl DefaultConfigTransferService {
         }
     }
 
-    /// Serialise the registry without credential values (DATA-015).
+    /// Serialise the registry without credential values; the exported bundle never contains a
+    /// secret.
     pub async fn export(&self) -> Result<ConfigBundle> {
         let list = self
             .connections
@@ -142,9 +144,10 @@ impl DefaultConfigTransferService {
         })
     }
 
-    /// Build a logical import plan from one registry snapshot. A newly added
-    /// connection gets a planned identity immediately, so buckets can refer
-    /// to it before execution has created its database ID.
+    /// Build a logical import plan from one registry snapshot.
+    ///
+    /// A newly added connection gets a planned identity immediately, so buckets can refer to
+    /// it before execution has created its database ID.
     async fn plan(&self, bundle: &ConfigBundle) -> Result<ImportPlan> {
         let existing_connections = self.connections.list().await?;
         let existing_buckets = self.buckets.list().await?;
@@ -159,8 +162,8 @@ impl DefaultConfigTransferService {
             let (decision, existing_id) = if let Some(target) = targets.get(&config.name) {
                 (ImportDecision::Skip, *target)
             } else {
-                // `None` is a deliberate logical target: execution will fill
-                // in the generated ID after the connection is inserted.
+                // `None` is a deliberate logical target: execution will fill in the generated
+                // ID after the connection is inserted.
                 targets.insert(config.name.clone(), None);
                 (ImportDecision::Add, None)
             };
@@ -202,8 +205,9 @@ impl DefaultConfigTransferService {
         })
     }
 
-    /// Execute or preview a previously derived plan. Existing names are
-    /// skipped and never overwritten.
+    /// Execute or preview a previously derived plan.
+    ///
+    /// Existing names are skipped and never overwritten.
     pub async fn import(&self, bundle: &ConfigBundle, dry_run: bool) -> Result<ImportReport> {
         let plan = self.plan(bundle).await?;
         let report = plan.report(dry_run);
@@ -248,7 +252,8 @@ impl DefaultConfigTransferService {
                         name: bucket.export.name.clone(),
                         config: bucket.export.config.clone(),
                     },
-                    false, // imported buckets skip the readability probe
+                    // Imported buckets skip the readability probe.
+                    false,
                 )
                 .await?;
         }
@@ -265,7 +270,7 @@ fn connection_input(config: &ConnectionConfig) -> crate::connection::AddConnecti
         region: config.region.clone(),
         addressing_style: config.addressing_style,
         tls_verify: config.tls_verify,
-        // DATA-016: credentials are intentionally not portable.
+        // Credentials are intentionally not portable.
         credentials: None,
     }
 }

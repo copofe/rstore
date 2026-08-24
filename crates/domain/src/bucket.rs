@@ -1,7 +1,7 @@
-//! Bucket domain model (BKT-).
+//! Local bucket registration model.
 //!
-//! `Bucket` is the local registration of a real remote bucket plus its
-//! per-machine settings (BKT-006..010). It does not own remote data.
+//! A [`Bucket`] is the local registration of a real remote bucket together
+//! with its per-machine settings. It does not own remote data.
 
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -12,17 +12,17 @@ use crate::policy::ConflictPolicy;
 /// Locally-configured settings attached to a real bucket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BucketConfig {
-    /// Display name override (defaults to the real bucket name — BKT-006).
+    /// Display name override; defaults to the real bucket name.
     pub display_name: Option<String>,
-    /// Core-level read-only guard (BKT-007 / SEC-004).
+    /// Core-level read-only guard.
     pub read_only: bool,
-    /// Whether destructive operations are allowed (BKT-008 / SEC-005).
+    /// Whether destructive operations are allowed.
     pub allow_delete: bool,
-    /// Whether this bucket participates in the index (BKT-009).
+    /// Whether this bucket participates in the index.
     pub index_enabled: bool,
-    /// Default conflict policy for transfers into this bucket (BKT-010).
+    /// Default conflict policy for transfers into this bucket.
     pub default_conflict: ConflictPolicy,
-    /// Per-bucket concurrency override (None = use global, BKT-012).
+    /// Per-bucket concurrency override; `None` falls back to the global limit.
     pub concurrency: Option<u32>,
 }
 

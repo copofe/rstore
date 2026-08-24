@@ -1,17 +1,27 @@
+//! Secret wrapping and display masking for credentials.
+
 use std::fmt;
 
 /// A value whose Debug output never includes the underlying text.
+///
+/// Wrap every credential in this type so accidental `{:?}` logging of a
+/// struct carrying it cannot leak the value; display paths must call
+/// [`expose`](Secret::expose) explicitly and are expected to go through
+/// [`mask_secret`].
 pub struct Secret<T>(T);
 
 impl<T> Secret<T> {
+    /// Wrap a raw secret value.
     pub fn new(value: T) -> Self {
         Self(value)
     }
 
+    /// Borrow the underlying value. Callers must not log or serialise it.
     pub fn expose(&self) -> &T {
         &self.0
     }
 
+    /// Unwrap into the raw value, consuming the wrapper.
     pub fn into_inner(self) -> T {
         self.0
     }

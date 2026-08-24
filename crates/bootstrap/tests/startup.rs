@@ -1,12 +1,13 @@
-//! The production startup path (CONTEXT.md: 启动编排).
+//! The production startup path.
 //!
 //! Service tests deliberately skip [`Application::initialize`] to stay
-//! deterministic; this test is the one place the JOB-015 recovery rule runs
+//! deterministic; this test is the one place the startup recovery rule runs
 //! against the real production wiring: a job orphaned by a dead process must
 //! come back as `interrupted`, while terminal states are left untouched.
 
+use rstore_application_ports::JobRepository;
 use rstore_bootstrap::{Runtime, RuntimeConfig};
-use rstore_domain::job::{Job, JobKind, JobRepository, JobState};
+use rstore_domain::job::{Job, JobKind, JobState};
 use rstore_domain::{Clock, JobId, SystemClock};
 
 #[tokio::test]
@@ -20,10 +21,10 @@ async fn open_marks_jobs_orphaned_by_a_dead_process_interrupted() {
     let (orphan_id, settled_id) = {
         let db = rstore_persistence::Database::open(&db_path).await.unwrap();
 
-        let mut orphan = Job::new(JobKind::Upload, JobId::new(), clock.now());
+        let mut orphan = Job::new(JobKind::Upload, JobId::new_random(), clock.now());
         orphan.transition(JobState::Running, clock.now()).unwrap();
 
-        let mut settled = Job::new(JobKind::Download, JobId::new(), clock.now());
+        let mut settled = Job::new(JobKind::Download, JobId::new_random(), clock.now());
         settled.transition(JobState::Running, clock.now()).unwrap();
         settled
             .transition(JobState::Succeeded, clock.now())

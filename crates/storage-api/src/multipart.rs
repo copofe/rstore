@@ -1,8 +1,9 @@
-//! The provider multipart protocol (STORE-012/013, UP-014/015).
+//! The provider multipart protocol.
 //!
 //! Two ports live here. [`MultipartSession`] is the provider-side lifetime:
 //! one session type owns part/complete/abort and the abort dispositions,
-//! reached through the session factories on [`Storage`] (`create_multipart`
+//! reached through the session factories on [`crate::storage::Storage`]
+//! (`create_multipart`
 //! and `adopt_multipart`) — the protocol has one home below every consumer.
 //! [`MultipartStore`] is where transfer checkpoints persist between runs;
 //! the SQLite adapter (`rstore-persistence`) and the engine
@@ -10,6 +11,7 @@
 //! Sessions never touch checkpoints.
 
 use bytes::Bytes;
+use rstore_domain::id::ConnectionId;
 use rstore_domain::remote::ObjectPath;
 use rstore_domain::{Error, Result};
 
@@ -43,6 +45,11 @@ pub trait MultipartSession: Send + Sync {
 
     /// Copy one part provider-side from `range` of the source object — no
     /// object bytes transit the local device.
+    ///
+    /// # Errors
+    /// Defaults to `ErrorCode::CapabilityUnsupported`; adapters without
+    /// server-side part copy keep the default. Implementations may require a
+    /// bounded `range` (an open-ended end is not expressible on S3).
     async fn copy_part(
         &self,
         _part_number: u32,
@@ -54,7 +61,7 @@ pub trait MultipartSession: Send + Sync {
     }
 
     /// Finalise the upload from the ordered completed parts. Never aborts on
-    /// failure.
+    /// failure — a completion failure leaves the provider upload in place.
     async fn complete(&self, parts: &[UploadedPart]) -> Result<ObjectMetadata>;
 
     /// Strict abort: a failed abort *is* the error.
@@ -76,20 +83,26 @@ pub trait MultipartSession: Send + Sync {
 /// Where multipart checkpoints persist between runs (implemented over SQLite
 /// by the persistence layer; kept abstract so consumers stay substitutable —
 /// two adapters make the seam real: SQLite in production, the no-op in tests).
+///
+/// All methods key on `(connection, bucket, key)`; the connection is the
+/// typed local identity, the bucket the provider-facing name.
 #[async_trait::async_trait]
 pub trait MultipartStore: Send + Sync {
     /// The pending upload for (connection, bucket, key), with its completed
-    /// parts — `None` when nothing is in flight.
+    /// parts — `None` when nothing is in flight. The connection is the typed
+    /// local identity (checkpoints survive across runs and must never attach
+    /// to a different endpoint by string coincidence); the bucket stays the
+    /// provider-facing name the remote session calls use.
     async fn pending(
         &self,
-        connection: &str,
+        connection: ConnectionId,
         bucket: &str,
         key: &str,
     ) -> Result<Option<PendingUpload>>;
     /// Record the upload id for a new multipart upload.
     async fn started(
         &self,
-        connection: &str,
+        connection: ConnectionId,
         bucket: &str,
         key: &str,
         upload_id: &str,
@@ -98,16 +111,18 @@ pub trait MultipartStore: Send + Sync {
     /// Persist a completed part.
     async fn part_done(
         &self,
-        connection: &str,
+        connection: ConnectionId,
         bucket: &str,
         key: &str,
         part: &UploadedPart,
     ) -> Result<()>;
     /// Drop the checkpoint (upload completed or aborted).
-    async fn cleared(&self, connection: &str, bucket: &str, key: &str) -> Result<()>;
+    async fn cleared(&self, connection: ConnectionId, bucket: &str, key: &str) -> Result<()>;
 }
 
 /// A no-op checkpoint store (tests / adapters without resumable uploads).
+///
+/// `pending` always reports `None`, so consumers never attempt a resume.
 #[derive(Debug, Default)]
 pub struct NoopMultipartStore;
 
@@ -115,7 +130,7 @@ pub struct NoopMultipartStore;
 impl MultipartStore for NoopMultipartStore {
     async fn pending(
         &self,
-        _connection: &str,
+        _connection: ConnectionId,
         _bucket: &str,
         _key: &str,
     ) -> Result<Option<PendingUpload>> {
@@ -123,7 +138,7 @@ impl MultipartStore for NoopMultipartStore {
     }
     async fn started(
         &self,
-        _connection: &str,
+        _connection: ConnectionId,
         _bucket: &str,
         _key: &str,
         _upload_id: &str,
@@ -133,14 +148,14 @@ impl MultipartStore for NoopMultipartStore {
     }
     async fn part_done(
         &self,
-        _connection: &str,
+        _connection: ConnectionId,
         _bucket: &str,
         _key: &str,
         _part: &UploadedPart,
     ) -> Result<()> {
         Ok(())
     }
-    async fn cleared(&self, _connection: &str, _bucket: &str, _key: &str) -> Result<()> {
+    async fn cleared(&self, _connection: ConnectionId, _bucket: &str, _key: &str) -> Result<()> {
         Ok(())
     }
 }
@@ -170,7 +185,8 @@ impl FileFingerprint {
     }
 }
 
-/// A resumable upload checkpoint.
+/// A resumable upload checkpoint: the provider upload id, the parts already
+/// on the provider, and the source fingerprint the upload was started with.
 #[derive(Debug, Clone)]
 pub struct PendingUpload {
     pub upload_id: String,

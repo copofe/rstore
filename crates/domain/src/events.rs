@@ -35,12 +35,14 @@ pub enum DomainEvent {
 }
 
 impl DomainEvent {
+    /// The bounded context owning this fact.
     pub fn context(&self) -> BoundedContext {
         match self {
             Self::RemoteMutationCompleted { .. } => BoundedContext::Transfer,
         }
     }
 
+    /// Stable snake-case event-type token.
     pub fn event_type(&self) -> &'static str {
         match self {
             Self::RemoteMutationCompleted { .. } => "remote_mutation_completed",
@@ -48,6 +50,10 @@ impl DomainEvent {
     }
 
     /// Build the stable aggregate-facing envelope written to the outbox.
+    ///
+    /// # Panics
+    /// Panics if the event payload cannot serialise; every variant is built
+    /// from serializable values, so this is unreachable by construction.
     pub fn envelope(
         &self,
         event_id: uuid::Uuid,
@@ -57,7 +63,7 @@ impl DomainEvent {
         EventEnvelope {
             event_id,
             context: self.context(),
-            aggregate_type: self.aggregate_type(),
+            aggregate_type: self.aggregate_type().to_owned(),
             aggregate_id: self.aggregate_id().to_string(),
             aggregate_version,
             event_type: self.event_type().to_owned(),
@@ -87,8 +93,9 @@ impl DomainEvent {
 pub struct EventEnvelope {
     pub event_id: uuid::Uuid,
     pub context: BoundedContext,
-    pub aggregate_type: &'static str,
+    pub aggregate_type: String,
     pub aggregate_id: String,
+    /// Monotonic per-aggregate sequence establishing the ordering guarantee.
     pub aggregate_version: u64,
     pub event_type: String,
     pub schema_version: u32,
@@ -104,8 +111,8 @@ mod tests {
     #[test]
     fn envelope_contains_ordering_and_context_metadata() {
         let locator = RemoteLocator::new(
-            crate::id::ConnectionId::new(),
-            crate::id::BucketId::new(),
+            crate::id::ConnectionId::new_random(),
+            crate::id::BucketId::new_random(),
             crate::remote::ObjectPath::new("docs/object.bin").unwrap(),
         );
         let event = DomainEvent::RemoteMutationCompleted {

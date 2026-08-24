@@ -1,11 +1,11 @@
-//! Storage abstraction (CORE-004) and provider capability model (STORE-021).
+//! Storage abstraction and provider capability model.
 //!
 //! The [`Storage`] facade is the seam between the application core and an
 //! object store. Production wiring uses the S3 adapter; `FakeStorage` is the
 //! deterministic contract-test implementation.
 //!
-//! Dependency rule (PRD §6): this crate depends only on `domain` and basic
-//! crates — never on GPUI or a concrete SDK.
+//! Dependency rule: this crate depends only on `domain` and basic crates —
+//! never on GPUI or a concrete SDK.
 
 pub mod capability;
 pub mod factory;

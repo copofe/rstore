@@ -1,4 +1,8 @@
-//! Shared behavioral contract for every [`Storage`] adapter.
+//! Shared behavioral contract for every [`Storage`] adapter: the same
+//! assertions run against the fake and real providers, pinning put/stat/
+//! read round-trips, delimiter folding, keyset pagination stability,
+//! idempotent delete, server-side copy, presign expiry and multipart
+//! isolation.
 
 use bytes::Bytes;
 use rstore_domain::remote::ObjectPath;
@@ -194,9 +198,8 @@ pub async fn storage_contract(storage: &dyn Storage, bucket: &str) {
         .stat(bucket, &key("contract/never-existed"))
         .await
         .is_err());
-
-    // Copy (STORE-016): the copied object reads back byte-identical, the
-    // returned metadata describes the target (its key, the source's size and
+    // Copy: the copied object reads back byte-identical, the returned
+    // metadata describes the target (its key, the source's size and
     // content type), and the source is untouched.
     let copy_target = key("contract/round-trip.copy.txt");
     let copied = storage
@@ -230,7 +233,8 @@ pub async fn storage_contract(storage: &dyn Storage, bucket: &str) {
     );
 
     // Presigned expiry rides the adapter's now + the requested TTL — the
-    // same basis for every adapter (LINK-006/007).
+    // Presigned expiry rides the adapter's call time plus the requested
+    // TTL — the same basis for every adapter.
     let before = time::OffsetDateTime::now_utc();
     let presigned = storage
         .presign(&rstore_storage_api::model::PresignRequest {

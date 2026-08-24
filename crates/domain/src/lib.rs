@@ -1,8 +1,8 @@
-//! Domain core: entities, value objects, strongly-typed IDs, the unified error
-//! model, an injectable clock and the job state machine.
+//! Domain core: entities, value objects, strongly-typed IDs, the unified
+//! error model, an injectable clock and guarded state machines.
 //!
-//! Hard dependency rule (PRD §6): this crate MUST NOT depend on GPUI, the AWS
-//! SDK or SQLite. Everything in here is pure Rust + serde.
+//! Hard dependency rule: this crate MUST NOT depend on any UI toolkit, cloud
+//! SDK or database driver. Everything in here is pure Rust + serde.
 
 pub mod bucket;
 pub mod clock;
@@ -29,17 +29,18 @@ pub use contexts::BoundedContext;
 pub use error::{Error, ErrorCode, ErrorContext, Result};
 pub use events::{DomainEvent, EventEnvelope, DOMAIN_EVENT_SCHEMA_VERSION};
 pub use id::{
-    BucketId, ConnectionId, IndexRunId, JobId, RemoteObjectId, TagId, TypedId, WorkspaceId,
+    BucketId, ConnectionId, IndexRunId, JobId, ReceiptId, RemoteObjectId, RepairId, TagId, TypedId,
+    WorkspaceId,
 };
-pub use job::{Job, JobItem, JobKind, JobRepository, JobState};
+pub use job::{Job, JobItem, JobKind, JobState};
 pub use link::LinkProfile;
 pub use locator::RemoteLocator;
 pub use policy::ConflictPolicy;
 pub use remote::{FileType, ObjectPath, RemoteObject};
 pub use secret::{mask_secret, Secret};
 pub use workspace::{
-    normalize_tag_name, IgnoreRule, IndexRun, IndexRunState, ObjectState, Tag, Workspace,
-    WorkspaceBucket,
+    normalize_tag_name, IgnoreRule, IgnoreRuleId, IndexRun, IndexRunState, ObjectState, Tag,
+    Workspace, WorkspaceBucket,
 };
 
 /// Crate-wide version string surfaced by `rstore --version`.

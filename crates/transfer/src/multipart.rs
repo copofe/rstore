@@ -1,11 +1,12 @@
-//! The one resume policy for checkpointed multipart uploads (UP-014/015).
+//! The one resume policy for checkpointed multipart uploads.
 //!
-//! The provider-side session lifetime — part/complete/abort and the three
-//! failure dispositions — lives at the storage seam
-//! ([`rstore_storage_api::MultipartSession`]); this module only decides
-//! *which* session a run uses. Durable checkpoints stay behind
-//! [`rstore_storage_api::MultipartStore`]; sessions never touch them.
+//! The provider-side session lifetime — parts, completion, and the three
+//! dispositions (abandon warn-only, abort strict, complete never aborts) —
+//! lives at the storage seam (`rstore_storage_api::MultipartSession`); this
+//! module only decides which session a run uses. Durable checkpoints stay
+//! behind `rstore_storage_api::MultipartStore`; sessions never touch them.
 
+use rstore_domain::id::ConnectionId;
 use rstore_domain::remote::ObjectPath;
 use rstore_domain::Result;
 use rstore_storage_api::{
@@ -22,7 +23,7 @@ use rstore_storage_api::{
 pub(crate) async fn resume_or_begin(
     storage: &dyn Storage,
     store: &dyn MultipartStore,
-    connection: &str,
+    connection: ConnectionId,
     bucket: &str,
     key: &ObjectPath,
     fingerprint: &FileFingerprint,
@@ -54,7 +55,7 @@ pub(crate) async fn resume_or_begin(
 async fn begin(
     storage: &dyn Storage,
     store: &dyn MultipartStore,
-    connection: &str,
+    connection: ConnectionId,
     bucket: &str,
     key: &ObjectPath,
     fingerprint: &FileFingerprint,
@@ -82,7 +83,7 @@ async fn begin(
 /// (warn-only) while preserving the caller's original error.
 pub(crate) async fn abandon_with_checkpoint(
     store: &dyn MultipartStore,
-    connection: &str,
+    connection: ConnectionId,
     bucket: &str,
     key: &str,
     session: Box<dyn MultipartSession>,

@@ -1,13 +1,9 @@
-//! The one bounded chunk walk.
+//! The one bounded chunk walk: constant-memory loops over remote ranges.
 //!
-//! Every constant-memory byte loop over a remote range — the engine's
-//! download chunks and the relay's cross-adapter parts — walks `[0, total)`
-//! in exclusive ranges of at most `chunk` bytes, checks cancellation per
-//! chunk and reports cumulative byte progress. [`ChunkPlan`] owns the range
-//! math (the `min(chunk, remaining)` arithmetic); [`pump`] owns the loop
-//! itself. The upload's part loop rides
-//! [`ChunkPlan`] but keeps its body in the engine: its producer is a local
-//! file with prefix-skip resume and per-part checkpoints, not a ranged read.
+//! Every download chunk and cross-adapter relay part walks `[0, total)` in
+//! exclusive ranges of at most `chunk` bytes, checks cancellation per chunk,
+//! and reports cumulative byte progress. [`ChunkPlan`] owns the range math
+//! (including the multipart skip decisions); [`pump`] owns the loop.
 
 use async_trait::async_trait;
 use bytes::Bytes;

@@ -1,4 +1,4 @@
-//! S3 client factory (STORE-001).
+//! S3 client factory.
 //!
 //! [`S3StorageFactory`] implements the [`StorageFactory`] seam: it builds an
 //! [`aws_sdk_s3::Client`] from a [`ConnectionConfig`] plus static credentials.
@@ -34,7 +34,7 @@ fn normalize_endpoint(endpoint: &str) -> String {
 }
 
 /// Builds a configured S3 client for a connection. This is the one place
-/// credential plaintext is exposed to the SDK (`expose()`, SEC-001).
+/// credential plaintext is exposed to the SDK (`expose()`).
 pub fn build_client(config: &ConnectionConfig, creds: &StorageCredentials) -> aws_sdk_s3::Client {
     let mut builder = aws_sdk_s3::Config::builder()
         .behavior_version(BehaviorVersion::latest())
@@ -103,7 +103,7 @@ mod tests {
     fn config() -> ConnectionConfig {
         use time::OffsetDateTime;
         ConnectionConfig {
-            id: rstore_domain::id::ConnectionId::new(),
+            id: rstore_domain::id::ConnectionId::new_random(),
             name: "test".into(),
             endpoint: "http://localhost:9000".into(),
             public_base_url: None,
@@ -122,18 +122,14 @@ mod tests {
 
     #[test]
     fn endpoints_with_paths_gain_a_trailing_slash() {
-        // Supabase-style endpoints: the path must end in `/` or the SDK
-        // glues the bucket onto it (`…/s3<bucket>` → provider 404).
         assert_eq!(
             normalize_endpoint("https://ref.storage.supabase.co/storage/v1/s3"),
             "https://ref.storage.supabase.co/storage/v1/s3/"
         );
-        // Idempotent: already-normalised endpoints are unchanged.
         assert_eq!(
             normalize_endpoint("https://ref.storage.supabase.co/storage/v1/s3/"),
             "https://ref.storage.supabase.co/storage/v1/s3/"
         );
-        // Host-only endpoints pass through untouched.
         assert_eq!(
             normalize_endpoint("http://localhost:9000"),
             "http://localhost:9000"

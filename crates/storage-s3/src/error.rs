@@ -1,9 +1,10 @@
 //! Translation of AWS SDK errors into the unified [`rstore_domain::Error`]
-//! model with stable [`ErrorCode`]s (STORE-024 retry classification).
+//! model with stable [`ErrorCode`]s.
 //!
-//! The single adapter-level decision is [`classify`]: a *pure* function over a
-//! provider error-code string with no SDK types in its signature, so the most
-//! branching-heavy logic in the adapter is table-testable without a live MinIO.
+//! The single adapter-level decision is [`classify`]: a *pure* function over
+//! a provider error-code string with no SDK types in its signature, so the
+//! most branching-heavy logic in the adapter is table-testable without a
+//! live MinIO.
 
 use aws_sdk_s3::error::SdkError;
 use aws_smithy_types::error::metadata::ProvideErrorMetadata;
@@ -108,43 +109,48 @@ where
 /// facts a codeless failure still carries) into `(ErrorCode, retryable)`.
 ///
 /// `retryable` is the adapter's transient-error signal (throttle / timeout /
-/// 5xx); it is the only place that decision is made, so the future retry
-/// engine reads it from [`Error::is_retryable`] instead of re-deriving it.
-/// A decisive code wins over the status; an indecisive one leaves the status
+/// 5xx); it is the only place that decision is made, so the retry engine
+/// reads it from [`Error::is_retryable`] instead of re-deriving it. A
+/// decisive code wins over the status; an indecisive one leaves the status
 /// to speak — but only for transience: a bare 404 from a proxy is not proof
 /// the *object* is missing.
 pub(crate) fn classify(code: &str, transport: Option<Transport>) -> (ErrorCode, bool) {
     let c = code.to_ascii_lowercase();
+    let timed_out = c.contains("timeout") || transport == Some(Transport::TimedOut);
     let transient = is_transient(&c) || transport.is_some_and(Transport::is_transient);
     let ec = if c.contains("nosuchkey")
         || c.contains("nosuchbucket")
         || c.contains("notfound")
         || c == "404"
     {
-        ErrorCode::NotFound
+        (ErrorCode::NotFound, false)
     } else if c.contains("accessdenied") || c == "403" {
-        ErrorCode::Forbidden
+        (ErrorCode::Forbidden, false)
     } else if c.contains("invalidaccesskeyid")
         || c.contains("signaturedoesnotmatch")
         || c.contains("unauthorized")
         || c == "invalididentitytoken"
     {
-        ErrorCode::Unauthorized
+        (ErrorCode::Unauthorized, false)
     } else if c.contains("bucketalreadyexists")
         || c.contains("bucketalreadyownedbyyou")
         || c.contains("preconditionfailed")
         || c == "412"
     {
-        ErrorCode::Conflict
+        (ErrorCode::Conflict, false)
+    } else if timed_out {
+        // A timed-out request is not proof the endpoint is unreachable; the
+        // distinct code keeps exit codes and retry decisions honest.
+        (ErrorCode::Timeout, true)
     } else if transient {
-        ErrorCode::NetworkUnreachable
+        (ErrorCode::NetworkUnreachable, true)
     } else {
-        ErrorCode::Unknown
+        (ErrorCode::Unknown, false)
     };
-    (ec, transient)
+    (ec.0, transient)
 }
 
-/// Heuristic transient-error detection from the provider error code (STORE-024).
+/// Heuristic transient-error detection from the provider error code.
 fn is_transient(lowercased_code: &str) -> bool {
     matches!(
         lowercased_code,
@@ -191,7 +197,7 @@ mod tests {
                 ErrorCode::NetworkUnreachable,
                 true,
             ),
-            ("RequestTimeout", None, ErrorCode::NetworkUnreachable, true),
+            ("RequestTimeout", None, ErrorCode::Timeout, true),
             (
                 "ServiceUnavailable",
                 None,
@@ -221,12 +227,7 @@ mod tests {
                 ErrorCode::NetworkUnreachable,
                 true,
             ),
-            (
-                "",
-                Some(Transport::TimedOut),
-                ErrorCode::NetworkUnreachable,
-                true,
-            ),
+            ("", Some(Transport::TimedOut), ErrorCode::Timeout, true),
             // Only transience reads from the status: a proxy 404 without a
             // provider code is not proof the object is missing.
             ("", Some(Transport::Status(404)), ErrorCode::Unknown, false),

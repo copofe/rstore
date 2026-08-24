@@ -1,4 +1,4 @@
-//! Conflict policy shared by upload/download/copy/move (UP-/DOWN-/MOVE-).
+//! Conflict policy shared by upload/download/copy/move.
 
 use serde::{Deserialize, Serialize};
 
@@ -31,6 +31,10 @@ impl ConflictPolicy {
     }
 
     /// Parse a token, accepting the clap-style dash alias (`over-write`).
+    ///
+    /// # Errors
+    /// Returns [`Error::invalid_input`] for any token outside the accepted
+    /// vocabulary.
     pub fn parse(token: &str) -> Result<Self> {
         match token.trim().to_ascii_lowercase().as_str() {
             "" | "ask" => Ok(Self::Ask),

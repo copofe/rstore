@@ -2,36 +2,53 @@
 //!
 //! The port aliases and dependency-group structs live here — next to the
 //! traits they name — so the persistence layer can offer a single assembly
-//! point ([`assemble`](crate::assemble) over in `rstore-persistence`) without
+//! point (`rstore_persistence::assemble`) without
 //! depending on the application crate. This module contains no SQLite, SQLx,
 //! provider SDK, or UI type.
 
 use std::sync::Arc;
 
 use rstore_catalog::{CatalogQuery, RemoteObjectRepository, TagStore as CatalogTagStore};
-use rstore_domain::{Clock, JobRepository};
+use rstore_domain::Clock;
 use rstore_storage_api::{MultipartStore, StorageFactory};
 
 use crate::{
-    BucketStore, ConnectionStore, IgnoreRuleStore, IndexRunStore, LinkProfileStore,
+    BucketStore, ConnectionStore, IgnoreRuleStore, IndexRunStore, JobRepository, LinkProfileStore,
     RepairRepository, RuntimeStats, SettingsStore, TagStore, UnitOfWork, WorkspaceStore,
 };
 
+/// Shared handle to the [`ConnectionStore`] port.
 pub type ConnectionPort = Arc<dyn ConnectionStore>;
+/// Shared handle to the [`BucketStore`] port.
 pub type BucketPort = Arc<dyn BucketStore>;
+/// Shared handle to the [`WorkspaceStore`] port.
 pub type WorkspacePort = Arc<dyn WorkspaceStore>;
+/// Shared handle to the [`IgnoreRuleStore`] port.
 pub type IgnoreRulePort = Arc<dyn IgnoreRuleStore>;
+/// Shared handle to the [`IndexRunStore`] port.
 pub type IndexRunPort = Arc<dyn IndexRunStore>;
+/// Shared handle to the [`SettingsStore`] port.
 pub type SettingsPort = Arc<dyn SettingsStore>;
+/// Shared handle to the [`LinkProfileStore`] port.
 pub type LinkProfilePort = Arc<dyn LinkProfileStore>;
+/// Shared handle to the wide workspace [`TagStore`] port.
 pub type TagPort = Arc<dyn TagStore>;
+/// Shared handle to the catalog seam's narrow tag port
+/// (`rstore_catalog::TagStore`).
 pub type CatalogTagPort = Arc<dyn CatalogTagStore>;
+/// Shared handle to the [`RuntimeStats`] port.
 pub type StatsPort = Arc<dyn RuntimeStats>;
+/// Shared handle to the [`UnitOfWork`] port.
 pub type UnitOfWorkPort = Arc<dyn UnitOfWork>;
+/// Shared handle to the [`RepairRepository`] port.
 pub type RepairPort = Arc<dyn RepairRepository>;
+/// Shared handle to the catalog write port (`rstore_catalog::RemoteObjectRepository`).
 pub type CatalogPort = Arc<dyn RemoteObjectRepository>;
+/// Shared handle to the catalog read port (`rstore_catalog::CatalogQuery`).
 pub type CatalogQueryPort = Arc<dyn CatalogQuery>;
+/// Shared handle to the [`JobRepository`] port.
 pub type JobPort = Arc<dyn JobRepository>;
+/// Shared handle to the multipart upload port (`rstore_storage_api::MultipartStore`).
 pub type MultipartPort = Arc<dyn MultipartStore>;
 
 /// Registry-facing inputs to the application graph.
@@ -87,6 +104,7 @@ pub struct ApplicationDependencies {
 }
 
 impl ApplicationDependencies {
+    /// Bundles the four dependency groups into the application-core inputs.
     pub fn new(
         registry: RegistryDependencies,
         catalog: CatalogDependencies,
@@ -101,14 +119,19 @@ impl ApplicationDependencies {
         }
     }
 
+    /// Installs or replaces the optional provider storage factory.
     pub fn replace_storage_factory(&mut self, factory: Arc<dyn StorageFactory>) {
         self.runtime.storage_factory = Some(factory);
     }
 
+    /// Installs or replaces the clock that stamps every core timestamp.
     pub fn replace_clock(&mut self, clock: Arc<dyn Clock>) {
         self.runtime.clock = clock;
     }
 
+    /// Points both catalog ports — write ([`CatalogDependencies::catalog`])
+    /// and read ([`CatalogDependencies::catalog_query`]) — at one shared
+    /// implementation.
     pub fn replace_catalog<C>(&mut self, catalog: Arc<C>)
     where
         C: RemoteObjectRepository + CatalogQuery + 'static,

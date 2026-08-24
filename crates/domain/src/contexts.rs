@@ -6,15 +6,6 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Access and diagnostics value-object surface.
-pub mod access;
-/// Catalog aggregate surface.
-pub mod catalog;
-/// Registry aggregate/value-object surface.
-pub mod registry;
-/// Transfer aggregate and policy surface.
-pub mod transfer;
-
 /// The four business contexts in the domain model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -26,12 +17,30 @@ pub enum BoundedContext {
 }
 
 impl BoundedContext {
+    /// Canonical snake-case token shared by serde and the persistence column.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Registry => "registry",
             Self::Catalog => "catalog",
             Self::Transfer => "transfer",
             Self::AccessDiagnostics => "access_diagnostics",
+        }
+    }
+
+    /// Decode the stored token of a persisted event's owning context.
+    ///
+    /// # Errors
+    /// Returns [`crate::Error::database`] for an unknown token: a vocabulary miss in
+    /// stored data is internal corruption, not user input.
+    pub fn parse(token: &str) -> crate::Result<Self> {
+        match token {
+            "registry" => Ok(Self::Registry),
+            "catalog" => Ok(Self::Catalog),
+            "transfer" => Ok(Self::Transfer),
+            "access_diagnostics" => Ok(Self::AccessDiagnostics),
+            other => Err(crate::Error::database(format!(
+                "unknown bounded context `{other}`"
+            ))),
         }
     }
 }

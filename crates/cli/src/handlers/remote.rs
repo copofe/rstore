@@ -1,9 +1,10 @@
-//! `remote …` and `rm` handlers (REM- / DEL-).
+//! Handlers for the `remote ls` / `remote stat` inspection commands and the
+//! counted `rm` batch removal: user-supplied URIs are expanded against the
+//! catalog, then delegated to the transfer service's remote API.
 
 use super::format::human_size;
 use super::HandlerResult;
 use crate::output::HandlerOutput;
-// --- remote ----------------------------------------------------------------
 
 pub(super) async fn remote(
     action: &crate::args::RemoteCommand,
@@ -52,6 +53,7 @@ pub(super) async fn remote(
                     entry.name.clone(),
                 ]);
             }
+            // The human heading shows what the user typed, not the expanded URI.
             let human = super::format::dir_listing(
                 shown.trim_end_matches('/'),
                 "  (empty)",
@@ -89,8 +91,11 @@ pub(super) async fn remote(
     }
 }
 
-// --- rm --------------------------------------------------------------------
-
+/// Plan the removal, confirm the exact object count, then delete.
+///
+/// A single expansion feeds both the confirmation prompt and the run: the
+/// plan is the exact object set, so "Delete N object(s)" and the executed
+/// deletions cannot disagree, and a recursive prefix is listed once.
 pub(super) async fn rm(
     app: &rstore_application::ApplicationApi,
     uris: &[String],
@@ -102,16 +107,13 @@ pub(super) async fn rm(
 ) -> HandlerResult {
     let uris = super::tty::resolve_uris(uris, "rm needs at least one remote URI")?;
     let uris = super::expand_remote_batch(app, &uris).await?;
-    // One expansion serves the confirmation count and the run (DEL-003): the
-    // plan is the exact object set, so "Delete N object(s)" and the executed
-    // deletions cannot disagree, and a recursive prefix is listed once.
     let plan = app
         .transfer()
         .remote()
         .plan_removals(&uris, recursive)
         .await?;
     if !dry_run {
-        // SEC-006: destructive operations need explicit confirmation.
+        // Destructive: nothing is deleted without explicit consent.
         super::tty::confirm_destructive(
             &format!("Delete {} object(s) ({})", plan.count(), uris.join(", ")),
             yes,
@@ -126,16 +128,19 @@ pub(super) async fn rm(
         .await?;
     let data = super::json_value(&report)?;
     let verb = if dry_run { "Would delete" } else { "Deleted" };
-    // Only failure-shaped outcomes carry their detail into the listing.
-    let entries = report.items.iter().map(|item| super::report::BatchEntry {
-        marker: super::report::remove_marker(item.outcome).to_string(),
-        label: item.uri.clone(),
-        detail: match item.outcome {
-            rstore_application::RemoveOutcome::Failed
-            | rstore_application::RemoveOutcome::GuardBlocked => item.detail.clone(),
-            _ => None,
-        },
+    let entries = report.outcome.items().iter().map(|item| {
+        let show_detail = matches!(
+            item.disposition,
+            rstore_application::Disposition::Failed(_)
+                | rstore_application::Disposition::Blocked(_)
+        );
+        super::report::BatchEntry {
+            marker: super::report::remove_marker(&item.disposition).to_string(),
+            label: item.target.clone(),
+            detail: show_detail.then(|| item.detail.clone()).flatten(),
+        }
     });
+    let severity = report.outcome.severity();
     let out = super::report::render_entries(
         data,
         dry_run.then_some("(dry run — nothing deleted)"),
@@ -144,22 +149,24 @@ pub(super) async fn rm(
         &super::report::BatchFacts {
             summary: (!dry_run).then(|| {
                 format!(
-                    "{} object(s), {} blocked, {} failed",
-                    verb, report.blocked, report.failed
+                    "{} object(s), {} not run, {} failed",
+                    verb,
+                    report.outcome.not_run(),
+                    report.outcome.failed()
                 )
             }),
             interrupted: report.is_interrupted(),
-            failed: report.failed,
-            succeeded: report.deleted,
+            severity,
         },
     )?;
     if report.is_interrupted() {
         return Ok(out);
     }
-    if report.failed > 0 || report.blocked > 0 {
+    if severity != rstore_application::Severity::AllOk {
         return Ok(out.with_warning(format!(
-            "{} blocked, {} failed — see per-item details",
-            report.blocked, report.failed
+            "{} not run, {} failed — see per-item details",
+            report.outcome.not_run(),
+            report.outcome.failed()
         )));
     }
     Ok(out)

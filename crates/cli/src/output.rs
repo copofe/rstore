@@ -1,9 +1,7 @@
-//! Output envelope (CLI-004/005), handler result type, version rendering and
-//! exit-code mapping (CLI-011).
-//!
-//! The envelope builders take the timestamp as a parameter so the injected
-//! [`rstore_domain::Clock`] flows end-to-end and tests can produce deterministic
-//! snapshots (CORE-009). No direct `SystemClock` call lives here.
+//! JSON envelope builders, the handler result type, version rendering and the
+//! stable error-code → process-exit-code mapping. Envelope timestamps arrive
+//! as a parameter so the injected clock flows end-to-end and tests produce
+//! deterministic output.
 
 use rstore_domain::clock::iso8601;
 use rstore_domain::{Error, ErrorCode};
@@ -18,14 +16,15 @@ use time::OffsetDateTime;
 pub struct HandlerOutput {
     pub data: Option<Value>,
     pub human: String,
-    /// Non-fatal notes surfaced in the envelope's `warnings` array (CLI-004).
+    /// Non-fatal notes surfaced in the envelope's `warnings` array.
     pub warnings: Vec<String>,
-    /// Process exit code override for non-error outcomes (CLI-013: Ctrl+C
-    /// interrupts report 130 while still emitting their envelope).
+    /// Process exit-code override for non-error outcomes: an interrupted run
+    /// reports 130 while still emitting its envelope.
     pub exit_code: Option<i32>,
 }
 
 impl HandlerOutput {
+    /// A human-readable-only result with no data, warnings or exit override.
     pub fn human(text: impl Into<String>) -> Self {
         Self {
             data: None,
@@ -35,6 +34,7 @@ impl HandlerOutput {
         }
     }
 
+    /// Attach structured `data` for JSON mode.
     pub fn with_data(mut self, data: Value) -> Self {
         self.data = Some(data);
         self
@@ -61,8 +61,8 @@ pub struct ErrorEntry {
     pub retryable: bool,
 }
 
-/// Build the success/failure envelope value (CLI-004). `now` is supplied by the
-/// caller so the injected clock controls the timestamp.
+/// Build the success envelope value. `now` is supplied by the caller so the
+/// injected clock controls the timestamp.
 pub fn envelope(command: &str, output: &HandlerOutput, now: OffsetDateTime) -> Value {
     json!({
         "command": command,
@@ -76,7 +76,8 @@ pub fn envelope(command: &str, output: &HandlerOutput, now: OffsetDateTime) -> V
     })
 }
 
-/// Build a failure envelope from a domain [`Error`].
+/// Build a failure envelope from a domain [`Error`]; the envelope still goes
+/// to stdout in JSON mode.
 pub fn error_envelope(command: &str, error: &Error, now: OffsetDateTime) -> Value {
     json!({
         "command": command,
@@ -94,8 +95,8 @@ pub fn error_envelope(command: &str, error: &Error, now: OffsetDateTime) -> Valu
     })
 }
 
-/// Single source of the `version` command's output (CLI-002). Used by both the
-/// library dispatch and the binary's DB-free short-circuit.
+/// Single source of the `version` command's output, shared by library dispatch
+/// and the binary's DB-free short-circuit.
 pub fn version_output() -> HandlerOutput {
     let data = json!({
         "cli_version": env!("CARGO_PKG_VERSION"),
@@ -104,7 +105,7 @@ pub fn version_output() -> HandlerOutput {
     HandlerOutput::human(human).with_data(data)
 }
 
-/// Map a domain error code to a stable process exit code (CLI-011 / PRD §11.3).
+/// Map a domain error code to a stable process exit code.
 pub fn exit_code_for(error: &Error) -> i32 {
     match error.code {
         ErrorCode::Unknown => 1,

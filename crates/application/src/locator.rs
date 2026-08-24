@@ -1,10 +1,10 @@
-//! Remote-reference resolution (REM-/WSP-013) — the one path from a
-//! user-supplied `conn/bucket/key` reference to a registered bucket and a catalog row.
+//! Remote-reference resolution — the one path from a user-supplied
+//! `conn/bucket/key` reference to a registered bucket and a catalog row.
 //!
-//! Before this module existed the same chain (parse → connection → bucket →
-//! catalog row → workspace membership) was hand-rolled per service and the
-//! membership rule drifted: `tag add` accepted objects outside the workspace.
-//! Both tiers live here so the WSP-013 invariant cannot be forgotten again.
+//! Both tiers live here so the workspace-membership invariant cannot
+//! drift: registry resolution (parse → connection → bucket) for services,
+//! and catalog resolution (… → catalog row → workspace membership) for
+//! operations that address already-indexed objects.
 
 use std::sync::Arc;
 
@@ -15,7 +15,7 @@ use rstore_domain::remote::{ObjectPath, RemoteObject};
 use rstore_domain::{ConnectionConfig, Error, Result};
 
 use crate::gateway::RemoteGateway;
-use crate::remote::RemoteUri;
+use crate::reference::RemoteUri;
 
 /// Resolves remote locators against the registry and the catalog.
 #[derive(Clone)]
@@ -28,6 +28,7 @@ pub struct CatalogLocator {
 }
 
 impl CatalogLocator {
+    /// Create a locator over the given stores and gateway.
     pub fn new(
         connections: Arc<dyn ConnectionStore>,
         buckets: Arc<dyn BucketStore>,
@@ -44,11 +45,11 @@ impl CatalogLocator {
         }
     }
 
-    /// URI → (connection config, registered bucket). The key stays on the
-    /// [`RemoteUri`] — callers interpret it as a listing prefix or a strict
-    /// [`ObjectPath`] per their operation. A `NotFound` carries the
-    /// `bucket add` hint, so every command resolves unregistered locators
-    /// with the same message.
+    /// Resolve a URI's connection reference and bucket against the
+    /// registry.
+    ///
+    /// Errors when the connection is unknown or the bucket is not
+    /// registered under it (with a registration hint in the context).
     pub async fn resolve_bucket(
         &self,
         uri: &RemoteUri,
@@ -56,10 +57,9 @@ impl CatalogLocator {
         self.resolve_pair(&uri.connection, &uri.bucket).await
     }
 
-    /// (connection, bucket name) → (connection config, registered bucket) —
-    /// the resolution core behind the URI entries, for callers that hold a
-    /// [`ConnectionRef`] and a bucket name (transfer plans) instead of a
-    /// parsed URI. The same not-found hints as every other entry.
+    /// Resolve a connection reference plus bucket name without a parsed
+    /// [`RemoteUri`], with the same error behavior as
+    /// [`Self::resolve_bucket`].
     pub async fn resolve_pair(
         &self,
         connection: &crate::connection::ConnectionRef,
@@ -88,11 +88,8 @@ impl CatalogLocator {
         Ok((config, bucket))
     }
 
-    /// URI → (connection config, registered bucket, storage adapter) —
-    /// tier 1, the one path every live remote operation (ls/stat/rm, cp/mv,
-    /// upload/download) resolves through. Presign-only callers that never
-    /// touch storage should
-    /// prefer [`Self::resolve_bucket`].
+    /// Resolve a URI to its config, bucket, and a connected adapter (no
+    /// retry decoration).
     pub async fn resolve_target(
         &self,
         uri: &RemoteUri,
@@ -106,9 +103,7 @@ impl CatalogLocator {
         Ok((config, bucket, storage))
     }
 
-    /// (connection, bucket name) → tier 1 without a URI: transfer plans hold
-    /// a [`ConnectionRef`] plus a bucket name — no fabricated keys to fit
-    /// the URI entries.
+    /// [`Self::resolve_pair`] plus a connected adapter.
     pub async fn resolve_pair_target(
         &self,
         connection: &crate::connection::ConnectionRef,
@@ -123,7 +118,8 @@ impl CatalogLocator {
         Ok((config, bucket, storage))
     }
 
-    /// The retry flavour of [`Self::resolve_pair_target`].
+    /// [`Self::resolve_pair_target`] with the caller's run policy and
+    /// cancellation token decorating the adapter.
     pub async fn resolve_pair_target_with_retry(
         &self,
         connection: &crate::connection::ConnectionRef,
@@ -140,10 +136,10 @@ impl CatalogLocator {
         Ok((config, bucket, storage))
     }
 
-    /// A registered bucket row → its connection config and storage adapter.
-    /// Tier 1 for callers that resolved a registry reference themselves (the
-    /// indexer scans a bucket it already holds) — one connection lookup, no
-    /// gateway bypass, no URI fabrication.
+    /// Resolve an already-registered bucket to its connection config and a
+    /// connected adapter.
+    ///
+    /// Errors when the bucket's owning connection no longer exists.
     pub async fn resolve_bucket_target(
         &self,
         bucket: &rstore_domain::Bucket,
@@ -162,8 +158,6 @@ impl CatalogLocator {
         Ok((config, storage))
     }
 
-    /// One adapter construction path for the tier-1 entries: with or without
-    /// a job-scoped retry policy.
     async fn storage_for(
         &self,
         config: &ConnectionConfig,
@@ -182,9 +176,13 @@ impl CatalogLocator {
         }
     }
 
-    /// URI → catalog row, enforcing that the object's bucket belongs to the
-    /// workspace (WSP-013). A foreign object reports `NotFound`, matching
-    /// `files show`: existence is not leaked across workspaces.
+    /// Resolve a URI string to a catalog row that must exist and belong to
+    /// the given workspace.
+    ///
+    /// A not-found error covers three distinct cases on purpose — unknown
+    /// locator shape, unindexed object ("run `index start` first"), and an
+    /// object outside the workspace — so callers cannot distinguish a
+    /// missing object from one they must not see.
     pub async fn resolve(&self, uri: &str, workspace: WorkspaceId) -> Result<RemoteObject> {
         let parsed = RemoteUri::parse(uri)?;
         let (config, bucket) = self.resolve_bucket(&parsed).await?;

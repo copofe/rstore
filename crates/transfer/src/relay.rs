@@ -1,14 +1,9 @@
-//! Constant-memory object relay across storage adapters (MOVE-006).
+//! Constant-memory object relay across storage adapters.
 //!
-//! The provider multipart lifetime runs through the storage seam's
-//! [`MultipartSession`](rstore_storage_api::MultipartSession): once an upload
-//! is created, every read, upload, completion, or cancellation error takes
-//! the same best-effort `abandon` path before the original error returns —
-//! the relay has no checkpoint to resume from.
-//!
-//! Chunk policy and progress ride the engine's seams: [`TransferConfig`]
-//! decides read+put versus multipart and the part size, and a
-//! [`ProgressSink`] receives per-part byte progress like any transfer.
+//! On any error after the target multipart upload exists, the upload is
+//! abandoned warn-only — the relay keeps no checkpoint, so there is nothing
+//! to resume — and the original error returns. Chunk policy and progress
+//! ride the engine's [`TransferConfig`] and [`ProgressSink`] seams.
 
 use rstore_domain::remote::ObjectPath;
 use rstore_domain::Result;
@@ -139,7 +134,7 @@ mod tests {
     use rstore_domain::remote::ObjectPath;
 
     /// Real S3 minimum so multipart completions satisfy the legality rules
-    /// the fake now enforces.
+    /// the fake enforces.
     const PART: u64 = 5 * 1024 * 1024;
 
     async fn source_fixture() -> (Arc<FakeStorage>, ObjectMetadata) {

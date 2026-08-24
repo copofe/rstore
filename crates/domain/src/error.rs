@@ -1,9 +1,9 @@
-//! Unified error model (CORE-007).
+//! The unified error model.
 //!
 //! Every layer maps its failures into [`Error`], which carries a stable
 //! [`ErrorCode`], a human-readable message, structured [`ErrorContext`] pairs,
-//! a `retryable` flag and an optional boxed source. The CLI converts `ErrorCode`
-//! into a stable process exit code (CLI-011) and never surfaces a panic.
+//! a `retryable` flag and an optional boxed source. The CLI converts
+//! `ErrorCode` into a stable process exit code and never surfaces a panic.
 
 use std::backtrace::Backtrace;
 use std::fmt;
@@ -63,8 +63,10 @@ impl ErrorCode {
     }
 }
 
-/// A single structured key/value pair attached to an error (SEC-001 friendly:
-/// never put secrets here).
+/// A single structured key/value pair attached to an error.
+///
+/// Context values may surface in logs and JSON output, so they must never
+/// carry secrets.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorContext {
     pub key: String,
@@ -91,8 +93,8 @@ pub struct Error {
 }
 
 impl Error {
-    /// Construct with a code and message. `retryable` defaults to the code's own
-    /// policy unless overridden via [`Error::retryable`].
+    /// Construct with a code and message. `retryable` defaults to the code's
+    /// own policy unless overridden via [`Error::retryable`].
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
             code,
@@ -189,8 +191,8 @@ impl Error {
         self.retryable.unwrap_or_else(|| self.code.is_retryable())
     }
 
-    /// Captured backtrace for diagnostics (OBS-001). May be empty if backtraces
-    /// are disabled at runtime (`RUST_BACKTRACE=0`).
+    /// Captured backtrace for diagnostics. May be empty if backtraces are
+    /// disabled at runtime (`RUST_BACKTRACE=0`).
     pub fn backtrace(&self) -> &Backtrace {
         &self.backtrace
     }
@@ -266,6 +268,33 @@ impl ErrorCode {
             ErrorCode::LocalIo => "local_io",
         }
     }
+
+    /// Decode the stored token of a persisted error code.
+    ///
+    /// # Errors
+    /// Returns [`Error::database`] for an unknown token: a vocabulary miss in
+    /// stored data is internal corruption, not user input.
+    pub fn parse(token: &str) -> Result<Self> {
+        match token {
+            "unknown" => Ok(Self::Unknown),
+            "invalid_input" => Ok(Self::InvalidInput),
+            "config" => Ok(Self::Config),
+            "unauthorized" => Ok(Self::Unauthorized),
+            "forbidden" => Ok(Self::Forbidden),
+            "network_unreachable" => Ok(Self::NetworkUnreachable),
+            "not_found" => Ok(Self::NotFound),
+            "conflict" => Ok(Self::Conflict),
+            "checksum" => Ok(Self::Checksum),
+            "database" => Ok(Self::Database),
+            "capability_unsupported" => Ok(Self::CapabilityUnsupported),
+            "cancelled" => Ok(Self::Cancelled),
+            "timeout" => Ok(Self::Timeout),
+            "lock_busy" => Ok(Self::LockBusy),
+            "database_busy" => Ok(Self::DatabaseBusy),
+            "local_io" => Ok(Self::LocalIo),
+            other => Err(Error::database(format!("unknown error code `{other}`"))),
+        }
+    }
 }
 
 /// Convenience `Result` alias for the whole core.
@@ -275,10 +304,6 @@ pub type Result<T> = std::result::Result<T, Error>;
 mod tests {
     use super::*;
 
-    /// `ErrorCode::as_str` and the serde representation are two spellings of
-    /// one contract (envelope `code` field ↔ exit-code mapping). The
-    /// round-trip pins them together so a variant added to one side without
-    /// the other fails here instead of in a mismatched CLI envelope.
     #[test]
     fn error_code_as_str_matches_the_serde_token_in_both_directions() {
         for code in [

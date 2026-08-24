@@ -1,5 +1,7 @@
-//! `upload` / `download` handlers and the stderr progress sink (UP- / DOWN- /
-//! JOB-005/016/018).
+//! Upload/download/cp/mv handlers plus the stderr progress sink: sources
+//! and conflict policy are resolved here, the transfer runs through the
+//! application seam, and results render via the shared batch-report
+//! grammar.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -12,15 +14,14 @@ use super::tty::resolve_conflict;
 use super::HandlerResult;
 use rstore_domain::{ConflictPolicy, Error};
 
-// --- upload / download -----------------------------------------------------
-
+/// Transfer direction shared by the upload and download CLI arms.
 pub(super) enum Direction {
     Upload,
     Download,
 }
 
-/// stderr progress line: `label 42% (12.3MB/29.4MB) 3.1MB/s` (JOB-005/016/018).
-/// Never writes stdout (CLI-006); coalesces to one update per 250ms.
+/// stderr progress line: `label 42% (12.3MB/29.4MB) 3.1MB/s`. Never writes
+/// stdout; coalesces to one update per 250ms.
 struct StderrProgress {
     label: String,
     start: std::time::Instant,
@@ -83,6 +84,9 @@ fn sink_for_flags(no_progress: bool, label: &str) -> Box<dyn ProgressSink> {
     }
 }
 
+/// Runs one `upload` or `download`: resolve sources (`-` reads stdin),
+/// settle the conflict policy, then dispatch to the matching application
+/// command and render its report.
 pub(super) async fn transfer(
     app: &rstore_application::ApplicationApi,
     args: &crate::args::TransferArgs,
@@ -168,7 +172,7 @@ pub(super) async fn transfer(
                 rstore_application::download_plans(&expanded, target, conflict, args.recursive)?;
             match mode {
                 rstore_application::DownloadMode::Batch => {
-                    // MIX-029: one child job per URI, results aggregate at the
+                    // One child job per source URI; results aggregate at the
                     // application seam.
                     let report = app
                         .transfer()
@@ -213,8 +217,7 @@ fn render_transfer_report(
             report.job_id, report.succeeded, report.skipped, report.failed, report.state,
         ),
         report.is_interrupted(),
-        report.failed,
-        report.succeeded,
+        report.severity(),
     )
 }
 
@@ -235,13 +238,12 @@ fn render_batch_download_report(
             report.blocked,
         ),
         report.interrupted,
-        report.failed,
-        report.succeeded,
+        report.severity(),
     )
 }
 
-/// `cp` / `mv` (MOVE-): resolve sources against the target, run the copy
-/// service, render the shared report shape.
+/// Runs `cp` / `mv`: resolve sources against the target, run the copy or
+/// move service, render the shared report shape.
 pub(super) async fn copy_move(
     is_move: bool,
     args: &crate::args::CopyArgs,
@@ -250,7 +252,7 @@ pub(super) async fn copy_move(
     quiet: bool,
     session: &super::tty::Session,
 ) -> HandlerResult {
-    // MOVE-007/008: `-` reads one URI per line from stdin.
+    // `-` reads one URI per line from stdin.
     let sources =
         super::tty::resolve_uris(&args.sources, "cp/mv needs at least one remote source URI")?;
     let sources = super::expand_remote_batch(app, &sources).await?;
@@ -311,9 +313,8 @@ fn render_copy_report(report: TransferReport, args: &crate::args::CopyArgs) -> H
             report.blocked,
             report.state,
         ),
-        false,
-        report.failed,
-        report.succeeded,
+        report.is_interrupted(),
+        report.severity(),
     )
 }
 

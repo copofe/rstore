@@ -1,14 +1,9 @@
-//! Repository for [`ConnectionConfig`] rows (CON-/DATA-).
+//! Repository for `ConnectionConfig` rows.
 //!
-//! Stores the complete local connection configuration, including credentials.
-//! Credential values are never serialized or logged; this repository is the
-//! only persistence boundary that writes them.
-//!
-//! Enum ↔ column encoding lives on the domain enums (`Region::as_token`,
-//! `AddressingStyle::as_str`); this module only binds and reads those tokens
-//! through the shared [`RowReader`](crate::codec::RowReader), which fails
-//! loud on any field that cannot be decoded.
-
+//! Stores complete local connection configuration including credentials;
+//! credential values are never serialized or logged. Enum ↔ column encodings
+//! live on the domain enums; this module only binds and reads those tokens
+//! through the shared row reader, which fails loud on undecodable fields.
 use async_trait::async_trait;
 use rstore_application_ports::ConnectionStore;
 use rstore_domain::connection::{AddressingStyle, ConnectionConfig, ConnectionTestStatus, Region};
@@ -21,16 +16,15 @@ use crate::codec::{unix_secs, uuid_to_text, Bind, Insert, RowReader, Update};
 use crate::error::map_sqlx;
 use crate::tx::WriteGate;
 
-/// Every column of `storage_connections`, in canonical order. One list serves
-/// every SELECT/INSERT here, so adding a field is a bind + decode change, not
-/// an SQL-in-four-places change.
+/// Every column of `storage_connections` in canonical order; one list serves every SELECT/INSERT here,
+/// so adding a field is a bind + decode change, not an SQL-in-four-places change.
 const COLUMNS: &str =
     "id, name, endpoint, public_base_url, cdn_base_url, region, addressing_style, \
                        tls_verify, access_key, secret_key, created_at, updated_at, \
                        last_tested_at, last_test_status";
 
-/// CRUD access to `storage_connections`.
 #[derive(Clone)]
+/// CRUD access to `storage_connections`.
 pub struct ConnectionRepository {
     gate: WriteGate,
     read_pool: SqlitePool,
@@ -44,8 +38,8 @@ impl ConnectionRepository {
 
 #[async_trait]
 impl ConnectionStore for ConnectionRepository {
-    /// Insert a new connection. The caller is responsible for name uniqueness
-    /// (CON-002); a duplicate surfaces as a `Conflict` error.
+    /// Insert a new connection. The caller is responsible for name uniqueness; a duplicate surfaces as
+    /// a `Conflict` error.
     async fn insert(&self, config: &ConnectionConfig) -> Result<()> {
         let _write = self.gate.permit().await?;
         Insert::into("storage_connections")
@@ -110,7 +104,7 @@ impl ConnectionStore for ConnectionRepository {
         row.map(row_to_config).transpose()
     }
 
-    /// Update an existing connection's mutable fields.
+    /// Update an existing connection's mutable fields; a missing row is `NotFound`.
     async fn update(&self, config: &ConnectionConfig) -> Result<()> {
         let _write = self.gate.permit().await?;
         let affected = Update::table("storage_connections")
@@ -145,7 +139,7 @@ impl ConnectionStore for ConnectionRepository {
         Ok(())
     }
 
-    /// Persist the outcome of a connection test (CON-007/010).
+    /// Persist the outcome of a connection test.
     async fn record_test(
         &self,
         id: ConnectionId,
@@ -167,8 +161,7 @@ impl ConnectionStore for ConnectionRepository {
         Ok(())
     }
 
-    /// Delete a connection. Returns `false` if it did not exist (CON-013 leaves
-    /// cascade/cleanup policy to the application layer).
+    /// Delete a connection; returns `false` when it did not exist.
     async fn delete(&self, id: ConnectionId) -> Result<bool> {
         let _write = self.gate.permit().await?;
         let affected = sqlx::query("DELETE FROM storage_connections WHERE id = ?")
@@ -179,20 +172,10 @@ impl ConnectionStore for ConnectionRepository {
             .rows_affected();
         Ok(affected > 0)
     }
-
-    /// Number of stored connections.
-    async fn count(&self) -> Result<i64> {
-        Ok(crate::codec::count_scalar(
-            &self.read_pool,
-            "SELECT COUNT(*) AS n FROM storage_connections",
-            Vec::new(),
-        )
-        .await? as i64)
-    }
 }
 
-/// Decode one row. `Region` is an open vocabulary (`parse_token` never fails),
-/// so it needs no failure path; `AddressingStyle` is closed and fails loud.
+/// Decode one row. `Region` is an open vocabulary (`parse_token` never fails); `AddressingStyle` is
+/// closed and fails loud.
 fn row_to_config(row: sqlx::sqlite::SqliteRow) -> Result<ConnectionConfig> {
     let row = RowReader::new(row);
     Ok(ConnectionConfig {

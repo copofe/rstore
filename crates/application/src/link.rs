@@ -1,13 +1,11 @@
-//! Link generation behind `rstore url …` (LINK-001..013).
+//! Link generation behind `rstore url …`.
 //!
-//! One service turns a remote reference into the requested representation —
-//! object path, S3 URI, public URL, presigned URL, Markdown or HTML — using
-//! the connection's defaults and the bucket's [`LinkProfile`] overrides for
-//! public/CDN bases and permissions. Presigning
-//! delegates to the storage adapter; a bucket or adapter that disallows it
-//! surfaces `CapabilityUnsupported` (CLI exit 11) rather than a silently
-//! degraded link (LINK-011). Presigned URLs are results, never logs
-//! (LINK-012).
+//! One service turns a remote reference into the requested representation — object path, S3
+//! URI, public URL, presigned URL, Markdown, or HTML — using the connection's defaults and the
+//! bucket's [`LinkProfile`] overrides for public/CDN bases and permissions. Presigning
+//! delegates to the storage adapter; a bucket or adapter that disallows it surfaces
+//! `CapabilityUnsupported` (CLI exit 11) rather than a silently degraded link. Presigned URLs
+//! are results, never logs.
 
 use std::sync::Arc;
 
@@ -16,10 +14,11 @@ use rstore_domain::link::LinkProfile;
 use rstore_domain::{Clock, Error, Result};
 use rstore_storage_api::model::{PresignMethod, PresignRequest};
 
+use crate::batch_outcome::{BatchOutcome, ItemOutcome};
 use crate::gateway::RemoteGateway;
-use crate::remote::RemoteUri;
+use crate::reference::RemoteUri;
 
-/// The requested representation (LINK-001/002/004/008/009/010).
+/// The requested representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkFormat {
     Path,
@@ -31,6 +30,7 @@ pub enum LinkFormat {
 }
 
 impl LinkFormat {
+    /// Parse a CLI format token (`md` is accepted as an alias for `markdown`).
     pub fn parse(token: &str) -> Result<Self> {
         match token {
             "path" => Ok(Self::Path),
@@ -46,17 +46,17 @@ impl LinkFormat {
     }
 }
 
-/// One generate request (LINK-004/005).
+/// One generate request.
 #[derive(Debug, Clone)]
 pub struct LinkRequest {
     pub format: LinkFormat,
     pub signed: bool,
-    /// Explicit TTL in seconds; `None` uses the profile default (LINK-006).
+    /// Explicit TTL in seconds; `None` uses the profile default.
     pub ttl_seconds: Option<u64>,
 }
 
-/// The generated link in every representation; `requested` is what the
-/// caller prints (LINK-010 keeps the JSON shape stable).
+/// The generated link in every representation; `requested` is what the caller prints and keeps
+/// the JSON shape stable across releases.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct GeneratedLink {
     #[serde(skip)]
@@ -73,24 +73,19 @@ pub struct GeneratedLink {
     pub requested: String,
 }
 
-/// Per-URI outcome: links generate item-by-item so one bad URI does not
-/// sink the batch (LINK-013).
-#[derive(Debug, Clone)]
-pub struct LinkOutcome {
-    pub uri: String,
-    pub link: Option<GeneratedLink>,
-    pub error: Option<String>,
-}
-
-/// Parse a TTL like `30s`, `15m`, `1h`, `7d`, `1h30m` or plain seconds
-/// (LINK-006/007). S3 presigning caps at seven days; the parser enforces the
-/// same bound so every adapter gets a valid request.
+/// Parse a TTL like `30s`, `15m`, `1h`, `7d`, `1h30m`, or plain seconds.
+///
+/// S3 presigning caps at seven days; the parser enforces the same bound so every adapter gets
+/// a valid request.
 pub fn parse_ttl(raw: &str) -> Result<u64> {
     rstore_domain::duration::parse_span(raw, "smhd", 7 * 86_400, "TTL", "7d (S3 presign limit)")
 }
 
-/// Resolve the effective object delivery base from connection defaults and
-/// bucket overrides. CDN/proxy delivery wins over a plain public base.
+/// Resolve the effective object delivery base from connection defaults and bucket overrides.
+///
+/// Precedence: bucket CDN override, connection CDN default, bucket public override,
+/// connection public default, then the unchanged S3 endpoint. The trailing slash is trimmed so
+/// callers can join with `/`.
 pub fn resolve_link_base(
     config: &rstore_domain::ConnectionConfig,
     profile: &LinkProfile,
@@ -106,23 +101,23 @@ pub fn resolve_link_base(
         .to_string()
 }
 
-fn normalize_base_url(base: String) -> Option<String> {
-    let base = base.trim().trim_end_matches('/');
-    (!base.is_empty()).then(|| base.to_string())
-}
-
-/// Editable link-profile fields for [`DefaultLinkService::set_profile`];
-/// `None` keeps the current value and `Some("")` clears a base override.
+/// Editable link-profile fields for [`DefaultLinkService::set_profile`].
+///
+/// The outer `None` keeps the current value; the inner `None` (or an empty string, which
+/// normalizes to it) clears a base override.
 #[derive(Debug, Clone, Default)]
 pub struct LinkProfileInput {
-    pub public_base_url: Option<String>,
-    pub cdn_base_url: Option<String>,
+    pub public_base_url: Option<Option<String>>,
+    pub cdn_base_url: Option<Option<String>>,
     pub allow_public_url: Option<bool>,
     pub allow_presigned: Option<bool>,
     pub default_ttl_seconds: Option<u64>,
 }
 
 /// Link generation service.
+///
+/// Resolves remote URIs against the catalog locator and merges connection defaults with
+/// per-bucket [`LinkProfile`] overrides.
 pub struct DefaultLinkService {
     gateway: RemoteGateway,
     buckets: Arc<dyn crate::bucket::BucketService>,
@@ -154,8 +149,12 @@ impl DefaultLinkService {
         self.profiles.get(bucket.id).await
     }
 
-    /// Merge `input` into the bucket's link profile and persist it. `None`
-    /// fields keep the current values.
+    /// Merge `input` into the bucket's link profile and persist it.
+    ///
+    /// Merge semantics follow the `Option<Option<T>>` convention: `None` fields keep their
+    /// current values, `Some(None)` clears an override, and base-URL values pass through
+    /// `ConnectionConfig::normalize_base_url`, so surrounding whitespace, trailing slashes,
+    /// and empty strings all normalize away.
     pub async fn set_profile(
         &self,
         bucket: &crate::bucket::BucketRef,
@@ -164,10 +163,10 @@ impl DefaultLinkService {
         let resolved = self.resolve(bucket).await?;
         let mut profile = self.profiles.get(resolved.id).await?;
         if let Some(base) = input.public_base_url {
-            profile.public_base_url = normalize_base_url(base);
+            profile.public_base_url = rstore_domain::ConnectionConfig::normalize_base_url(base);
         }
         if let Some(base) = input.cdn_base_url {
-            profile.cdn_base_url = normalize_base_url(base);
+            profile.cdn_base_url = rstore_domain::ConnectionConfig::normalize_base_url(base);
         }
         if let Some(allow) = input.allow_public_url {
             profile.allow_public_url = allow;
@@ -186,24 +185,22 @@ impl DefaultLinkService {
         self.buckets.resolve(bucket).await
     }
 
-    /// Generate links for a batch of URIs (LINK-013: per-item outcomes).
-    pub async fn generate(&self, uris: &[String], request: &LinkRequest) -> Vec<LinkOutcome> {
-        let mut outcomes = Vec::with_capacity(uris.len());
+    /// Generate links for a batch of URIs; never fails as a whole — each URI
+    /// gets an [`ItemOutcome`] carrying either the generated link or the
+    /// projected failure.
+    pub async fn generate(
+        &self,
+        uris: &[String],
+        request: &LinkRequest,
+    ) -> BatchOutcome<GeneratedLink> {
+        let mut items = Vec::with_capacity(uris.len());
         for uri in uris {
-            outcomes.push(match self.one(uri, request).await {
-                Ok(link) => LinkOutcome {
-                    uri: uri.clone(),
-                    link: Some(link),
-                    error: None,
-                },
-                Err(e) => LinkOutcome {
-                    uri: uri.clone(),
-                    link: None,
-                    error: Some(e.to_string()),
-                },
+            items.push(match self.one(uri, request).await {
+                Ok(link) => ItemOutcome::succeeded(uri.clone(), link),
+                Err(e) => ItemOutcome::failed(uri.clone(), &e),
             });
         }
-        outcomes
+        BatchOutcome::new(items)
     }
 
     async fn one(&self, uri: &str, request: &LinkRequest) -> Result<GeneratedLink> {
@@ -218,9 +215,8 @@ impl DefaultLinkService {
         let path = parsed.object_path()?;
         let profile = self.profiles.get(bucket.id).await?;
 
-        // Delivery URL (LINK-003/004): bucket CDN override, connection CDN
-        // default, bucket public override, connection public default, then
-        // the unchanged S3 endpoint.
+        // Delivery URL: bucket CDN override, connection CDN default, bucket public override,
+        // connection public default, then the unchanged S3 endpoint.
         let public_url = if profile.allow_public_url {
             let base = resolve_link_base(&config, &profile);
             Some(format!("{}/{}/{}", base, bucket.name, encode_path(key)))
@@ -228,7 +224,8 @@ impl DefaultLinkService {
             None
         };
 
-        // Presigned URL (LINK-005/006/007).
+        // Presigned URL: gated on the profile's permission, TTL from the explicit request or
+        // the profile default.
         let (presigned_url, expires_at) = if request.signed {
             if !profile.allow_presigned {
                 return Err(Error::unsupported(format!(
@@ -262,9 +259,8 @@ impl DefaultLinkService {
                 .unwrap_or_default()
         });
 
-        // Derivation is demand-driven: a URL is load-bearing only for the
-        // formats that render one, so `path`/`s3`/`json` succeed on a
-        // bucket with every URL flavour disabled (LINK-003/004).
+        // Derivation is demand-driven: a URL is load-bearing only for the formats that render
+        // one, so `path`/`s3`/`json` succeed on a bucket with every URL flavour disabled.
         let requested = match request.format {
             LinkFormat::Path => path.as_str().to_string(),
             LinkFormat::S3 => s3_uri.clone(),
@@ -303,8 +299,8 @@ impl DefaultLinkService {
     }
 }
 
-/// Render a URL-bearing representation: `url` verbatim, or the image-aware
-/// markdown/HTML document grammar (LINK-008/009).
+/// Render a URL-bearing representation: `url` verbatim, or the image-aware markdown/HTML
+/// document grammar.
 fn render_document(format: LinkFormat, name: &str, url: &str) -> String {
     match format {
         LinkFormat::Markdown if is_image(name) => format!("![{name}]({url})"),
@@ -327,7 +323,7 @@ fn is_image(name: &str) -> bool {
     )
 }
 
-/// Escape the HTML-significant characters in link text (LINK-009).
+/// Escape the HTML-significant characters in link text.
 fn escape_html(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -335,8 +331,8 @@ fn escape_html(s: &str) -> String {
         .replace('\"', "&quot;")
 }
 
-/// Percent-encode an object key for URL path segments (LINK-004): keep the
-/// unreserved set and `/` (a legitimate path separator), escape the rest.
+/// Percent-encode an object key for URL path segments: keep the unreserved set and `/` (a
+/// legitimate path separator), escape the rest.
 fn encode_path(key: &str) -> String {
     let mut out = String::with_capacity(key.len());
     for byte in key.bytes() {
@@ -353,7 +349,15 @@ fn encode_path(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::batch_outcome::Disposition;
 
+    /// The projected failure message of one batch item, if it failed.
+    fn failure_message(item: &ItemOutcome<GeneratedLink>) -> Option<String> {
+        match &item.disposition {
+            Disposition::Failed(f) => Some(f.message.clone()),
+            _ => None,
+        }
+    }
     async fn setup() -> Arc<DefaultLinkService> {
         let (app, _factory) = crate::test_util::app_with(&["nas"], &[("nas", "media")]).await;
         app.link_service()
@@ -374,7 +378,7 @@ mod tests {
             .update(
                 connection.id,
                 crate::connection::UpdateConnectionInput {
-                    public_base_url: Some("https://cdn.example.com/assets".into()),
+                    public_base_url: Some(Some("https://cdn.example.com/assets".into())),
                     ..Default::default()
                 },
             )
@@ -400,8 +404,9 @@ mod tests {
                 &req(LinkFormat::Path),
             )
             .await
+            .into_items()
             .remove(0);
-        let link = out.link.unwrap();
+        let link = out.value.unwrap();
         assert_eq!(link.requested, "docs/my file.txt");
         assert_eq!(link.s3_uri, "s3://media/docs/my file.txt");
 
@@ -411,9 +416,10 @@ mod tests {
                 &req(LinkFormat::Url),
             )
             .await
+            .into_items()
             .remove(0);
-        let link = out.link.unwrap();
-        // Derived from the endpoint, key percent-encoded (LINK-004).
+        let link = out.value.unwrap();
+        // Derived from the endpoint, key percent-encoded.
         assert_eq!(
             link.requested,
             "http://localhost:9000/media/docs/my%20file.txt"
@@ -426,9 +432,10 @@ mod tests {
         let out = svc
             .generate(&["nas/media/img/logo.png".into()], &req(LinkFormat::Url))
             .await
+            .into_items()
             .remove(0);
         assert_eq!(
-            out.link.unwrap().requested,
+            out.value.unwrap().requested,
             "https://cdn.example.com/assets/media/img/logo.png"
         );
     }
@@ -450,8 +457,8 @@ mod tests {
             .update(
                 connection.id,
                 crate::connection::UpdateConnectionInput {
-                    public_base_url: Some("https://connection-public.example.com".into()),
-                    cdn_base_url: Some("https://connection-cdn.example.com".into()),
+                    public_base_url: Some(Some("https://connection-public.example.com".into())),
+                    cdn_base_url: Some(Some("https://connection-cdn.example.com".into())),
                     ..Default::default()
                 },
             )
@@ -500,7 +507,7 @@ mod tests {
             .set_profile(
                 &bucket,
                 LinkProfileInput {
-                    public_base_url: Some(" https://bucket-public.example.com/// ".into()),
+                    public_base_url: Some(Some(" https://bucket-public.example.com/// ".into())),
                     ..Default::default()
                 },
             )
@@ -515,7 +522,7 @@ mod tests {
             .set_profile(
                 &bucket,
                 LinkProfileInput {
-                    public_base_url: Some(String::new()),
+                    public_base_url: Some(Some(String::new())),
                     ..Default::default()
                 },
             )
@@ -547,19 +554,21 @@ mod tests {
                 &req(LinkFormat::Markdown),
             )
             .await
+            .into_items()
             .remove(0)
-            .link
+            .value
             .unwrap()
             .requested;
         assert!(md.starts_with("![shot.png](http"));
         let html = svc
             .generate(&["nas/media/a<b>.txt".into()], &req(LinkFormat::Html))
             .await
+            .into_items()
             .remove(0)
-            .link
+            .value
             .unwrap()
             .requested;
-        // Link text is escaped (LINK-009).
+        // Link text is escaped.
         assert!(html.contains("&lt;b&gt;"));
         assert!(html.starts_with("<a href=\"http"));
     }
@@ -575,8 +584,9 @@ mod tests {
         let out = svc
             .generate(&["nas/media/doc.pdf".into()], &request)
             .await
+            .into_items()
             .remove(0);
-        let link = out.link.unwrap();
+        let link = out.value.unwrap();
         assert!(link
             .requested
             .starts_with("http://fake/media/doc.pdf?sig=fake"));
@@ -605,8 +615,9 @@ mod tests {
         let out = svc
             .generate(&["nas/media/doc.pdf".into()], &request)
             .await
+            .into_items()
             .remove(0);
-        let err = out.error.expect("expected a per-item error");
+        let err = failure_message(&out).expect("expected a per-item error");
         assert!(err.contains("presigned links are disabled"));
     }
 
@@ -627,14 +638,17 @@ mod tests {
         let out = svc
             .generate(&["nas/media/doc.pdf".into()], &req(LinkFormat::Url))
             .await
+            .into_items()
             .remove(0);
-        assert!(out.error.unwrap().contains("public links are disabled"));
+        assert!(failure_message(&out)
+            .unwrap()
+            .contains("public links are disabled"));
     }
 
     #[tokio::test]
     async fn path_s3_and_json_survive_a_locked_down_bucket() {
-        // A URL is load-bearing only for formats that render one: with every
-        // URL flavour disabled, path/s3/json still succeed while url errors.
+        // A URL is load-bearing only for formats that render one: with every URL flavour
+        // disabled, path/s3/json still succeed while url errors.
         let svc = setup().await;
         let bucket = svc_for_profile(&svc).await;
         svc.profiles
@@ -653,8 +667,9 @@ mod tests {
             let out = svc
                 .generate(&["nas/media/doc.pdf".into()], &req(format))
                 .await
+                .into_items()
                 .remove(0);
-            let link = out.link.expect("{format:?} should not need a URL");
+            let link = out.value.expect("{format:?} should not need a URL");
             assert!(link.public_url.is_none());
         }
 
@@ -662,9 +677,12 @@ mod tests {
             let out = svc
                 .generate(&["nas/media/doc.pdf".into()], &req(format))
                 .await
+                .into_items()
                 .remove(0);
             assert!(
-                out.error.unwrap().contains("public links are disabled"),
+                failure_message(&out)
+                    .unwrap()
+                    .contains("public links are disabled"),
                 "{format:?} renders a URL and must fail"
             );
         }
@@ -706,8 +724,8 @@ mod tests {
                 &req(LinkFormat::Path),
             )
             .await;
-        assert!(outcomes[0].link.is_some());
-        assert!(outcomes[1].error.is_some());
+        assert!(outcomes.items()[0].value.is_some());
+        assert!(failure_message(&outcomes.items()[1]).is_some());
     }
 
     #[test]

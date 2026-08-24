@@ -1,22 +1,14 @@
-//! Transfer execution engine (CORE-006 / UP- / DOWN- / STORE-013).
+//! Transfer execution: resumable uploads and downloads against one
+//! [`Storage`] adapter.
 //!
-//! One engine instance runs a whole job's items against one [`Storage`]
-//! adapter. Design points:
-//!
-//! - **Uploads**: files at or above the multipart threshold stream part by
-//!   part through [`Storage::upload_part`]; the (upload_id, completed parts)
-//!   checkpoint goes to the [`MultipartStore`] after every part, so an
-//!   interrupted upload resumes without re-sending finished parts (UP-014/015).
-//! - **Downloads**: ranged chunked reads append to a `<name>.part` file and
-//!   rename atomically on completion (DOWN-004/009); an existing `.part`
-//!   resumes from its length.
-//! - **Retries**: the application composition root wraps the adapter in
-//!   [`crate::RetryingStorage`], so this engine issues each storage operation
-//!   once and remains focused on transfer state.
-//! - Progress flows through [`ProgressSink`] to stderr only (JOB-005/016).
+//! Stateless between calls except the checkpoint store — multipart uploads
+//! checkpoint after every part, downloads stage through a `.part` file and
+//! rename atomically on completion; retries live at the storage seam
+//! ([`crate::RetryingStorage`]), never inside the engine.
 
 use std::path::PathBuf;
 
+use rstore_domain::id::ConnectionId;
 use rstore_domain::policy::ConflictPolicy;
 use rstore_domain::remote::ObjectPath;
 use rstore_domain::{Error, Result};
@@ -30,7 +22,7 @@ use crate::multipart;
 use crate::progress::{Progress, ProgressSink};
 use crate::pump::{pump, ChunkPlan, ChunkSink, RangedSource};
 
-/// Tuning knobs (UP-006/007 thresholds are configurable).
+/// Tuning knobs for transfer sizes and thresholds.
 #[derive(Debug, Clone, Copy)]
 pub struct TransferConfig {
     /// Files at or above this size use multipart (default 8 MiB).
@@ -59,8 +51,8 @@ pub struct UploadRequest {
     pub source: PathBuf,
     pub content_type: Option<String>,
     pub conflict: ConflictPolicy,
-    /// Connection identity for the multipart checkpoint.
-    pub connection: String,
+    /// Typed connection identity for the multipart checkpoint.
+    pub connection: ConnectionId,
 }
 
 /// One download request (remote object → local file).
@@ -126,6 +118,8 @@ pub struct TransferEngine {
 }
 
 impl TransferEngine {
+    /// Creates an engine bound to one storage adapter, its checkpoint store
+    /// and its sizing configuration.
     pub fn new(
         storage: std::sync::Arc<dyn Storage>,
         checkpoints: std::sync::Arc<dyn MultipartStore>,
@@ -152,9 +146,9 @@ impl TransferEngine {
         let size = source_metadata.len();
         let fingerprint = FileFingerprint::of(&source_metadata);
 
-        // Conflict policy against an existing remote object (UP-010..013):
-        // the one decision table, its one interpretation and its one
-        // reaction — rename re-entry included.
+        // Conflict policy against an existing remote object: the one decision
+        // table, its one interpretation and its one reaction — rename
+        // re-entry included.
         let key = match decide_target(
             req.key.as_str(),
             req.conflict,
@@ -168,10 +162,11 @@ impl TransferEngine {
         };
 
         let opts = PutOptions {
-            content_type: req
-                .content_type
-                .clone()
-                .or_else(|| guess_content_type(&req.source)),
+            content_type: Some(
+                req.content_type
+                    .clone()
+                    .unwrap_or_else(|| guess_content_type(&req.source)),
+            ),
             ..Default::default()
         };
 
@@ -218,14 +213,14 @@ impl TransferEngine {
         cancel: &CancellationToken,
     ) -> Result<ObjectMetadata> {
         let size = fingerprint.size;
-        let (connection, bucket) = (&req.connection, &req.bucket);
+        let (connection, bucket) = (req.connection, req.bucket.as_str());
         let file = tokio::fs::File::open(&req.source)
             .await
             .map_err(|e| Error::io("open upload source").with_source(e))?;
         let mut reader = tokio::io::BufReader::with_capacity(self.config.part_size as usize, file);
 
         // The one resume policy: adopt a matching checkpoint, strictly retire
-        // a stale one, or begin fresh (UP-014/015).
+        // a stale one, or begin fresh.
         let (session, mut done_parts) = multipart::resume_or_begin(
             self.storage.as_ref(),
             self.checkpoints.as_ref(),
@@ -239,10 +234,9 @@ impl TransferEngine {
         let done_numbers: Vec<u32> = done_parts.iter().map(|p| p.part_number).collect();
         let done_bytes: u64 = done_parts.iter().map(|p| p.size).sum();
 
-        // One counter — bytes already safely stored. `pending` owns the skip
-        // decision and the part numbering, so the plan position that once
-        // drifted from the progress counter (truncating a resumed upload by
-        // exactly the resumed bytes) no longer exists.
+        // One counter — bytes already safely stored. `pending` owns both the
+        // skip decision and the part numbering, so the progress counter can
+        // never drift from the plan positions.
         let mut progress_bytes = done_bytes;
         for (part_number, range) in
             ChunkPlan::new(size, self.config.part_size).pending(&done_numbers)
@@ -298,15 +292,18 @@ impl TransferEngine {
             // successful upload as failed because local cleanup lagged.
             tracing::warn!(error = %error, "could not clear completed multipart checkpoint");
         }
-        progress.report(Progress::Bytes {
-            done: size,
-            total: size,
-        });
+        // The per-part loop already reported the terminal count; emit here
+        // only when resume skipped every pending part.
+        if progress_bytes < size {
+            progress.report(Progress::Bytes {
+                done: size,
+                total: size,
+            });
+        }
         Ok(metadata)
     }
 
-    /// Download one object with `.part` staging and byte-exact resume
-    /// (DOWN-001/004/009).
+    /// Download one object with `.part` staging and byte-exact resume.
     pub async fn download(
         &self,
         req: &DownloadRequest,
@@ -316,8 +313,8 @@ impl TransferEngine {
         cancel.check()?;
         let meta = self.storage.stat(&req.bucket, &req.key).await?;
 
-        // Local conflict policy mirrors the upload set (DOWN-005/006): the
-        // one decision, interpretation and reaction.
+        // Local conflict policy mirrors the upload set: the one decision,
+        // interpretation and reaction.
         let target = match decide_target(
             &req.target.to_string_lossy(),
             req.conflict,
@@ -336,8 +333,8 @@ impl TransferEngine {
                 .map_err(|e| Error::io("create download dir").with_source(e))?;
         }
 
-        // Staging policy (DOWN-004/009): identity-checked resume, atomic
-        // promotion — one module owns the `.part` lifetime.
+        // Staging policy: identity-checked resume, atomic promotion — one
+        // module owns the `.part` lifetime.
         let mut staged = crate::part_file::stage(&target, &meta).await?;
 
         struct StagedSink<'a>(&'a mut crate::part_file::StagedDownload);
@@ -370,6 +367,12 @@ mod tests {
     use super::*;
     use rstore_domain::remote::ObjectPath;
 
+    /// Deterministic checkpoint identity shared by every request in a test.
+    fn conn() -> ConnectionId {
+        use std::str::FromStr as _;
+        ConnectionId::from_str("conn_00000000-0000-0000-0000-000000000000").unwrap()
+    }
+
     fn key(s: &str) -> ObjectPath {
         ObjectPath::new(s).unwrap()
     }
@@ -377,6 +380,7 @@ mod tests {
     use rstore_storage_api::model::{ReadRange, UploadedPart};
     use rstore_storage_api::{NoopMultipartStore, PendingUpload};
     use rstore_test_support::FakeStorage;
+    use rstore_test_support::StorageMethod;
     use std::sync::Arc;
 
     /// Real S3 minimum for non-final multipart parts — the same floor the
@@ -435,7 +439,7 @@ mod tests {
             source: source.clone(),
             content_type: None,
             conflict: ConflictPolicy::Overwrite,
-            connection: "conn_nas".into(),
+            connection: conn(),
         };
         let out = engine
             .upload(&req, &rstore_transfer_sink(), &cancel)
@@ -447,7 +451,6 @@ mod tests {
         assert_eq!(metadata.key, "docs/small.txt");
         assert_eq!(metadata.size, 12);
 
-        // Download it back and compare bytes.
         let target = source.with_extension("downloaded");
         let dl = DownloadRequest {
             bucket: "media".into(),
@@ -460,7 +463,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"hello rstore");
-        // No `.part` residue after atomic completion (DOWN-009).
         assert!(!target.with_extension("downloaded.part").exists());
     }
 
@@ -510,7 +512,6 @@ mod tests {
         ));
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
 
-        // Simulate a run interrupted after the first two chunks (chunk = 4).
         let meta = storage.stat("media", &key("doc.bin")).await.unwrap();
         let mut staged = crate::part_file::stage(&target, &meta).await.unwrap();
         let head = storage
@@ -549,7 +550,7 @@ mod tests {
             source,
             content_type: None,
             conflict: ConflictPolicy::Ask,
-            connection: "conn_nas".into(),
+            connection: conn(),
         };
         let out = engine
             .upload(&req, &rstore_transfer_sink(), &cancel)
@@ -567,7 +568,6 @@ mod tests {
     async fn multipart_upload_assembles_object() {
         let storage = Arc::new(FakeStorage::new());
         let engine = multipart_engine(storage.clone(), Arc::new(NoopMultipartStore));
-        // Two full parts plus a tail, at the real S3 part floor.
         let payload: Vec<u8> = (0..(PART * 2 + 5) as usize)
             .map(|i| (i % 251) as u8)
             .collect();
@@ -580,7 +580,7 @@ mod tests {
             source,
             content_type: None,
             conflict: ConflictPolicy::Overwrite,
-            connection: "conn_nas".into(),
+            connection: conn(),
         };
         let out = engine
             .upload(&req, &rstore_transfer_sink(), &cancel)
@@ -600,9 +600,6 @@ mod tests {
     async fn multipart_resume_produces_byte_exact_object() {
         use std::sync::Mutex;
 
-        // Two full parts at the real S3 floor plus a tail. Simulate a run
-        // interrupted after the first 2 parts (checkpointed in a store
-        // backed by real state).
         type StoreState = Option<(String, Vec<UploadedPart>, FileFingerprint)>;
         #[derive(Default, Clone)]
         struct SharedStore {
@@ -611,7 +608,12 @@ mod tests {
 
         #[async_trait::async_trait]
         impl MultipartStore for SharedStore {
-            async fn pending(&self, _c: &str, _b: &str, _k: &str) -> Result<Option<PendingUpload>> {
+            async fn pending(
+                &self,
+                _c: ConnectionId,
+                _b: &str,
+                _k: &str,
+            ) -> Result<Option<PendingUpload>> {
                 let guard = self.state.lock().unwrap();
                 Ok(guard
                     .as_ref()
@@ -623,7 +625,7 @@ mod tests {
             }
             async fn started(
                 &self,
-                _c: &str,
+                _c: ConnectionId,
                 _b: &str,
                 _k: &str,
                 upload_id: &str,
@@ -635,7 +637,7 @@ mod tests {
             }
             async fn part_done(
                 &self,
-                _c: &str,
+                _c: ConnectionId,
                 _b: &str,
                 _k: &str,
                 part: &UploadedPart,
@@ -649,7 +651,7 @@ mod tests {
                     .push(part.clone());
                 Ok(())
             }
-            async fn cleared(&self, _c: &str, _b: &str, _k: &str) -> Result<()> {
+            async fn cleared(&self, _c: ConnectionId, _b: &str, _k: &str) -> Result<()> {
                 *self.state.lock().unwrap() = None;
                 Ok(())
             }
@@ -664,8 +666,6 @@ mod tests {
         let storage = Arc::new(FakeStorage::new());
         let cancel = CancellationToken::new();
 
-        // Seed the checkpoint AND the fake provider's staged parts as a
-        // previous run would have left them (server keeps uploaded parts).
         store.state.lock().unwrap().replace((
             "upload-1".into(),
             vec![
@@ -712,7 +712,7 @@ mod tests {
             source,
             content_type: None,
             conflict: ConflictPolicy::Overwrite,
-            connection: "conn_nas".into(),
+            connection: conn(),
         };
         engine
             .upload(&req, &rstore_transfer_sink(), &cancel)
@@ -743,7 +743,7 @@ mod tests {
         impl MultipartStore for StaleCheckpoint {
             async fn pending(
                 &self,
-                _connection: &str,
+                _connection: ConnectionId,
                 _bucket: &str,
                 _key: &str,
             ) -> Result<Option<PendingUpload>> {
@@ -752,7 +752,7 @@ mod tests {
 
             async fn started(
                 &self,
-                _connection: &str,
+                _connection: ConnectionId,
                 _bucket: &str,
                 _key: &str,
                 _upload_id: &str,
@@ -763,7 +763,7 @@ mod tests {
 
             async fn part_done(
                 &self,
-                _connection: &str,
+                _connection: ConnectionId,
                 _bucket: &str,
                 _key: &str,
                 _part: &UploadedPart,
@@ -771,7 +771,12 @@ mod tests {
                 Ok(())
             }
 
-            async fn cleared(&self, _connection: &str, _bucket: &str, _key: &str) -> Result<()> {
+            async fn cleared(
+                &self,
+                _connection: ConnectionId,
+                _bucket: &str,
+                _key: &str,
+            ) -> Result<()> {
                 *self.pending.lock().unwrap() = None;
                 Ok(())
             }
@@ -820,7 +825,7 @@ mod tests {
             source,
             content_type: None,
             conflict: ConflictPolicy::Overwrite,
-            connection: "conn_nas".into(),
+            connection: conn(),
         };
 
         engine
@@ -846,7 +851,7 @@ mod tests {
         impl MultipartStore for FailingCheckpoint {
             async fn pending(
                 &self,
-                _connection: &str,
+                _connection: ConnectionId,
                 _bucket: &str,
                 _key: &str,
             ) -> Result<Option<PendingUpload>> {
@@ -855,7 +860,7 @@ mod tests {
 
             async fn started(
                 &self,
-                _connection: &str,
+                _connection: ConnectionId,
                 _bucket: &str,
                 _key: &str,
                 _upload_id: &str,
@@ -866,7 +871,7 @@ mod tests {
 
             async fn part_done(
                 &self,
-                _connection: &str,
+                _connection: ConnectionId,
                 _bucket: &str,
                 _key: &str,
                 _part: &UploadedPart,
@@ -874,7 +879,12 @@ mod tests {
                 Ok(())
             }
 
-            async fn cleared(&self, _connection: &str, _bucket: &str, _key: &str) -> Result<()> {
+            async fn cleared(
+                &self,
+                _connection: ConnectionId,
+                _bucket: &str,
+                _key: &str,
+            ) -> Result<()> {
                 Ok(())
             }
         }
@@ -895,7 +905,7 @@ mod tests {
             source: temp_file("checkpoint-failure.bin", &[7; 20]),
             content_type: None,
             conflict: ConflictPolicy::Overwrite,
-            connection: "conn_nas".into(),
+            connection: conn(),
         };
 
         let error = engine
@@ -930,13 +940,63 @@ mod tests {
             source,
             content_type: None,
             conflict: ConflictPolicy::Skip,
-            connection: "conn_nas".into(),
+            connection: conn(),
         };
         let out = engine
             .upload(&req, &rstore_transfer_sink(), &cancel)
             .await
             .unwrap();
         assert!(out.skipped);
+        assert_eq!(
+            storage.stat("media", &key("s.txt")).await.unwrap().size,
+            8,
+            "existing object untouched"
+        );
+    }
+
+    /// A probe outage during the conflict decision must block the item —
+    /// never read as "target absent" and overwrite it.
+    #[tokio::test]
+    async fn stat_outage_blocks_conflict_decision_instead_of_overwriting() {
+        let storage = Arc::new(FakeStorage::new());
+        let engine = engine(storage.clone());
+        let source = temp_file("s.txt", b"new");
+        let cancel = CancellationToken::new();
+
+        storage
+            .put(
+                "media",
+                &key("s.txt"),
+                bytes::Bytes::from_static(b"existing"),
+                &PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        storage.fail_until_cleared(
+            StorageMethod::Stat,
+            rstore_domain::Error::network("probe outage"),
+        );
+
+        let req = UploadRequest {
+            bucket: "media".into(),
+            key: ObjectPath::new("s.txt").unwrap(),
+            source,
+            content_type: None,
+            conflict: ConflictPolicy::Skip,
+            connection: conn(),
+        };
+        let out = engine
+            .upload(&req, &rstore_transfer_sink(), &cancel)
+            .await
+            .unwrap();
+        storage.clear_fault(StorageMethod::Stat);
+
+        assert!(out.blocked, "unverifiable target blocks, got {out:?}");
+        assert!(out
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("could not be verified"));
         assert_eq!(
             storage.stat("media", &key("s.txt")).await.unwrap().size,
             8,
@@ -957,7 +1017,7 @@ mod tests {
             source,
             content_type: None,
             conflict: ConflictPolicy::Overwrite,
-            connection: "conn_nas".into(),
+            connection: conn(),
         };
         let err = engine
             .upload(&req, &rstore_transfer_sink(), &cancel)
@@ -973,7 +1033,6 @@ mod tests {
     async fn midflight_cancellation_keeps_the_provider_upload_for_resume() {
         use std::sync::Mutex;
 
-        // Cancel the run after the first checkpointed part.
         struct CancelAfterPart {
             parts_done: Mutex<u32>,
             token: CancellationToken,
@@ -981,12 +1040,17 @@ mod tests {
 
         #[async_trait::async_trait]
         impl MultipartStore for CancelAfterPart {
-            async fn pending(&self, _c: &str, _b: &str, _k: &str) -> Result<Option<PendingUpload>> {
+            async fn pending(
+                &self,
+                _c: ConnectionId,
+                _b: &str,
+                _k: &str,
+            ) -> Result<Option<PendingUpload>> {
                 Ok(None)
             }
             async fn started(
                 &self,
-                _c: &str,
+                _c: ConnectionId,
                 _b: &str,
                 _k: &str,
                 _upload_id: &str,
@@ -996,7 +1060,7 @@ mod tests {
             }
             async fn part_done(
                 &self,
-                _c: &str,
+                _c: ConnectionId,
                 _b: &str,
                 _k: &str,
                 _part: &UploadedPart,
@@ -1008,7 +1072,7 @@ mod tests {
                 }
                 Ok(())
             }
-            async fn cleared(&self, _c: &str, _b: &str, _k: &str) -> Result<()> {
+            async fn cleared(&self, _c: ConnectionId, _b: &str, _k: &str) -> Result<()> {
                 Ok(())
             }
         }
@@ -1032,7 +1096,7 @@ mod tests {
             source,
             content_type: None,
             conflict: ConflictPolicy::Overwrite,
-            connection: "conn_nas".into(),
+            connection: conn(),
         };
 
         let error = engine

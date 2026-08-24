@@ -1,7 +1,11 @@
-//! Human-readable formatting shared by handler modules (CLI-003).
+//! Human-readable formatting shared by the handler modules: byte sizes,
+//! transfer speeds, columnar tables, labeled detail views, and opaque-token
+//! wrapping for pagination cursors.
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 
+/// Format a byte count with binary units, keeping whole bytes exact
+/// (`1024 B`, `1.5 KB`).
 pub(super) fn human_size(size: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut value = size as f64;
@@ -17,6 +21,8 @@ pub(super) fn human_size(size: u64) -> String {
     }
 }
 
+/// Format a transfer rate as bytes per second with one decimal above the
+/// kilobyte range; sub-millisecond durations clamp to avoid division blowup.
 pub(super) fn speed(bytes: u64, elapsed: std::time::Duration) -> String {
     let secs = elapsed.as_secs_f64().max(0.001);
     let bps = bytes as f64 / secs;
@@ -36,10 +42,10 @@ pub(super) enum Align {
     Right,
 }
 
-/// A human-readable columnar listing (CLI-003): header plus rows, column
-/// widths adapting to the widest cell, two-space gutters, an optional detail
-/// line nested under a row. One renderer so every `… list` command shares
-/// the same table grammar instead of hand-picked `{:<N}` widths.
+/// A human-readable columnar listing: header plus rows, column widths
+/// adapting to the widest cell, two-space gutters, an optional detail line
+/// nested under a row. One renderer so every `… list` command shares the
+/// same table grammar instead of hand-picked `{:<N}` widths.
 pub(super) struct Table {
     header: Vec<String>,
     aligns: Vec<Align>,
@@ -47,8 +53,8 @@ pub(super) struct Table {
 }
 
 impl Table {
-    /// `header` names the columns (rendered as given, uppercase by
-    /// convention); `aligns` must have one entry per column.
+    /// Build a table; `header` names the columns (rendered as given,
+    /// uppercase by convention) and `aligns` must have one entry per column.
     pub(super) fn new(header: &[&str], aligns: &[Align]) -> Self {
         debug_assert_eq!(header.len(), aligns.len(), "one align per column");
         Self {
@@ -70,8 +76,8 @@ impl Table {
         self.rows.is_empty()
     }
 
-    /// Attach a detail line under the most recently added row (indented to
-    /// nest under the row, e.g. the `id:` line of a listing).
+    /// Attach a detail line under the most recently added row, indented to
+    /// nest beneath it (e.g. an `id:` line in a listing).
     pub(super) fn detail(&mut self, detail: String) -> &mut Self {
         if let Some(last) = self.rows.last_mut() {
             last.1 = Some(detail);
@@ -79,8 +85,8 @@ impl Table {
         self
     }
 
-    /// Render header + rows; empty tables render nothing (callers print
-    /// their own empty-state copy).
+    /// Render header plus rows; an empty table renders nothing because
+    /// callers print their own empty-state copy.
     pub(super) fn render(&self) -> String {
         let mut widths: Vec<usize> = self.header.iter().map(|h| h.len()).collect();
         for (cells, _) in &self.rows {
@@ -109,7 +115,7 @@ impl Table {
                 line.push_str("  ");
             }
             if i == cells.len() - 1 {
-                // The last column is never padded: trailing gaps read as bugs.
+                // Trailing whitespace on the last column reads as a bug.
                 line.push_str(cell);
             } else {
                 let padded = format!("{}", Pad(cell, widths[i], &self.aligns[i]));
@@ -121,12 +127,12 @@ impl Table {
     }
 }
 
-/// Pad `s` to `width` on the side `align` picks, char-wise (paths can carry
-/// wide glyphs).
+/// Pad `s` to `width` on the side `align` picks, counting chars rather than
+/// bytes so paths carrying wide glyphs stay aligned.
 struct Pad<'a>(&'a str, usize, &'a Align);
 
 /// One empty-state grammar for titled listings: the title line over the
-/// rendered table, or the empty-state line, never a bare table.
+/// rendered table, or the empty-state line — never a bare table.
 pub(super) fn listing(title: &str, empty: &str, table: Table) -> String {
     if table.is_empty() {
         format!("{empty}\n")
@@ -135,8 +141,8 @@ pub(super) fn listing(title: &str, empty: &str, table: Table) -> String {
     }
 }
 
-/// The pagination footnote for a titled listing: one grammar, so `remote ls`
-/// and `files list` hint the same way. `flag` names the caller's own option.
+/// The pagination footnote for a titled listing; `flag` names the caller's
+/// own continuation option so every listing hints the same way.
 pub(super) fn more(flag: &str, cursor: &str) -> String {
     format!("  -- more: {flag} {cursor}\n")
 }
@@ -152,7 +158,12 @@ pub(super) fn encode_opaque_token(token: &str) -> String {
     )
 }
 
-/// Decode the printable CLI token before passing it to the provider.
+/// Decode a printable CLI token back to the raw provider token before
+/// passing it on.
+///
+/// # Errors
+/// Returns [`rstore_domain::Error::invalid_input`] when the prefix is
+/// missing or the payload is not valid URL-safe base64 UTF-8.
 pub(super) fn decode_opaque_token(token: &str) -> rstore_domain::Result<String> {
     let Some(encoded) = token.strip_prefix(OPAQUE_TOKEN_PREFIX) else {
         return Err(rstore_domain::Error::invalid_input(
@@ -166,9 +177,9 @@ pub(super) fn decode_opaque_token(token: &str) -> rstore_domain::Result<String> 
         .map_err(|_| rstore_domain::Error::invalid_input("invalid remote pagination cursor"))
 }
 
-/// A directory listing keeps its title when empty — an empty remote
-/// directory is still named — and paginates through the shared [`more`]
-/// footnote.
+/// Assemble a directory listing that keeps its title when empty — an empty
+/// remote directory is still named — and appends the shared [`more`]
+/// footnote when a cursor is present.
 pub(super) fn dir_listing(
     title: &str,
     empty_line: &str,
@@ -191,8 +202,8 @@ enum FieldRow {
     Lines { label: String, lines: Vec<String> },
 }
 
-/// A human-readable labeled detail view (CLI-003): an optional header line,
-/// then `label : value` lines under one two-space indent, label widths
+/// A human-readable labeled detail view: an optional header line, then
+/// `label : value` lines under a single two-space indent, label widths
 /// adapting to the longest label, `Option` values rendering as `(none)`.
 /// One renderer so every `… show`/`stat` view shares the same grammar
 /// instead of hand-counted padding.
@@ -203,6 +214,7 @@ pub(super) struct Fields {
 }
 
 impl Fields {
+    /// Create an empty view with no header.
     pub(super) fn new() -> Self {
         Self {
             header: None,
@@ -211,7 +223,7 @@ impl Fields {
         }
     }
 
-    /// Render a header line above the fields (the subject of the view).
+    /// Render a header line above the fields naming the subject of the view.
     pub(super) fn header(&mut self, header: impl std::fmt::Display) -> &mut Self {
         self.header = Some(header.to_string());
         self
@@ -227,7 +239,7 @@ impl Fields {
         self
     }
 
-    /// Append one `label : value` line; `None` renders as `(none)`.
+    /// Append one `label : value` line; a `None` value renders as `(none)`.
     pub(super) fn push_opt(
         &mut self,
         label: &str,
@@ -250,6 +262,7 @@ impl Fields {
         self
     }
 
+    /// Render the header (if any) followed by all field lines.
     pub(super) fn render(&self) -> String {
         let mut out = String::new();
         if let Some(header) = &self.header {

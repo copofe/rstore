@@ -1,9 +1,9 @@
-//! Platform integration: standard app data directories (DATA-001) and a
-//! cross-process write lock (DATA-008).
+//! Platform integration: standard application data directories and a
+//! cross-process write lock.
 //!
-//! Dependency rule (PRD §6): this crate MUST NOT depend on `domain`. It exposes
-//! its own small error type; the application layer maps it into the domain
-//! error model where needed.
+//! Dependency rule: this crate MUST NOT depend on `domain`. It exposes its own
+//! small error type; the application layer maps it into the domain error model
+//! where needed.
 
 pub mod dirs;
 pub mod lock;

@@ -263,8 +263,8 @@ fn link_input(
     flags: &crate::args::LinkProfileFlags,
 ) -> Result<rstore_application::LinkProfileInput, rstore_domain::Error> {
     Ok(rstore_application::LinkProfileInput {
-        public_base_url: flags.public_base.clone(),
-        cdn_base_url: flags.cdn_base.clone(),
+        public_base_url: flags.public_base.clone().map(Some),
+        cdn_base_url: flags.cdn_base.clone().map(Some),
         allow_public_url: flags.allow_public_url,
         allow_presigned: flags.allow_presigned,
         default_ttl_seconds: match &flags.default_ttl {

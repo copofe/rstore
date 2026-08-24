@@ -1,17 +1,23 @@
-//! Durable coordination for remote mutations and local catalog projection.
+//! Remote mutation settlement: the durability seam between remote storage
+//! writes and the local catalog projection.
 //!
-//! A provider mutation cannot share a transaction with SQLite. This seam
-//! records the completed remote fact first, then lets catalog follow-up report
-//! a queryable repair item instead of silently downgrading the remote result.
+//! Contract: every confirmed remote mutation first commits a receipt plus
+//! outbox event as one atomic unit-of-work; only then does the coordinator
+//! apply catalog projections. Any projection failure is persisted as a repair
+//! item so it can be retried, never lost and never re-executed against the
+//! remote side.
 
 use std::sync::Arc;
 
+// Membership preservation needs the narrow catalog membership trait, not the
+// wide workspace store: the dependency bundle hands out the catalog-typed
+// handle here (`CatalogTagPort`) on purpose.
 use rstore_application_ports::{
-    OutboxEvent, RemoteMutationReceipt, RepairItem, UnitOfWorkOperation,
+    OutboxEvent, RemoteMutationReceipt, RepairItem, RepairKind, RepairStatus, UnitOfWorkOperation,
 };
 use rstore_catalog::{RemoteObjectRepository, TagStore};
 use rstore_domain::events::DomainEvent;
-use rstore_domain::id::{BucketId, ConnectionId, JobId};
+use rstore_domain::id::{BucketId, ConnectionId, JobId, ReceiptId, RepairId};
 use rstore_domain::remote::ObjectPath;
 use rstore_domain::{Clock, Error, RemoteLocator};
 use rstore_storage_api::model::ObjectMetadata;
@@ -21,6 +27,7 @@ use uuid::Uuid;
 
 use crate::ports::{RepairPort, UnitOfWorkPort};
 
+/// Kind of remote mutation being settled.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum MutationOperation {
     Upload,
@@ -29,6 +36,7 @@ pub(crate) enum MutationOperation {
 }
 
 impl MutationOperation {
+    /// Stable wire/persistence name for this operation kind.
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Upload => "upload",
@@ -38,6 +46,8 @@ impl MutationOperation {
     }
 }
 
+/// Catalog projection steps that can fail after a durable settlement; each
+/// maps to a distinct repair stage.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ProjectionStage {
     ObjectUpsert,
@@ -50,7 +60,7 @@ pub(crate) enum ProjectionStage {
     SourceDelete,
 }
 
-/// The catalog identity of one remote object involved in a copy or move.
+/// Locator triple identifying one remote object in the catalog.
 pub(crate) struct CatalogObjectRef<'a> {
     connection: ConnectionId,
     bucket: BucketId,
@@ -58,6 +68,7 @@ pub(crate) struct CatalogObjectRef<'a> {
 }
 
 impl<'a> CatalogObjectRef<'a> {
+    /// Builds a reference to a remote object at the given locator.
     pub(crate) fn new(connection: ConnectionId, bucket: BucketId, path: &'a ObjectPath) -> Self {
         Self {
             connection,
@@ -71,7 +82,8 @@ impl<'a> CatalogObjectRef<'a> {
     }
 }
 
-/// Everything the settlement module needs after one remote copy completes.
+/// Post-copy bookkeeping payload for settling a completed remote copy,
+/// including optional tag propagation from source to target.
 pub(crate) struct CopyFollowUp<'a> {
     source: CatalogObjectRef<'a>,
     target: CatalogObjectRef<'a>,
@@ -81,6 +93,7 @@ pub(crate) struct CopyFollowUp<'a> {
 }
 
 impl<'a> CopyFollowUp<'a> {
+    /// Builds the settlement payload for a copy from `source` to `target`.
     pub(crate) fn new(
         source: CatalogObjectRef<'a>,
         target: CatalogObjectRef<'a>,
@@ -98,9 +111,8 @@ impl<'a> CopyFollowUp<'a> {
     }
 }
 
-/// One resolved endpoint of a move completion: the storage handle plus the
-/// catalog identity of the object involved. The coordinator needs the remote
-/// handle to verify and delete; it never constructs adapters itself.
+/// Storage-side endpoint of a move operation: the handle used to verify or
+/// delete an object plus its catalog identity.
 pub(crate) struct MoveEndpoint<'a> {
     pub(crate) storage: &'a dyn Storage,
     pub(crate) connection: ConnectionId,
@@ -109,10 +121,7 @@ pub(crate) struct MoveEndpoint<'a> {
     pub(crate) path: &'a ObjectPath,
 }
 
-/// Result of a move's verify→delete completion after the remote copy
-/// succeeded. Failure arms carry the message the job step reports; the
-/// durable repair item has already been recorded by the coordinator — a
-/// half-finished move is never only a message in the job log.
+/// Outcome of finishing a move after its copy settled durably.
 #[derive(Debug)]
 pub(crate) enum MoveFinish {
     Completed,
@@ -121,6 +130,7 @@ pub(crate) enum MoveFinish {
 }
 
 impl ProjectionStage {
+    /// Stable persistence name for this projection stage.
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::ObjectUpsert => "object_upsert",
@@ -135,32 +145,32 @@ impl ProjectionStage {
     }
 }
 
-/// Outcome of recording one completed remote mutation locally.
+/// Durability result of committing a remote mutation receipt.
 #[derive(Debug, Clone)]
 pub(crate) enum RemoteSettlement {
-    /// The receipt and its outbox fact committed as one local unit.
-    Durable { receipt_id: String },
-    /// The local commit failed and degraded into a repair item. The receipt
-    /// id is a correlation handle only — no receipt row exists.
-    RepairQueued { receipt_id: String },
+    /// The receipt/outbox unit committed locally; the mutation is durable.
+    Durable { receipt_id: ReceiptId },
+
+    /// The commit failed but a repair was queued; the mutation must be
+    /// re-applied by the repair loop.
+    RepairQueued { receipt_id: ReceiptId },
 }
 
 impl RemoteSettlement {
-    /// The correlation handle for repair items, durable or not.
-    pub(crate) fn receipt_id(&self) -> &str {
+    /// Receipt id carried by either settlement flavor.
+    pub(crate) fn receipt_id(&self) -> ReceiptId {
         match self {
-            Self::Durable { receipt_id } | Self::RepairQueued { receipt_id } => receipt_id,
+            Self::Durable { receipt_id } | Self::RepairQueued { receipt_id } => *receipt_id,
         }
     }
 }
 
-/// Application-owned coordinator for the remote-mutation consistency seam.
+/// Coordinates remote mutation settlement.
 ///
-/// The durability ports are required, not optional: a remote-mutation
-/// receipt and its outbox fact are committed atomically through
-/// [`UnitOfWorkPort`], and every projection failure lands in the repair
-/// repository. "No durability configured" is not a state this seam can be
-/// in — a composition root either provides it or does not build the graph.
+/// Sequencing rule per mutation: record the receipt+outbox unit atomically
+/// (`record_remote_success`), then project into the catalog; projection
+/// failures are recorded as repairs keyed to the receipt, leaving the remote
+/// side untouched.
 #[derive(Clone)]
 pub(crate) struct MutationCoordinator {
     unit_of_work: UnitOfWorkPort,
@@ -171,6 +181,7 @@ pub(crate) struct MutationCoordinator {
 }
 
 impl MutationCoordinator {
+    /// Wires the coordinator to its persistence ports and catalog stores.
     pub(crate) fn new(
         unit_of_work: UnitOfWorkPort,
         repairs: RepairPort,
@@ -192,9 +203,9 @@ impl MutationCoordinator {
         self.catalog.clone()
     }
 
-    /// Settle a completed upload: record the remote fact, then project the
-    /// confirmed object locally. Projection failure never reclassifies the
-    /// already-completed provider operation.
+    /// Settles a confirmed remote upload: records the receipt, then upserts
+    /// the confirmed object into the catalog. Never fails the caller;
+    /// projection problems land in the repair queue instead.
     pub(crate) async fn settle_upload(
         &self,
         connection: ConnectionId,
@@ -233,10 +244,10 @@ impl MutationCoordinator {
         }
     }
 
-    /// Settle a completed copy and, when requested, carry tag associations
-    /// from the source catalog row to the target row. Returns the settlement
-    /// of the copy receipt — [`Self::finish_move`] correlates move repairs
-    /// against it.
+    /// Settles a confirmed remote copy: records the receipt, upserts the
+    /// target object, and when tag preservation is requested mirrors the
+    /// source's tag associations onto the target. Each failed stage is
+    /// repaired independently; earlier successes are never rolled back.
     pub(crate) async fn settle_copy(&self, follow_up: &CopyFollowUp<'_>) -> RemoteSettlement {
         let target_locator = follow_up.target.locator();
         let settlement = self
@@ -271,6 +282,8 @@ impl MutationCoordinator {
             return settlement;
         }
 
+        // Tag mirroring reads through the catalog rather than trusting caller
+        // state, so partially projected copies still pick up their tags.
         let source = match self
             .catalog
             .find_by_locator(
@@ -350,8 +363,8 @@ impl MutationCoordinator {
         settlement
     }
 
-    /// Settle a completed delete by recording the fact and tombstoning the
-    /// local row. A failed tombstone becomes repair state.
+    /// Settles a confirmed remote delete: records the receipt, then tombstones
+    /// the catalog row. Tombstone failures are queued as repairs.
     pub(crate) async fn settle_delete(
         &self,
         connection: ConnectionId,
@@ -375,11 +388,10 @@ impl MutationCoordinator {
         }
     }
 
-    /// Complete a move after the remote copy succeeded: verify the target
-    /// landed (MOVE-014), delete the source, then settle the delete. Every
-    /// failure arm leaves a queryable repair item against the source locator
-    /// — the actionable object for a repair tool — and the copy settlement
-    /// is never reclassified: the provider copy already succeeded.
+    /// Finishes a move whose copy already settled: verifies the target size,
+    /// deletes the source, and settles the source delete in the catalog. A
+    /// verification or deletion failure keeps the source intact and records a
+    /// `MoveFollowup` repair instead of losing the copied data.
     pub(crate) async fn finish_move(
         &self,
         copy: &RemoteSettlement,
@@ -387,6 +399,8 @@ impl MutationCoordinator {
         source: &MoveEndpoint<'_>,
         target: &MoveEndpoint<'_>,
     ) -> MoveFinish {
+        // Size check is the integrity gate: only delete the source once the
+        // target provably holds the expected bytes.
         match target.storage.stat(target.bucket_name, target.path).await {
             Ok(verified) if verified.size == follow_up.metadata.size => {}
             Ok(_) => {
@@ -418,8 +432,7 @@ impl MutationCoordinator {
         MoveFinish::Completed
     }
 
-    /// Record a failed move completion as durable repair state, correlated
-    /// with the copy settlement.
+    /// Records a move-stage failure as a repair anchored to the copy receipt.
     async fn move_failure(
         &self,
         copy: &RemoteSettlement,
@@ -430,8 +443,8 @@ impl MutationCoordinator {
         let locator = RemoteLocator::new(source.connection, source.bucket_id, source.path.clone());
         self.record_repair(
             Some(copy.receipt_id()),
-            "move_followup",
-            MutationOperation::Copy.as_str(),
+            RepairKind::MoveFollowup,
+            MutationOperation::Copy,
             &locator,
             message,
         )
@@ -443,9 +456,10 @@ impl MutationCoordinator {
         );
     }
 
+    /// Persists a projection failure as a repair and logs a warning.
     async fn projection_failure(
         &self,
-        receipt_id: Option<&str>,
+        receipt_id: Option<ReceiptId>,
         operation: MutationOperation,
         stage: ProjectionStage,
         locator: &RemoteLocator,
@@ -461,11 +475,9 @@ impl MutationCoordinator {
         );
     }
 
-    /// Persist a receipt and a domain fact after the provider has confirmed a
-    /// mutation. A failure is converted into a repair item because returning
-    /// it as the remote operation's error would report a false remote failure;
-    /// the settlement distinguishes the durable case from the degraded one so
-    /// callers cannot mistake a correlation handle for a committed receipt.
+    /// Commits the atomic settlement unit: one remote-mutation receipt plus
+    /// its outbox event, written together via the unit of work. On commit
+    /// failure queues a `RemoteMutation` repair so the mutation is retried.
     pub(crate) async fn record_remote_success(
         &self,
         operation: MutationOperation,
@@ -474,7 +486,7 @@ impl MutationCoordinator {
         job_id: Option<JobId>,
     ) -> RemoteSettlement {
         let now = self.clock.now();
-        let receipt_id = format!("receipt_{}", Uuid::new_v4());
+        let receipt_id = ReceiptId::new_random();
         let event_id = Uuid::new_v4();
         let event = DomainEvent::RemoteMutationCompleted {
             locator: locator.clone(),
@@ -482,8 +494,8 @@ impl MutationCoordinator {
         }
         .envelope(event_id, 0, now);
         let receipt = RemoteMutationReceipt {
-            receipt_id: receipt_id.clone(),
-            job_id: job_id.map(|id| id.to_string()),
+            receipt_id,
+            job_id,
             operation: operation.as_str().to_owned(),
             locator_json: serde_json::to_string(locator)
                 .expect("RemoteLocator is always serializable"),
@@ -493,9 +505,9 @@ impl MutationCoordinator {
             payload: metadata.and_then(|value| serde_json::to_value(value).ok()),
         };
         let outbox_event = OutboxEvent {
-            event_id: event.event_id.to_string(),
-            context: event.context.to_string(),
-            aggregate_type: event.aggregate_type.to_owned(),
+            event_id: event.event_id,
+            context: event.context,
+            aggregate_type: event.aggregate_type,
             aggregate_id: event.aggregate_id,
             aggregate_version: event.aggregate_version,
             event_type: event.event_type,
@@ -505,9 +517,6 @@ impl MutationCoordinator {
             attempts: 0,
         };
 
-        // The atomicity guarantee lives here — and only here: the receipt and
-        // its outbox fact commit as one local unit, or the failure becomes a
-        // queryable repair below.
         let result = self
             .unit_of_work
             .commit(UnitOfWorkOperation::RemoteMutation {
@@ -520,9 +529,9 @@ impl MutationCoordinator {
             Ok(()) => RemoteSettlement::Durable { receipt_id },
             Err(error) => {
                 self.record_repair(
-                    Some(&receipt_id),
-                    "remote_mutation",
-                    operation.as_str(),
+                    Some(receipt_id),
+                    RepairKind::RemoteMutation,
+                    operation,
                     locator,
                     &format!("remote mutation receipt/outbox failed: {error}"),
                 )
@@ -532,10 +541,10 @@ impl MutationCoordinator {
         }
     }
 
-    /// Convert any local projection failure into durable repair state.
+    /// Records a failed catalog projection stage as a queryable repair.
     pub(crate) async fn record_projection_failure(
         &self,
-        receipt_id: Option<&str>,
+        receipt_id: Option<ReceiptId>,
         operation: MutationOperation,
         stage: ProjectionStage,
         locator: &RemoteLocator,
@@ -543,8 +552,8 @@ impl MutationCoordinator {
     ) {
         self.record_repair(
             receipt_id,
-            "catalog_projection",
-            operation.as_str(),
+            RepairKind::CatalogProjection,
+            operation,
             locator,
             &error.to_string(),
         )
@@ -558,35 +567,33 @@ impl MutationCoordinator {
         );
     }
 
+    /// Inserts a repair row; a failing insert itself is logged loudly because
+    /// there is no deeper fallback for losing repair records.
     async fn record_repair(
         &self,
-        receipt_id: Option<&str>,
-        kind: &str,
-        operation: &str,
+        receipt_id: Option<ReceiptId>,
+        kind: RepairKind,
+        operation: MutationOperation,
         locator: &RemoteLocator,
         error: &str,
     ) {
         let item = RepairItem {
-            id: format!("repair_{}", Uuid::new_v4()),
-            receipt_id: receipt_id.map(str::to_owned),
-            kind: kind.to_owned(),
-            status: "repair_required".to_owned(),
+            id: RepairId::new_random(),
+            receipt_id,
+            kind,
+            status: RepairStatus::Required,
             attempts: 0,
             last_error: Some(error.to_owned()),
             next_attempt_at: self.clock.now(),
             locator: serde_json::to_string(locator).ok(),
-            operation: Some(operation.to_owned()),
+            operation: Some(operation.as_str().to_owned()),
         };
-        // Deliberate last-resort logging, not an error path: the remote
-        // operation already succeeded and must never be reclassified as
-        // failed (architecture-guide §1.2). If even the repair insert fails,
-        // the database itself is broken — surfacing that here would turn a
-        // durable fact into a lie.
+
         if let Err(insert_error) = self.repairs.insert(&item).await {
             tracing::error!(
                 %insert_error,
                 %error,
-                %operation,
+                operation = operation.as_str(),
                 locator = %locator,
                 "failed to persist remote mutation repair"
             );
@@ -598,7 +605,7 @@ impl MutationCoordinator {
 mod tests {
     use super::*;
     use rstore_application_ports::{OutboxStore, RemoteMutationRepository};
-    use rstore_catalog::{InMemoryCatalog, RemoteObjectRepository, TagStore};
+    use rstore_catalog::{InMemoryCatalog, RemoteObjectRepository};
     use rstore_domain::remote::ObjectPath;
     use rstore_domain::remote::RemoteObject;
     use rstore_domain::SystemClock;
@@ -636,8 +643,8 @@ mod tests {
     async fn upload_settlement_projects_the_confirmed_object() {
         let catalog = Arc::new(InMemoryCatalog::new());
         let coordinator = coordinator(catalog.clone(), Arc::new(InMemoryTagStore::new())).await;
-        let connection = rstore_domain::ConnectionId::new();
-        let bucket = rstore_domain::BucketId::new();
+        let connection = rstore_domain::ConnectionId::new_random();
+        let bucket = rstore_domain::BucketId::new_random();
         let metadata = metadata("docs/upload.txt");
 
         coordinator
@@ -662,12 +669,12 @@ mod tests {
         let catalog = Arc::new(InMemoryCatalog::new());
         let tags = Arc::new(InMemoryTagStore::new());
         let coordinator = coordinator(catalog.clone(), tags.clone()).await;
-        let connection = rstore_domain::ConnectionId::new();
-        let bucket = rstore_domain::BucketId::new();
-        let workspace = rstore_domain::WorkspaceId::new();
+        let connection = rstore_domain::ConnectionId::new_random();
+        let bucket = rstore_domain::BucketId::new_random();
+        let workspace = rstore_domain::WorkspaceId::new_random();
         let source_path = ObjectPath::new("docs/source.txt").unwrap();
         let source = RemoteObject {
-            id: rstore_domain::RemoteObjectId::new(),
+            id: rstore_domain::RemoteObjectId::new_random(),
             connection_id: connection,
             bucket_id: bucket,
             path: source_path.clone(),
@@ -681,7 +688,7 @@ mod tests {
             state: rstore_domain::ObjectState::Confirmed,
         };
         catalog.upsert(&source).await.unwrap();
-        let tag = rstore_domain::TagId::new();
+        let tag = rstore_domain::TagId::new_random();
         tags.attach(workspace, source.id, tag, OffsetDateTime::UNIX_EPOCH)
             .await
             .unwrap();
@@ -712,12 +719,12 @@ mod tests {
     async fn delete_settlement_removes_the_catalog_row() {
         let catalog = Arc::new(InMemoryCatalog::new());
         let coordinator = coordinator(catalog.clone(), Arc::new(InMemoryTagStore::new())).await;
-        let connection = rstore_domain::ConnectionId::new();
-        let bucket = rstore_domain::BucketId::new();
+        let connection = rstore_domain::ConnectionId::new_random();
+        let bucket = rstore_domain::BucketId::new_random();
         let path = ObjectPath::new("docs/delete.txt").unwrap();
         catalog
             .upsert(&RemoteObject {
-                id: rstore_domain::RemoteObjectId::new(),
+                id: rstore_domain::RemoteObjectId::new_random(),
                 connection_id: connection,
                 bucket_id: bucket,
                 path: path.clone(),
@@ -756,8 +763,8 @@ mod tests {
             Arc::new(SystemClock),
         );
         let locator = RemoteLocator::new(
-            rstore_domain::ConnectionId::new(),
-            rstore_domain::BucketId::new(),
+            rstore_domain::ConnectionId::new_random(),
+            rstore_domain::BucketId::new_random(),
             ObjectPath::new("docs/a.txt").unwrap(),
         );
 
@@ -799,18 +806,17 @@ mod tests {
             Arc::new(SystemClock),
         );
         let locator = RemoteLocator::new(
-            rstore_domain::ConnectionId::new(),
-            rstore_domain::BucketId::new(),
+            rstore_domain::ConnectionId::new_random(),
+            rstore_domain::BucketId::new_random(),
             ObjectPath::new("docs/a.txt").unwrap(),
         );
         let receipt_id = coordinator
             .record_remote_success(MutationOperation::Copy, &locator, None, None)
             .await
-            .receipt_id()
-            .to_owned();
+            .receipt_id();
         coordinator
             .record_projection_failure(
-                Some(&receipt_id),
+                Some(receipt_id),
                 MutationOperation::Copy,
                 ProjectionStage::ObjectUpsert,
                 &locator,
@@ -820,13 +826,11 @@ mod tests {
 
         let repairs = outbox.repairs(10).await.unwrap();
         assert_eq!(repairs.len(), 1);
-        assert_eq!(repairs[0].receipt_id.as_deref(), Some(receipt_id.as_str()));
-        assert_eq!(repairs[0].kind, "catalog_projection");
-        assert_eq!(repairs[0].status, "repair_required");
+        assert_eq!(repairs[0].receipt_id, Some(receipt_id));
+        assert_eq!(repairs[0].kind, RepairKind::CatalogProjection);
+        assert_eq!(repairs[0].status, RepairStatus::Required);
     }
 
-    /// A move fixture: one FakeStorage standing in for both endpoints, a
-    /// seeded source, and a follow-up whose metadata matches the target seed.
     struct MoveFixture {
         storage: Arc<FakeStorage>,
         connection: rstore_domain::ConnectionId,
@@ -872,8 +876,8 @@ mod tests {
         let (coordinator, outbox) = move_coordinator(storage.clone()).await;
         let fixture = MoveFixture {
             storage: storage.clone(),
-            connection: rstore_domain::ConnectionId::new(),
-            bucket: rstore_domain::BucketId::new(),
+            connection: rstore_domain::ConnectionId::new_random(),
+            bucket: rstore_domain::BucketId::new_random(),
             source_path: ObjectPath::new("docs/source.txt").unwrap(),
             target_path: ObjectPath::new("docs/target.txt").unwrap(),
         };
@@ -917,8 +921,8 @@ mod tests {
         let (coordinator, outbox) = move_coordinator(storage.clone()).await;
         let fixture = MoveFixture {
             storage: storage.clone(),
-            connection: rstore_domain::ConnectionId::new(),
-            bucket: rstore_domain::BucketId::new(),
+            connection: rstore_domain::ConnectionId::new_random(),
+            bucket: rstore_domain::BucketId::new_random(),
             source_path: ObjectPath::new("docs/source.txt").unwrap(),
             target_path: ObjectPath::new("docs/target.txt").unwrap(),
         };
@@ -950,30 +954,25 @@ mod tests {
             }
             other => panic!("expected DeleteFailed, got {other:?}"),
         }
-        // The undeleted source is queryable repair state, correlated with the
-        // copy settlement — it no longer lives only in the job log.
+
         let repairs = outbox.repairs(10).await.unwrap();
         assert_eq!(repairs.len(), 1);
-        assert_eq!(repairs[0].kind, "move_followup");
-        assert_eq!(repairs[0].status, "repair_required");
-        assert_eq!(
-            repairs[0].receipt_id.as_deref(),
-            Some(settlement.receipt_id())
-        );
+        assert_eq!(repairs[0].kind, RepairKind::MoveFollowup);
+        assert_eq!(repairs[0].status, RepairStatus::Required);
+        assert_eq!(repairs[0].receipt_id, Some(settlement.receipt_id()));
     }
 
     #[tokio::test]
     async fn finish_move_verify_mismatch_keeps_source_and_repairs() {
         let storage = Arc::new(FakeStorage::new());
         storage.seed("media", "docs/source.txt", b"source", None);
-        // Target seed disagrees with the follow-up metadata (7 bytes): the
-        // verify arm must stop before touching the source.
+
         storage.seed("media", "docs/target.txt", b"wrong", None);
         let (coordinator, outbox) = move_coordinator(storage.clone()).await;
         let fixture = MoveFixture {
             storage: storage.clone(),
-            connection: rstore_domain::ConnectionId::new(),
-            bucket: rstore_domain::BucketId::new(),
+            connection: rstore_domain::ConnectionId::new_random(),
+            bucket: rstore_domain::BucketId::new_random(),
             source_path: ObjectPath::new("docs/source.txt").unwrap(),
             target_path: ObjectPath::new("docs/target.txt").unwrap(),
         };
@@ -1008,6 +1007,6 @@ mod tests {
         assert!(storage.stat("media", &fixture.source_path).await.is_ok());
         let repairs = outbox.repairs(10).await.unwrap();
         assert_eq!(repairs.len(), 1);
-        assert_eq!(repairs[0].kind, "move_followup");
+        assert_eq!(repairs[0].kind, RepairKind::MoveFollowup);
     }
 }
