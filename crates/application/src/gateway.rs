@@ -13,10 +13,8 @@ use rstore_domain::connection::ConnectionConfig;
 use rstore_domain::remote::ObjectPath;
 use rstore_domain::{Error, Result};
 use rstore_storage_api::model::{
-    CopyRequest, DeleteOutcome, ListOptions, ListPage, ObjectMetadata, PresignRequest,
-    PresignedUrl, PutOptions, ReadRange,
+    DeleteOutcome, ListOptions, ListPage, ObjectMetadata, PresignRequest, PresignedUrl, ReadRange,
 };
-use rstore_storage_api::multipart::MultipartSession;
 use rstore_storage_api::{Storage, StorageFactory};
 use rstore_transfer::{CancellationToken, RetryPolicy, RetryingStorage};
 
@@ -196,8 +194,10 @@ impl Reader {
     }
 }
 
-/// Bucket-bound mutation handle; obtainable only through
-/// [`RemoteGateway::writer`], so holding one proves the guard passed.
+/// Bucket-bound mutation proof; obtainable only through
+/// [`RemoteGateway::writer`], so holding one proves the guard passed. The
+/// transfer-crate machinery that executes mutations takes a `&dyn Storage`,
+/// so the handle doubles as its explicit escape hatch.
 pub struct Writer {
     storage: Arc<dyn Storage>,
     bucket: String,
@@ -207,63 +207,6 @@ impl Writer {
     /// The bound bucket name.
     pub fn bucket(&self) -> &str {
         &self.bucket
-    }
-
-    /// Head a single object (conflict probes are reads on the target).
-    pub async fn stat(&self, key: &ObjectPath) -> Result<ObjectMetadata> {
-        self.storage.stat(&self.bucket, key).await
-    }
-
-    /// Upload bytes to a key in the bound bucket.
-    pub async fn put(
-        &self,
-        key: &ObjectPath,
-        body: Bytes,
-        opts: &PutOptions,
-    ) -> Result<ObjectMetadata> {
-        self.storage.put(&self.bucket, key, body, opts).await
-    }
-
-    /// Server-side copy into the bound bucket from a source bucket on the
-    /// same connection.
-    pub async fn copy_from(
-        &self,
-        source_bucket: &str,
-        source_key: &ObjectPath,
-        target_key: &ObjectPath,
-        source: &ObjectMetadata,
-    ) -> Result<ObjectMetadata> {
-        self.storage
-            .copy(
-                &CopyRequest {
-                    source_bucket: source_bucket.to_string(),
-                    source_key: source_key.clone(),
-                    target_bucket: self.bucket.clone(),
-                    target_key: target_key.clone(),
-                },
-                source,
-            )
-            .await
-    }
-
-    /// Begin a multipart upload in the bound bucket.
-    pub async fn create_multipart(
-        &self,
-        key: &ObjectPath,
-        opts: &PutOptions,
-    ) -> Result<Box<dyn MultipartSession>> {
-        self.storage.create_multipart(&self.bucket, key, opts).await
-    }
-
-    /// Adopt an in-flight multipart upload in the bound bucket.
-    pub async fn adopt_multipart(
-        &self,
-        key: &ObjectPath,
-        upload_id: &str,
-    ) -> Result<Box<dyn MultipartSession>> {
-        self.storage
-            .adopt_multipart(&self.bucket, key, upload_id)
-            .await
     }
 }
 

@@ -111,7 +111,7 @@ differ freely.
 | `application` | Context APIs (`RegistryApi`, `CatalogApi`, …), use-case orchestration, gateway guard handles, job bookkeeping, mutation settlement | Depend on SQLx, an SDK, or GPUI in its normal dependency graph |
 | `application-ports` | Every local persistence port plus the dependency-group vocabulary in `deps.rs` | Expose SQLx types or transaction objects |
 | `catalog` | The SQLite-free query seam: filters, sort keys, keyset cursors, repository contracts | Contain SQL or know which database stores rows |
-| `transfer` | The streaming engine: multipart, resume, retry, cancellation, conflict probes at targets | Depend on persistence; own catalog or registry concerns |
+| `transfer` | The streaming engine: multipart, resume, retry, cancellation, conflict probes at targets, remote-to-remote copy routing | Depend on persistence; own catalog or registry concerns |
 | `storage-api` | Provider-neutral `Storage`, multipart sessions, capability model | Call a concrete provider SDK |
 | `bootstrap` | The sole composition root: opens the database, selects adapters, maps lock errors | Implement business rules or render output |
 | `persistence` | SQLite schema/migrations, read pool, bounded writer actor, repositories | Depend on `transfer`; choose which adapter the app uses |

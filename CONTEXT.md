@@ -61,6 +61,13 @@ terms map to crates. Entries are grouped by concern.
   succeeded, committed in the same transaction as its outbox fact.
 - **Storage / StorageFactory** — the provider-neutral storage port and its
   factory port (`crates/storage-api`).
+- **Remote copy entry (`transfer::copy`)** — the one entry that executes a
+  remote-to-remote copy: stat the source, apply the conflict decision (the
+  probe and rename re-entry live here and nowhere else), route
+  same-connection copies to provider-side `Storage::copy` and
+  cross-connection copies to the internal relay, and report through
+  `ItemOutcome`, including dry-run previews. Gateway `Writer` handles remain
+  the write-guard proof; settlement stays with the mutation coordinator.
 
 ## Multipart sessions
 

@@ -72,6 +72,9 @@ pub struct ItemOutcome {
     /// Skipped/blocked items carry none.
     pub metadata: Option<ObjectMetadata>,
     pub skipped: bool,
+    /// The item was deliberately not executed (dry run); the detail carries
+    /// the preview. Implies `skipped`.
+    pub dry_run: bool,
     /// The conflict policy left this item undone (unresolved `ask`, or rename
     /// found no free name) — a per-item outcome, not an error.
     pub blocked: bool,
@@ -94,6 +97,16 @@ impl ItemOutcome {
     pub fn skipped(detail: String) -> Self {
         Self {
             skipped: true,
+            detail: Some(detail),
+            ..Self::default()
+        }
+    }
+
+    /// A dry-run preview: fully resolved, deliberately not executed.
+    pub fn preview(detail: String) -> Self {
+        Self {
+            skipped: true,
+            dry_run: true,
             detail: Some(detail),
             ..Self::default()
         }
@@ -146,9 +159,9 @@ impl TransferEngine {
         let size = source_metadata.len();
         let fingerprint = FileFingerprint::of(&source_metadata);
 
-        // Conflict policy against an existing remote object: the one decision
-        // table, its one interpretation and its one reaction — rename
-        // re-entry included.
+        // Conflict policy against an existing remote object: the decision
+        // table, its interpretation and its reaction (rename re-entry
+        // included) live in this crate — never at call sites.
         let key = match decide_target(
             req.key.as_str(),
             req.conflict,

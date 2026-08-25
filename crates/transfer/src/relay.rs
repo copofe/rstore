@@ -14,7 +14,7 @@ use crate::pump::{pump, ChunkPlan, ChunkSink, RangedSource};
 use crate::{CancellationToken, TransferConfig};
 
 /// The locators and source metadata for one cross-adapter relay.
-pub struct RelayRequest<'a> {
+pub(crate) struct RelayRequest<'a> {
     source_bucket: &'a str,
     source_key: &'a ObjectPath,
     target_bucket: &'a str,
@@ -23,7 +23,7 @@ pub struct RelayRequest<'a> {
 }
 
 impl<'a> RelayRequest<'a> {
-    pub fn new(
+    pub(crate) fn new(
         source_bucket: &'a str,
         source_key: &'a ObjectPath,
         target_bucket: &'a str,
@@ -41,7 +41,7 @@ impl<'a> RelayRequest<'a> {
 }
 
 /// Relay one object without buffering it whole in memory.
-pub async fn relay(
+pub(crate) async fn relay(
     source: &dyn Storage,
     target: &dyn Storage,
     request: &RelayRequest<'_>,

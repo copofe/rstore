@@ -70,7 +70,12 @@ impl TransferReport {
 pub(crate) fn disposition_from_engine(
     item: &rstore_transfer::ItemOutcome,
 ) -> (Disposition, Option<String>) {
-    if item.skipped {
+    if item.dry_run {
+        (
+            Disposition::Skipped(SkipReason::DryRun),
+            item.detail.clone(),
+        )
+    } else if item.skipped {
         (
             Disposition::Skipped(SkipReason::Conflict),
             item.detail.clone(),

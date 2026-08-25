@@ -2517,6 +2517,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "parking_lot",
  "rstore-domain",
  "rstore-storage-api",
  "rstore-test-support",
