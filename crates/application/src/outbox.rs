@@ -102,14 +102,3 @@ impl OutboxDispatcher {
         self.repairs.list(limit).await
     }
 }
-
-/// A handler for tests and dispatcher unit exercises: acknowledges events
-/// without any delivery side effect.
-pub struct NoopOutboxHandler;
-
-#[async_trait]
-impl OutboxHandler for NoopOutboxHandler {
-    async fn handle(&self, _event: &OutboxEvent) -> Result<()> {
-        Ok(())
-    }
-}

@@ -32,7 +32,7 @@ use crate::outbox::OutboxHandler;
 /// configuration problem — unknown connection, unsupported adapter — is also
 /// permanent and lands in repairs. Everything else (timeouts, throttling,
 /// network faults) is transient and stays queued for retry.
-pub struct RemoteVerifyHandler {
+pub(crate) struct RemoteVerifyHandler {
     gateway: RemoteGateway,
     buckets: Arc<dyn BucketStore>,
     repairs: Arc<dyn RepairStore>,
@@ -41,7 +41,7 @@ pub struct RemoteVerifyHandler {
 
 impl RemoteVerifyHandler {
     /// Assemble the handler over the shared gateway and repair store.
-    pub fn new(
+    pub(crate) fn new(
         gateway: RemoteGateway,
         buckets: Arc<dyn BucketStore>,
         repairs: Arc<dyn RepairStore>,

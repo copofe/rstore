@@ -21,8 +21,8 @@ pub mod link;
 pub mod multipart;
 /// Transactional event outbox with dead-lettering and repair items.
 pub mod outbox;
-/// Durable receipts for completed remote mutations.
-pub mod receipt;
+/// Shared SQL helper for durable remote-mutation receipts.
+pub(crate) mod receipt;
 /// Indexed remote objects and deletion tombstones.
 pub mod remote_object;
 /// Repair items: the queryable record of follow-up failures.

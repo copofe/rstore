@@ -15,7 +15,7 @@ use std::sync::Arc;
 use rstore_application_ports::RepairKind;
 use rstore_catalog::{RemoteObjectRepository, TagStore};
 use rstore_domain::bucket::Bucket;
-use rstore_domain::id::{BucketId, ConnectionId};
+use rstore_domain::id::{BucketId, ConnectionId, ReceiptId};
 use rstore_domain::remote::ObjectPath;
 use rstore_domain::{Clock, RemoteLocator};
 use rstore_storage_api::model::ObjectMetadata;
@@ -24,7 +24,7 @@ use time::OffsetDateTime;
 
 use crate::copy::{Item, ItemKind};
 use crate::job_run::{ItemVerdict, Step};
-use crate::mutation::{MutationCoordinator, MutationOperation, ProjectionStage, RemoteSettlement};
+use crate::mutation::{MutationCoordinator, MutationOperation, ProjectionStage};
 
 /// Settles confirmed copies (and their move follow-through).
 #[derive(Clone)]
@@ -76,8 +76,8 @@ impl Settlement {
 
         let now = self.clock.now();
         let source = CatalogObjectRef::new(&item.src.bucket, &item.src_path);
-        let target = CatalogObjectRef::new(&item.dst.bucket, &dst_path);
-        let settlement = self
+        let target = CatalogObjectRef::new(&item.dst_bucket, &dst_path);
+        let receipt_id = self
             .settle_copy(&source, &target, copied, keep_tags, now)
             .await;
 
@@ -96,7 +96,7 @@ impl Settlement {
                 };
                 match self
                     .finish_move(MoveFinishContext {
-                        copy: &settlement,
+                        copy: receipt_id,
                         source: &source,
                         target: &target,
                         metadata: copied,
@@ -129,15 +129,15 @@ impl Settlement {
         metadata: &ObjectMetadata,
         preserve_tags: bool,
         at: OffsetDateTime,
-    ) -> RemoteSettlement {
+    ) -> ReceiptId {
         let target_locator = target.locator();
-        let settlement = self
+        let receipt_id = self
             .mutations
             .settle_confirmed(MutationOperation::Copy, &target_locator, Some(metadata), at)
             .await;
 
         if !preserve_tags {
-            return settlement;
+            return receipt_id;
         }
 
         // Tag mirroring reads through the catalog rather than trusting caller
@@ -148,16 +148,16 @@ impl Settlement {
             .await
         {
             Ok(Some(source_object)) => source_object,
-            Ok(None) => return settlement,
+            Ok(None) => return receipt_id,
             Err(error) => {
                 self.fail_stage(
-                    &settlement,
+                    receipt_id,
                     ProjectionStage::SourceLookup,
                     &target_locator,
                     &error,
                 )
                 .await;
-                return settlement;
+                return receipt_id;
             }
         };
         let target_object = match self
@@ -166,35 +166,35 @@ impl Settlement {
             .await
         {
             Ok(Some(target_object)) => target_object,
-            Ok(None) => return settlement,
+            Ok(None) => return receipt_id,
             Err(error) => {
                 self.fail_stage(
-                    &settlement,
+                    receipt_id,
                     ProjectionStage::TargetLookup,
                     &target_locator,
                     &error,
                 )
                 .await;
-                return settlement;
+                return receipt_id;
             }
         };
         let associations = match self.tags.associations_for_object(source_object.id).await {
             Ok(associations) => associations,
             Err(error) => {
                 self.fail_stage(
-                    &settlement,
+                    receipt_id,
                     ProjectionStage::TagRead,
                     &target_locator,
                     &error,
                 )
                 .await;
-                return settlement;
+                return receipt_id;
             }
         };
         for (workspace, tag) in associations {
             if let Err(error) = self.tags.attach(workspace, target_object.id, tag, at).await {
                 self.fail_stage(
-                    &settlement,
+                    receipt_id,
                     ProjectionStage::TagWrite,
                     &target_locator,
                     &error,
@@ -202,21 +202,21 @@ impl Settlement {
                 .await;
             }
         }
-        settlement
+        receipt_id
     }
 
     /// Records one failed tag-mirroring stage through the coordinator's
     /// single failure entry, keyed to the copy receipt.
     async fn fail_stage(
         &self,
-        settlement: &RemoteSettlement,
+        receipt_id: ReceiptId,
         stage: ProjectionStage,
         target_locator: &RemoteLocator,
         error: &rstore_domain::Error,
     ) {
         self.mutations
             .note_failure(
-                settlement,
+                receipt_id,
                 MutationOperation::Copy,
                 stage,
                 target_locator,
@@ -290,7 +290,7 @@ impl Settlement {
     /// Records a move-stage failure as a repair anchored to the copy receipt.
     async fn move_failure(
         &self,
-        copy: &RemoteSettlement,
+        copy: ReceiptId,
         stage: ProjectionStage,
         source: &CatalogObjectRef<'_>,
         message: &str,
@@ -298,7 +298,7 @@ impl Settlement {
         let locator = source.locator();
         self.mutations
             .record_repair(
-                copy.receipt_id(),
+                copy,
                 RepairKind::MoveFollowup,
                 MutationOperation::Copy,
                 &locator,
@@ -339,7 +339,7 @@ impl<'a> CatalogObjectRef<'a> {
 
 /// Everything a move's follow-through needs once its copy settled.
 struct MoveFinishContext<'a> {
-    copy: &'a RemoteSettlement,
+    copy: ReceiptId,
     source: &'a CatalogObjectRef<'a>,
     target: &'a CatalogObjectRef<'a>,
     metadata: &'a ObjectMetadata,

@@ -37,7 +37,7 @@ pub mod tag;
 pub mod transfer;
 mod transfer_plan;
 mod transfer_report;
-pub mod verify;
+pub(crate) mod verify;
 pub mod workspace;
 
 pub use api::{
@@ -79,7 +79,6 @@ pub use transfer::{
     classify_download, download_plans, BatchDownloadReport, DownloadMode, DownloadPlan, RunOptions,
     TransferReport, TransferReportItem, UploadPlan,
 };
-pub use verify::RemoteVerifyHandler;
 pub use workspace::{
     CreateWorkspaceInput, UpdateWorkspaceInput, WorkspaceDetail, WorkspaceRef, WorkspaceService,
 };

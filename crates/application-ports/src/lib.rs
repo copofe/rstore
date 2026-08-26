@@ -397,16 +397,6 @@ pub struct RemoteMutationReceipt {
     pub payload: Option<serde_json::Value>,
 }
 
-/// Read access to durable remote-mutation receipts.
-///
-/// Receipts are written exclusively through [`UnitOfWork::commit`] (receipt
-/// and outbox fact in one local unit), so there is deliberately no standalone
-/// write method here. Reads serve repair tooling and diagnostics.
-#[async_trait]
-pub trait RemoteMutationRepository: Send + Sync {
-    async fn get(&self, receipt_id: ReceiptId) -> Result<Option<RemoteMutationReceipt>>;
-}
-
 /// Reliable outbox-delivery port. The first implementation is SQLite-backed;
 /// the interface is intentionally independent of a worker or UI runtime.
 ///
@@ -449,26 +439,11 @@ pub struct OutboxEvent {
 
 /// Unit-of-work boundary between the application core and durable storage.
 ///
-/// Implementations must commit the supplied operation atomically: for
-/// [`UnitOfWorkOperation::RemoteMutation`] the receipt row and its outbox
-/// event either both land or neither does, so a receipt can never exist
-/// without the domain fact that lets projection and repair workers find it.
-/// The core never receives a SQL transaction object.
+/// Implementations must commit the remote-mutation receipt and its outbox
+/// event atomically, so a receipt can never exist without the domain fact that
+/// lets projection and repair workers find it. The core never receives a SQL
+/// transaction object.
 #[async_trait]
 pub trait UnitOfWork: Send + Sync {
-    async fn commit(&self, operation: UnitOfWorkOperation) -> Result<()>;
-}
-
-/// Minimal serialisable write set. More context-specific operations can be
-/// added when a consumer exists — variants without a producer are dead
-/// vocabulary, so the set starts at exactly one operation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum UnitOfWorkOperation {
-    /// A completed remote mutation and its durable domain fact. Persistence
-    /// must write both rows in one local transaction so a receipt can never
-    /// exist without the event that lets a projection/repair worker find it.
-    RemoteMutation {
-        receipt: RemoteMutationReceipt,
-        event: OutboxEvent,
-    },
+    async fn commit(&self, receipt: RemoteMutationReceipt, event: OutboxEvent) -> Result<()>;
 }

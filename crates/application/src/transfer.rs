@@ -12,7 +12,9 @@ use rstore_domain::{Clock, Error, Result};
 use rstore_transfer::{
     CancellationToken, MultipartStore, ProgressSink, TransferConfig, TransferEngine,
 };
+use serde::ser::{Serialize, SerializeStruct, Serializer};
 
+use crate::batch_outcome::{count_dispositions, OutcomeCounts};
 use crate::connection::ConnectionRef;
 use crate::reference::RemoteUri;
 use crate::transfer_plan::EngineItem;
@@ -76,25 +78,67 @@ pub fn download_plans(
         .collect()
 }
 
-/// Aggregate counters over several sequential downloads.
-#[derive(Debug, Clone, serde::Serialize)]
+/// Aggregate view over several sequential downloads.
+#[derive(Debug, Clone)]
 pub struct BatchDownloadReport {
     pub reports: Vec<TransferReport>,
-    pub succeeded: usize,
-    pub skipped: usize,
-    pub failed: usize,
-    pub blocked: usize,
-    pub interrupted: bool,
 }
 
 impl BatchDownloadReport {
-    /// The worst child severity — the batch verdict entry layers act on.
+    fn counts(&self) -> OutcomeCounts {
+        count_dispositions(
+            self.reports
+                .iter()
+                .flat_map(|report| report.items.iter().map(|item| &item.disposition)),
+        )
+    }
+
+    /// Items that completed as requested across all child runs.
+    pub fn succeeded(&self) -> usize {
+        self.counts().succeeded
+    }
+
+    /// Items skipped by policy or blocked before execution.
+    pub fn skipped(&self) -> usize {
+        self.counts().skipped
+    }
+
+    /// Items that failed across all child runs.
+    pub fn failed(&self) -> usize {
+        self.counts().failed
+    }
+
+    /// Items blocked before execution across all child runs.
+    pub fn blocked(&self) -> usize {
+        self.counts().blocked
+    }
+
+    /// Whether any child run ended by cancellation or interruption.
+    pub fn is_interrupted(&self) -> bool {
+        self.reports.iter().any(TransferReport::is_interrupted)
+    }
+
+    /// The aggregate verdict over every child item.
     pub fn severity(&self) -> crate::batch_outcome::Severity {
-        self.reports
-            .iter()
-            .map(TransferReport::severity)
-            .max()
-            .unwrap_or(crate::batch_outcome::Severity::AllOk)
+        crate::batch_outcome::severity_of(
+            self.reports
+                .iter()
+                .flat_map(|report| report.items.iter().map(|item| &item.disposition)),
+        )
+    }
+}
+
+impl Serialize for BatchDownloadReport {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let counts = self.counts();
+        let mut out = serializer.serialize_struct("BatchDownloadReport", 6)?;
+        out.serialize_field("reports", &self.reports)?;
+        out.serialize_field("succeeded", &counts.succeeded)?;
+        out.serialize_field("skipped", &counts.skipped)?;
+        out.serialize_field("failed", &counts.failed)?;
+        out.serialize_field("blocked", &counts.blocked)?;
+        out.serialize_field("interrupted", &self.is_interrupted())?;
+        out.end()
     }
 }
 
@@ -283,21 +327,12 @@ impl DefaultTransferService {
         }
         let mut batch = BatchDownloadReport {
             reports: Vec::with_capacity(plans.len()),
-            succeeded: 0,
-            skipped: 0,
-            failed: 0,
-            blocked: 0,
-            interrupted: false,
         };
         for plan in plans {
             let report = self.run_download(plan, options, progress, cancel).await?;
-            batch.succeeded += report.succeeded;
-            batch.skipped += report.skipped;
-            batch.failed += report.failed;
-            batch.blocked += report.blocked;
-            batch.interrupted |= report.is_interrupted();
+            let interrupted = report.is_interrupted();
             batch.reports.push(report);
-            if batch.interrupted {
+            if interrupted {
                 break;
             }
         }
@@ -316,6 +351,7 @@ impl DefaultTransferService {
         engine: &TransferEngine,
         config: TransferConfig,
     ) -> Result<TransferReport> {
+        let context = rstore_transfer::RunContext::new(cancel, config, progress);
         crate::job_run::run_items(
             self.jobs.as_ref(),
             self.clock.as_ref(),
@@ -324,16 +360,20 @@ impl DefaultTransferService {
             dry_run,
             progress,
             cancel,
-            |item| async move {
-                if dry_run {
-                    return crate::job_run::ItemVerdict::preview(item.preview());
+            |item| {
+                let context = &context;
+                async move {
+                    if dry_run {
+                        return crate::job_run::ItemVerdict::preview(item.preview());
+                    }
+                    let result = match &item {
+                        EngineItem::Upload(req) => engine.upload(req, context).await,
+                        EngineItem::Download { request, .. } => {
+                            engine.download(request, context).await
+                        }
+                    };
+                    crate::job_run::ItemVerdict::from_engine_result(result)
                 }
-                let ctx = rstore_transfer::RunContext::new(cancel, config, progress);
-                let result = match &item {
-                    EngineItem::Upload(req) => engine.upload(req, &ctx).await,
-                    EngineItem::Download { request, .. } => engine.download(request, &ctx).await,
-                };
-                crate::job_run::ItemVerdict::from_engine_result(result)
             },
             &UploadSettle {
                 mutations: self.mutations.clone(),

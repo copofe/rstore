@@ -10,7 +10,7 @@ use rstore_application_ports::JobRepository;
 use rstore_domain::job::JobKind;
 use rstore_domain::policy::ConflictPolicy;
 use rstore_domain::remote::ObjectPath;
-use rstore_domain::{Clock, Error, Result};
+use rstore_domain::{Bucket, Clock, Error, Result};
 use rstore_transfer::{CancellationToken, ProgressSink};
 
 use crate::gateway::RemoteGateway;
@@ -38,7 +38,7 @@ pub(crate) struct Item {
     pub(crate) kind: ItemKind,
     pub(crate) src: Arc<crate::batch_plan::Endpoint>,
     pub(crate) src_path: ObjectPath,
-    pub(crate) dst: Arc<crate::batch_plan::Endpoint>,
+    pub(crate) dst_bucket: Bucket,
     pub(crate) dst_path: ObjectPath,
     /// The guard-issued mutation adapter for the target bucket: the copy
     /// executes through it, so the guard travels with the item.
@@ -214,7 +214,7 @@ impl DefaultCopyService {
                     source_label: entry.label.clone(),
                     target_label: dst.label(dst_path.as_str()),
                     src: entry.endpoint.clone(),
-                    dst: dst.clone(),
+                    dst_bucket: dst.bucket.clone(),
                     src_path: entry.path,
                     dst_path,
                     dst_storage,
@@ -278,6 +278,7 @@ impl DefaultCopyService {
                 crate::job_run::RunItem::new(format!("{source} -> {target}"), source, target, item)
             })
             .collect();
+        let context = rstore_transfer::RunContext::new(cancel, options.config, progress);
         crate::job_run::run_items(
             self.jobs.as_ref(),
             self.clock.as_ref(),
@@ -287,12 +288,9 @@ impl DefaultCopyService {
             progress,
             cancel,
             |item| {
-                let item_cancel = cancel.clone();
-                let item_progress: &dyn ProgressSink = progress;
+                let context = &context;
                 async move {
-                    let result = self
-                        .execute_item(&item, options, &item_cancel, item_progress)
-                        .await;
+                    let result = self.execute_item(&item, options, context).await;
                     crate::job_run::ItemVerdict::from_engine_result(result)
                 }
             },
@@ -311,12 +309,11 @@ impl DefaultCopyService {
         &self,
         item: &Item,
         options: &CopyOptions,
-        cancel: &rstore_transfer::CancellationToken,
-        progress: &dyn rstore_transfer::ProgressSink,
+        context: &rstore_transfer::RunContext<'_>,
     ) -> Result<rstore_transfer::ItemOutcome> {
         let Item {
             src,
-            dst,
+            dst_bucket,
             src_path,
             dst_path,
             dst_storage,
@@ -332,14 +329,13 @@ impl DefaultCopyService {
         );
         let target = rstore_transfer::CopyEndpoint::new(
             dst_storage.clone(),
-            dst.bucket.connection_id,
-            &dst.bucket.name,
+            dst_bucket.connection_id,
+            &dst_bucket.name,
         );
         let request = rstore_transfer::CopyRequest::new(src_path, dst_path, options.conflict);
 
-        let ctx = rstore_transfer::RunContext::new(cancel, options.config, progress);
         let mut outcome =
-            rstore_transfer::copy(source, target, &request, options.dry_run, &ctx).await?;
+            rstore_transfer::copy(source, target, &request, options.dry_run, context).await?;
 
         // A move's preview names the delete that would follow it.
         if outcome.disposition.is_not_run() && item.kind == ItemKind::Move {

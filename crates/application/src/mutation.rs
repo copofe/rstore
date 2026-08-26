@@ -20,7 +20,7 @@ use std::sync::Arc;
 // wide workspace store: the dependency bundle hands out the catalog-typed
 // handle here (`CatalogTagPort`) on purpose.
 use rstore_application_ports::{
-    OutboxEvent, RemoteMutationReceipt, RepairItem, RepairKind, RepairStatus, UnitOfWorkOperation,
+    OutboxEvent, RemoteMutationReceipt, RepairItem, RepairKind, RepairStatus,
 };
 use rstore_catalog::RemoteObjectRepository;
 use rstore_domain::events::DomainEvent;
@@ -78,26 +78,6 @@ impl ProjectionStage {
             Self::Tombstone => "tombstone",
             Self::TargetVerify => "target_verify",
             Self::SourceDelete => "source_delete",
-        }
-    }
-}
-
-/// Durability result of committing a remote mutation receipt.
-#[derive(Debug, Clone)]
-pub(crate) enum RemoteSettlement {
-    /// The receipt/outbox unit committed locally; the mutation is durable.
-    Durable { receipt_id: ReceiptId },
-
-    /// The commit failed but a repair was queued; the mutation must be
-    /// re-applied by the repair loop.
-    RepairQueued { receipt_id: ReceiptId },
-}
-
-impl RemoteSettlement {
-    /// Receipt id carried by either settlement flavor.
-    pub(crate) fn receipt_id(&self) -> ReceiptId {
-        match self {
-            Self::Durable { receipt_id } | Self::RepairQueued { receipt_id } => *receipt_id,
         }
     }
 }
@@ -182,8 +162,8 @@ impl MutationCoordinator {
         locator: &RemoteLocator,
         metadata: Option<&ObjectMetadata>,
         at: OffsetDateTime,
-    ) -> RemoteSettlement {
-        let settlement = self
+    ) -> ReceiptId {
+        let receipt_id = self
             .record_remote_success(operation, locator, metadata, None)
             .await;
         let stage = match operation {
@@ -205,7 +185,7 @@ impl MutationCoordinator {
                         locator = %locator,
                         "upsert settlement missing object metadata"
                     );
-                    return settlement;
+                    return receipt_id;
                 };
                 crate::catalog_follow::upsert_confirmed(
                     self.catalog.as_ref(),
@@ -218,10 +198,10 @@ impl MutationCoordinator {
             }
         };
         if let Err(error) = projection {
-            self.note_failure(&settlement, operation, stage, locator, &error)
+            self.note_failure(receipt_id, operation, stage, locator, &error)
                 .await;
         }
-        settlement
+        receipt_id
     }
 
     /// Records a settlement follow-up failure as a repair keyed to the
@@ -230,13 +210,13 @@ impl MutationCoordinator {
     /// (tag mirroring, move verification) alike.
     pub(crate) async fn note_failure(
         &self,
-        settlement: &RemoteSettlement,
+        receipt_id: ReceiptId,
         operation: MutationOperation,
         stage: ProjectionStage,
         locator: &RemoteLocator,
         error: &Error,
     ) {
-        self.record_projection_failure(settlement.receipt_id(), operation, stage, locator, error)
+        self.record_projection_failure(receipt_id, operation, stage, locator, error)
             .await;
         tracing::warn!(
             %error,
@@ -255,7 +235,7 @@ impl MutationCoordinator {
         locator: &RemoteLocator,
         metadata: Option<&ObjectMetadata>,
         job_id: Option<JobId>,
-    ) -> RemoteSettlement {
+    ) -> ReceiptId {
         let now = self.clock.now();
         let receipt_id = ReceiptId::new_random();
         let event_id = Uuid::new_v4();
@@ -288,16 +268,10 @@ impl MutationCoordinator {
             attempts: 0,
         };
 
-        let result = self
-            .unit_of_work
-            .commit(UnitOfWorkOperation::RemoteMutation {
-                receipt,
-                event: outbox_event,
-            })
-            .await;
+        let result = self.unit_of_work.commit(receipt, outbox_event).await;
 
         match result {
-            Ok(()) => RemoteSettlement::Durable { receipt_id },
+            Ok(()) => receipt_id,
             Err(error) => {
                 self.record_repair(
                     receipt_id,
@@ -307,7 +281,7 @@ impl MutationCoordinator {
                     &format!("remote mutation receipt/outbox failed: {error}"),
                 )
                 .await;
-                RemoteSettlement::RepairQueued { receipt_id }
+                receipt_id
             }
         }
     }

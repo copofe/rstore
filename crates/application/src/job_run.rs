@@ -234,10 +234,6 @@ where
         job_id: job.id,
         kind: kind.as_str(),
         items: Vec::new(),
-        succeeded: 0,
-        skipped: 0,
-        failed: 0,
-        blocked: 0,
         state: JobState::Running,
         dry_run,
     };
@@ -273,19 +269,15 @@ where
 
         match &disposition {
             Disposition::Succeeded => {
-                report.succeeded += 1;
                 job.items[index].state = ItemState::Succeeded;
             }
             Disposition::Skipped(_) => {
-                report.skipped += 1;
                 job.items[index].state = ItemState::Skipped;
             }
             Disposition::Failed(_) => {
-                report.failed += 1;
                 job.items[index].state = ItemState::Failed;
             }
             Disposition::Blocked(_) => {
-                report.blocked += 1;
                 // Blocked items surface as failed on the durable record while
                 // keeping their distinct counter in the report.
                 job.items[index].state = ItemState::Failed;
@@ -305,17 +297,17 @@ where
             disposition,
             detail,
         });
-        let settled = (report.succeeded + report.skipped + report.failed + report.blocked) as u64;
         progress.report(Progress::Items {
-            done: settled,
+            done: report.items.len() as u64,
             total,
         });
     }
 
     // Single terminal commit: partial success only when at least one item
-    // landed alongside failures/blocks.
-    let final_state = if report.failed > 0 || report.blocked > 0 {
-        if report.succeeded > 0 {
+    // landed alongside failures/blocks. Counts are derived from the item
+    // dispositions rather than maintained as a second mutable state.
+    let final_state = if report.failed() > 0 || report.blocked() > 0 {
+        if report.succeeded() > 0 {
             JobState::PartialSuccess
         } else {
             JobState::Failed

@@ -272,64 +272,60 @@ impl OutboxStore for OutboxRepository {
                     })?;
                     let event = row_to_event(row)?;
                     let attempts = i64::from(event.attempts);
-                    if matches!(delivery_decision(event.attempts, now), DeliveryDecision::DeadLetter) {
-                        Self::append_event(tx, &event).await?;
-                        sqlx::query(
-                            "UPDATE outbox_events SET status = 'repair_required', last_error = ? \
-                             WHERE event_id = ?",
-                        )
-                        .bind(&error)
-                        .bind(event.event_id.to_string())
-                        .execute(&mut **tx)
-                        .await
-                        .map_err(map_sqlx)?;
-                        // The dead-letter repair derives its identity from
-                        // the event, so a repeat dead-letter refreshes the
-                        // same row instead of opening another.
-                        let item = RepairItem {
-                            id: RepairId::from_event(event.event_id),
-                            event_id: Some(event.event_id),
-                            receipt_id: None,
-                            kind: RepairKind::OutboxDelivery,
-                            status: RepairStatus::Required,
-                            attempts: event.attempts,
-                            last_error: Some(error.clone()),
-                            next_attempt_at: now,
-                            locator: None,
-                            operation: Some(event.event_type.clone()),
-                        };
-                        upsert_repair(&mut **tx, &item, now).await?;
-                        return Ok(());
+                    match delivery_decision(event.attempts, now) {
+                        DeliveryDecision::DeadLetter => {
+                            Self::append_event(tx, &event).await?;
+                            sqlx::query(
+                                "UPDATE outbox_events SET status = 'repair_required', last_error = ? \
+                                 WHERE event_id = ?",
+                            )
+                            .bind(&error)
+                            .bind(event.event_id.to_string())
+                            .execute(&mut **tx)
+                            .await
+                            .map_err(map_sqlx)?;
+                            // The dead-letter repair derives its identity from
+                            // the event, so a repeat dead-letter refreshes the
+                            // same row instead of opening another.
+                            let item = RepairItem {
+                                id: RepairId::from_event(event.event_id),
+                                event_id: Some(event.event_id),
+                                receipt_id: None,
+                                kind: RepairKind::OutboxDelivery,
+                                status: RepairStatus::Required,
+                                attempts: event.attempts,
+                                last_error: Some(error.clone()),
+                                next_attempt_at: now,
+                                locator: None,
+                                operation: Some(event.event_type.clone()),
+                            };
+                            upsert_repair(&mut **tx, &item, now).await?;
+                            Ok(())
+                        }
+                        DeliveryDecision::Retry { next_attempt_at } => {
+                            sqlx::query(
+                                "UPDATE outbox_events SET status = 'pending', available_at = ?, last_error = ? \
+                                 WHERE event_id = ?",
+                            )
+                            .bind(unix_secs(next_attempt_at))
+                            .bind(&error)
+                            .bind(event_id.to_string())
+                            .execute(&mut **tx)
+                            .await
+                            .map_err(map_sqlx)?;
+                            sqlx::query(
+                                "UPDATE outbox_attempts SET outcome = 'retrying', error = ? \
+                                 WHERE event_id = ? AND attempt_no = ?",
+                            )
+                            .bind(&error)
+                            .bind(event_id.to_string())
+                            .bind(attempts)
+                            .execute(&mut **tx)
+                            .await
+                            .map_err(map_sqlx)?;
+                            Ok(())
+                        }
                     }
-
-                    // The schedule lives in `delivery_decision`.
-                    let DeliveryDecision::Retry { next_attempt_at } =
-                        delivery_decision(event.attempts, now)
-                    else {
-                        unreachable!("dead-letter handled above")
-                    };
-
-                    sqlx::query(
-                        "UPDATE outbox_events SET status = 'pending', available_at = ?, last_error = ? \
-                         WHERE event_id = ?",
-                    )
-                    .bind(unix_secs(next_attempt_at))
-                    .bind(&error)
-                    .bind(event_id.to_string())
-                    .execute(&mut **tx)
-                    .await
-                    .map_err(map_sqlx)?;
-                    sqlx::query(
-                        "UPDATE outbox_attempts SET outcome = 'retrying', error = ? \
-                         WHERE event_id = ? AND attempt_no = ?",
-                    )
-                    .bind(&error)
-                    .bind(event_id.to_string())
-                    .bind(attempts)
-                    .execute(&mut **tx)
-                    .await
-                    .map_err(map_sqlx)?;
-                    Ok(())
                 })
             })
             .await

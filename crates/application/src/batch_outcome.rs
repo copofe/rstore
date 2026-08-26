@@ -16,6 +16,38 @@ pub use rstore_domain::outcome::{
 
 use serde::ser::{Serialize, SerializeStruct, Serializer};
 
+/// Counts derived from the unified disposition vocabulary.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct OutcomeCounts {
+    pub(crate) succeeded: usize,
+    pub(crate) skipped: usize,
+    pub(crate) failed: usize,
+    pub(crate) blocked: usize,
+}
+
+impl OutcomeCounts {
+    pub(crate) fn not_run(self) -> usize {
+        self.skipped + self.blocked
+    }
+}
+
+/// Derive batch counts from item dispositions without maintaining a second
+/// mutable aggregate state.
+pub(crate) fn count_dispositions<'a>(
+    dispositions: impl IntoIterator<Item = &'a Disposition>,
+) -> OutcomeCounts {
+    let mut counts = OutcomeCounts::default();
+    for disposition in dispositions {
+        match disposition {
+            Disposition::Succeeded => counts.succeeded += 1,
+            Disposition::Skipped(_) => counts.skipped += 1,
+            Disposition::Failed(_) => counts.failed += 1,
+            Disposition::Blocked(_) => counts.blocked += 1,
+        }
+    }
+    counts
+}
+
 /// One item's result: its display target, the [`Disposition`], optional free
 /// detail text (guard message, conflict detail, dry-run preview), and the
 /// operation payload on success.
@@ -119,21 +151,21 @@ impl<T> BatchOutcome<T> {
 
     /// Items that completed as requested.
     pub fn succeeded(&self) -> usize {
-        self.count(|d| d.is_success())
+        self.counts().succeeded
     }
 
     /// Items that failed.
     pub fn failed(&self) -> usize {
-        self.count(|d| matches!(d, Disposition::Failed(_)))
+        self.counts().failed
     }
 
     /// Items skipped or blocked.
     pub fn not_run(&self) -> usize {
-        self.count(|d| d.is_not_run())
+        self.counts().not_run()
     }
 
-    fn count(&self, f: impl Fn(&Disposition) -> bool) -> usize {
-        self.items.iter().filter(|i| f(&i.disposition)).count()
+    fn counts(&self) -> OutcomeCounts {
+        count_dispositions(self.items.iter().map(|item| &item.disposition))
     }
 
     /// The aggregate verdict — the single rule, shared with every other

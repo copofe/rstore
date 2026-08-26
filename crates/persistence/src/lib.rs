@@ -19,7 +19,6 @@ pub use repo::job::SqliteJobRepository;
 pub use repo::link::LinkRepository;
 pub use repo::multipart::SqliteMultipartStore;
 pub use repo::outbox::OutboxRepository;
-pub use repo::receipt::SqliteRemoteMutationRepository;
 pub use repo::remote_object::SqliteRemoteObjectRepository;
 pub use repo::repair::RepairRepository;
 pub use repo::settings::SettingsRepository;
@@ -285,11 +284,6 @@ impl Database {
     /// The repair queue for failed follow-ups.
     pub fn repairs(&self) -> RepairRepository {
         RepairRepository::new(self.gate(), self.read_pool.clone(), self.clock.clone())
-    }
-
-    /// Read access to completed remote-mutation receipts.
-    pub fn mutation_receipts(&self) -> SqliteRemoteMutationRepository {
-        SqliteRemoteMutationRepository::new(self.read_pool.clone())
     }
 
     /// A repository for workspaces and their bucket memberships.
