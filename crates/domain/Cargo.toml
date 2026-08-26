@@ -12,8 +12,5 @@ serde_json.workspace = true
 uuid.workspace = true
 time.workspace = true
 
-[dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros"] }
-
 [lints]
 workspace = true

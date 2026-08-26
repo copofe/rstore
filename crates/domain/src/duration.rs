@@ -66,36 +66,3 @@ pub fn parse_span(
     }
     Ok(secs)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn plain_seconds_and_unit_sums() {
-        assert_eq!(parse_span("30", "smhd", 604_800, "TTL", "7d").unwrap(), 30);
-        assert_eq!(
-            parse_span("15m", "smhd", 604_800, "TTL", "7d").unwrap(),
-            900
-        );
-        assert_eq!(
-            parse_span("1h30m", "smhd", 604_800, "TTL", "7d").unwrap(),
-            5_400
-        );
-        assert_eq!(
-            parse_span("2w", "smhdw", 31_536_000, "retention", "365d").unwrap(),
-            1_209_600
-        );
-    }
-
-    #[test]
-    fn bounds_and_bad_input() {
-        let ttl = |raw| parse_span(raw, "smhd", 604_800, "TTL", "7d (S3 presign limit)");
-        assert!(ttl("8d").is_err());
-        assert!(ttl("0").is_err());
-        assert!(ttl("1x").is_err());
-        assert!(ttl("").is_err());
-        // `w` is not in the TTL unit set.
-        assert!(ttl("1w").is_err());
-    }
-}

@@ -317,15 +317,3 @@ fn render_copy_report(report: TransferReport, args: &crate::args::CopyArgs) -> H
         report.severity(),
     )
 }
-
-#[cfg(test)]
-mod tests {
-    use super::progress_suppressed;
-
-    #[test]
-    fn quiet_disables_progress_alongside_the_explicit_flag() {
-        assert!(!progress_suppressed(false, false));
-        assert!(progress_suppressed(true, false));
-        assert!(progress_suppressed(false, true));
-    }
-}

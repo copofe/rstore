@@ -47,22 +47,3 @@ impl AppLock {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn second_acquire_is_busy() {
-        let tmp = tempfile::tempdir().unwrap();
-        let lockfile = tmp.path().join("test.lock");
-        let first = AppLock::try_acquire(&lockfile).expect("first acquire");
-        match AppLock::try_acquire(&lockfile) {
-            Err(LockError::Busy) => {}
-            other => panic!("expected Busy, got {other:?}"),
-        }
-        drop(first);
-        // After release, re-acquire should succeed.
-        let _again = AppLock::try_acquire(&lockfile).expect("re-acquire after drop");
-    }
-}

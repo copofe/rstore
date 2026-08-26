@@ -12,8 +12,5 @@ fs4.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 
-[dev-dependencies]
-tempfile.workspace = true
-
 [lints]
 workspace = true

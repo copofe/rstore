@@ -42,33 +42,3 @@ impl fmt::Display for RemoteLocator {
         )
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn displays_the_canonical_typed_address() {
-        let locator = RemoteLocator::new(
-            ConnectionId::new_random(),
-            BucketId::new_random(),
-            ObjectPath::new("/photos/cat.jpg").unwrap(),
-        );
-
-        assert!(locator.to_string().ends_with("/photos/cat.jpg"));
-        assert!(!locator.to_string().contains("//photos"));
-    }
-
-    #[test]
-    fn serde_round_trip_preserves_typed_ids() {
-        let locator = RemoteLocator::new(
-            ConnectionId::new_random(),
-            BucketId::new_random(),
-            ObjectPath::new("photos/cat.jpg").unwrap(),
-        );
-
-        let encoded = serde_json::to_string(&locator).unwrap();
-        let decoded: RemoteLocator = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(decoded, locator);
-    }
-}

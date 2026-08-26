@@ -18,14 +18,5 @@ aws-smithy-types.workspace = true
 tracing.workspace = true
 time.workspace = true
 
-[dev-dependencies]
-aws-smithy-runtime-api = "1.9.2"
-rstore-test-support.workspace = true
-tokio.workspace = true
-# Engine-over-provider end-to-end test (README's interrupt-resume claim).
-rstore-transfer.workspace = true
-rstore-persistence.workspace = true
-tempfile.workspace = true
-
 [lints]
 workspace = true

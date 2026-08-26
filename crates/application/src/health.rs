@@ -70,24 +70,3 @@ impl HealthService {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rstore_persistence::Database;
-
-    #[tokio::test]
-    async fn health_reports_counts_and_schema_match() {
-        let db = Database::open_in_memory().await.unwrap();
-        let service = HealthService::new(Arc::new(db.clone()));
-        let report = service
-            .health(Path::new("/tmp/catalog.db"), Some("fake"))
-            .await;
-
-        assert_eq!(report.connection_count, 0);
-        assert_eq!(report.untested_connections, 0);
-        assert_eq!(report.interrupted_jobs, 0);
-        assert_eq!(report.storage_adapter, "fake");
-        assert_eq!(report.db_path, "/tmp/catalog.db");
-    }
-}

@@ -83,6 +83,3 @@ pub use verify::RemoteVerifyHandler;
 pub use workspace::{
     CreateWorkspaceInput, UpdateWorkspaceInput, WorkspaceDetail, WorkspaceRef, WorkspaceService,
 };
-
-#[cfg(feature = "test-util")]
-pub mod test_util;

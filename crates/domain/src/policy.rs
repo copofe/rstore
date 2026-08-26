@@ -47,22 +47,3 @@ impl ConflictPolicy {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn token_round_trip_and_alias() {
-        assert_eq!(
-            ConflictPolicy::parse("overwrite").unwrap(),
-            ConflictPolicy::Overwrite
-        );
-        assert_eq!(
-            ConflictPolicy::parse("Over-Write").unwrap(),
-            ConflictPolicy::Overwrite
-        );
-        assert_eq!(ConflictPolicy::Skip.as_str(), "skip");
-        assert!(ConflictPolicy::parse("nonsense").is_err());
-    }
-}

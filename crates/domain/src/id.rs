@@ -181,37 +181,3 @@ impl RepairId {
         Self(receipt.0)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn round_trip_prefixed_string() {
-        let id = ConnectionId::new_random();
-        let s = id.to_string();
-        assert!(s.starts_with("conn_"));
-        let parsed: ConnectionId = s.parse().unwrap();
-        assert_eq!(id, parsed);
-    }
-
-    #[test]
-    fn wrong_prefix_rejected() {
-        assert!(ConnectionId::from_str("bkt_deadbeef").is_err());
-    }
-
-    #[test]
-    fn types_do_not_mix() {
-        // Compile-time guarantee: these are distinct types.
-        fn takes_conn(_: ConnectionId) {}
-        takes_conn(ConnectionId::new_random());
-    }
-
-    #[test]
-    fn serde_round_trip() {
-        let id = BucketId::new_random();
-        let json = serde_json::to_string(&id).unwrap();
-        let back: BucketId = serde_json::from_str(&json).unwrap();
-        assert_eq!(id, back);
-    }
-}

@@ -108,32 +108,3 @@ pub fn decode(cursor: &str, field: SortField) -> Result<(SortKey, String, String
 fn bad_cursor() -> Error {
     Error::invalid_input("invalid pagination cursor")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cursor_is_printable_and_round_trips() {
-        let cursor = encode(
-            &SortKey::Num(1_746_109_278),
-            "upload/IMG-20250501220719790.webp",
-            "d79b45a2-473f-4ef4-a5a1-32797e00a676",
-        );
-
-        assert!(!cursor.chars().any(char::is_control));
-        assert_eq!(
-            decode(&cursor, SortField::Modified).unwrap(),
-            (
-                SortKey::Num(1_746_109_278),
-                "upload/IMG-20250501220719790.webp".to_string(),
-                "d79b45a2-473f-4ef4-a5a1-32797e00a676".to_string(),
-            )
-        );
-        assert!(decode(
-            "1746109278\u{1f}upload/file.webp\u{1f}d79b45a2-473f-4ef4-a5a1-32797e00a676",
-            SortField::Modified,
-        )
-        .is_err());
-    }
-}

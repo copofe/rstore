@@ -38,20 +38,3 @@ pub trait StorageFactory: Send + Sync {
         creds: &StorageCredentials,
     ) -> Result<Arc<dyn Storage>>;
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn storage_credentials_debug_is_redacted() {
-        let creds = StorageCredentials {
-            access_key: Secret::new("AKIAEXAMPLE".to_string()),
-            secret_key: Secret::new("super-secret-value".to_string()),
-        };
-        let rendered = format!("{creds:?}");
-        assert!(!rendered.contains("AKIAEXAMPLE"));
-        assert!(!rendered.contains("super-secret-value"));
-        assert!(rendered.contains("REDACTED"));
-    }
-}

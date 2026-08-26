@@ -8,10 +8,6 @@ license.workspace = true
 
 [dependencies]
 rstore-domain.workspace = true
-# Optional so the `test-util` fixture can share FakeStorage wiring without
-# pulling test scaffolding into production builds.
-rstore-test-support = { workspace = true, optional = true }
-rstore-persistence = { workspace = true, optional = true }
 rstore-application-ports.workspace = true
 rstore-storage-api.workspace = true
 rstore-catalog.workspace = true
@@ -25,18 +21,6 @@ uuid.workspace = true
 tracing.workspace = true
 # `spawn_blocking` keeps local-tree walks off the async executor.
 tokio.workspace = true
-
-[features]
-default = []
-test-util = ["dep:rstore-test-support", "dep:rstore-persistence"]
-
-[dev-dependencies]
-tokio.workspace = true
-rstore-test-support.workspace = true
-rstore-persistence.workspace = true
-# Self dev-dependency: turns the feature on for this crate's own test builds,
-# so unit and integration tests share one fixture.
-rstore-application = { path = ".", features = ["test-util"] }
 
 [lints]
 workspace = true

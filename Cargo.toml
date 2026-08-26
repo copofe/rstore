@@ -6,7 +6,6 @@ members = [
     "crates/domain",
     "crates/application-ports",
     "crates/application",
-    "crates/application-test-support",
     "crates/bootstrap",
     "crates/storage-api",
     "crates/storage-s3",
@@ -14,7 +13,6 @@ members = [
     "crates/persistence",
     "crates/transfer",
     "crates/platform",
-    "crates/test-support",
     "crates/cli",
     "ui/ui-kit",
     "ui/desktop-ui",
@@ -75,16 +73,10 @@ directories = "5"
 fs4 = "0.13"
 rpassword = "7"
 
-# Test tooling
-insta = { version = "1", features = ["json", "redactions"] }
-parking_lot = "0.12"
-tempfile = "3"
-
 # Internal crates (paths)
 rstore-domain = { path = "crates/domain" }
 rstore-application-ports = { path = "crates/application-ports" }
 rstore-bootstrap = { path = "crates/bootstrap" }
-rstore-application-test-support = { path = "crates/application-test-support" }
 rstore-application = { path = "crates/application" }
 rstore-storage-api = { path = "crates/storage-api" }
 rstore-storage-s3 = { path = "crates/storage-s3" }
@@ -92,7 +84,6 @@ rstore-catalog = { path = "crates/catalog" }
 rstore-persistence = { path = "crates/persistence" }
 rstore-transfer = { path = "crates/transfer" }
 rstore-platform = { path = "crates/platform" }
-rstore-test-support = { path = "crates/test-support" }
 rstore-cli = { path = "crates/cli" }
 
 [workspace.lints.rust]

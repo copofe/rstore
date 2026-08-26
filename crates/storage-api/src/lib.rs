@@ -1,8 +1,7 @@
 //! Storage abstraction and provider capability model.
 //!
 //! The [`Storage`] facade is the seam between the application core and an
-//! object store. Production wiring uses the S3 adapter; `FakeStorage` is the
-//! deterministic contract-test implementation.
+//! object store. Production wiring uses the S3 adapter.
 //!
 //! Dependency rule: this crate depends only on `domain` and basic crates —
 //! never on GPUI or a concrete SDK.

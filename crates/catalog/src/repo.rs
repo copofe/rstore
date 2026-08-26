@@ -1,9 +1,8 @@
 //! Repository and query contracts over the catalog.
 //!
-//! An [`InMemoryCatalog`] reference implementation lives here so service and
-//! contract tests can run without SQLite. Its semantics are pinned by the
-//! shared `catalog_contract` suite in `rstore-test-support`, which the SQLite
-//! repositories also run — the two adapters must not drift.
+//! An [`InMemoryCatalog`] reference implementation lives here so catalog
+//! semantics remain available without SQLite. It mirrors the persisted
+//! repository's observable behavior.
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};

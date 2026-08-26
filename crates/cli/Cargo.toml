@@ -18,12 +18,5 @@ serde_json.workspace = true
 time.workspace = true
 rpassword.workspace = true
 
-[dev-dependencies]
-insta.workspace = true
-tokio.workspace = true
-rstore-test-support.workspace = true
-rstore-persistence.workspace = true
-rstore-application-test-support.workspace = true
-
 [lints]
 workspace = true

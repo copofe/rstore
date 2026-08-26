@@ -16,9 +16,5 @@ rstore-storage-s3.workspace = true
 tokio.workspace = true
 rstore-platform.workspace = true
 
-[dev-dependencies]
-tempfile.workspace = true
-rstore-application-ports.workspace = true
-
 [lints]
 workspace = true

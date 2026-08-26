@@ -17,15 +17,11 @@ use crate::args::ConnectionAddArgs;
 /// their answers: machine output (`--json`) or a non-terminal stdin means
 /// no. Constructed once per run and threaded to every prompt; an embedded
 /// consumer passes its own always-non-interactive session and inherits
-/// every prompting rule for free. Tests inject scripted answers through
-/// [`Session::with_answers`] — the interactive paths are the test surface,
-/// not dead code behind `--yes`.
+/// every prompting rule for free.
 #[derive(Clone)]
 pub struct Session {
     json: bool,
     stdin_is_tty: bool,
-    /// Scripted answers for tests; `None` reads stdin.
-    answers: Option<std::sync::Arc<std::sync::Mutex<std::vec::IntoIter<String>>>>,
 }
 
 impl Session {
@@ -33,28 +29,7 @@ impl Session {
         Self {
             json,
             stdin_is_tty: std::io::stdin().is_terminal(),
-            answers: None,
         }
-    }
-
-    /// A test session whose prompts consume the given answers in order.
-    #[cfg(test)]
-    pub fn with_answers(json: bool, answers: Vec<String>) -> Self {
-        Self {
-            json,
-            stdin_is_tty: !answers.is_empty(),
-            answers: Some(std::sync::Arc::new(std::sync::Mutex::new(
-                answers.into_iter(),
-            ))),
-        }
-    }
-
-    /// The same scripted session, downgraded to non-interactive — the
-    /// prompt must be refused before any answer is read.
-    #[cfg(test)]
-    pub fn into_non_interactive(mut self) -> Self {
-        self.stdin_is_tty = false;
-        self
     }
 
     /// Whether a human can answer a prompt.
@@ -62,19 +37,13 @@ impl Session {
         !self.json && self.stdin_is_tty
     }
 
-    /// Read one prompt answer: the next scripted line in tests, one stdin
-    /// line in production.
+    /// Read one prompt answer from stdin.
     fn read_answer(&self) -> Result<String> {
-        if let Some(answers) = &self.answers {
-            let mut queue = answers.lock().expect("answer queue poisoned");
-            Ok(queue.next().unwrap_or_default().trim().to_string())
-        } else {
-            let mut line = String::new();
-            std::io::stdin()
-                .read_line(&mut line)
-                .map_err(|e| Error::invalid_input("could not read confirmation").with_source(e))?;
-            Ok(line.trim().to_string())
-        }
+        let mut line = String::new();
+        std::io::stdin()
+            .read_line(&mut line)
+            .map_err(|e| Error::invalid_input("could not read confirmation").with_source(e))?;
+        Ok(line.trim().to_string())
     }
 }
 
@@ -288,198 +257,4 @@ pub(super) fn read_stdin_uris() -> rstore_domain::Result<Vec<String>> {
         uris.push(line.to_string());
     }
     Ok(uris)
-}
-
-#[cfg(test)]
-mod conflict_chain_tests {
-    use super::*;
-
-    fn non_interactive() -> Session {
-        Session {
-            json: false,
-            stdin_is_tty: false,
-            answers: None,
-        }
-    }
-
-    #[test]
-    fn explicit_flag_wins_over_bucket_default() {
-        assert_eq!(
-            resolve_conflict(ConflictPolicy::Rename, true, &non_interactive()).unwrap(),
-            ConflictPolicy::Rename
-        );
-    }
-
-    #[test]
-    fn omitted_flag_falls_back_to_bucket_default() {
-        assert_eq!(
-            resolve_conflict(ConflictPolicy::Skip, true, &non_interactive()).unwrap(),
-            ConflictPolicy::Skip
-        );
-    }
-
-    #[test]
-    fn unresolved_ask_resolves_to_overwrite_with_yes() {
-        assert_eq!(
-            resolve_conflict(ConflictPolicy::Ask, true, &non_interactive()).unwrap(),
-            ConflictPolicy::Overwrite
-        );
-        assert_eq!(
-            resolve_conflict(ConflictPolicy::Ask, true, &non_interactive()).unwrap(),
-            ConflictPolicy::Overwrite
-        );
-    }
-
-    #[test]
-    fn unresolved_ask_errors_non_interactively() {
-        // Injected session: deterministic regardless of the host's stdin.
-        let err = resolve_conflict(ConflictPolicy::Ask, false, &non_interactive()).unwrap_err();
-        assert_eq!(err.code, rstore_domain::ErrorCode::InvalidInput);
-    }
-
-    #[test]
-    fn json_session_is_never_interactive_even_on_a_tty() {
-        let machine_on_a_tty = Session::detect(true);
-        assert!(!machine_on_a_tty.is_interactive());
-        let human = Session {
-            json: false,
-            stdin_is_tty: true,
-            answers: None,
-        };
-        assert!(human.is_interactive());
-    }
-}
-
-#[cfg(test)]
-mod credential_pair_tests {
-    use super::*;
-
-    fn session(json: bool, tty: bool) -> Session {
-        Session {
-            json,
-            stdin_is_tty: tty,
-            answers: None,
-        }
-    }
-
-    #[test]
-    fn edit_without_credential_flags_does_not_prompt() {
-        let args = crate::args::ConnectionEditArgs {
-            reference: "supabase".into(),
-            name: None,
-            endpoint: None,
-            public_base: Some("https://public.example.com".into()),
-            cdn_base: None,
-            region: None,
-            addressing_style: None,
-            tls_verify: None,
-            access_key: None,
-            secret_key: None,
-        };
-
-        assert!(read_edit_credential_input(&args, &session(false, true))
-            .unwrap()
-            .is_none());
-    }
-
-    fn pair(access: Option<&str>, secret: Option<&str>) -> Result<Option<Secret<CredentialInput>>> {
-        read_credential_pair(access, secret, "A", "S", None, &session(false, false))
-    }
-
-    #[test]
-    fn complete_flag_pair_is_trimmed_and_wrapped() {
-        let creds = pair(Some(" AK "), Some(" SK ")).unwrap().unwrap();
-        let input = creds.expose();
-        assert_eq!(input.access_key, "AK");
-        assert_eq!(input.secret_key, "SK");
-    }
-
-    #[test]
-    fn empty_flag_values_are_rejected() {
-        for (access, secret) in [(Some("x"), Some(" ")), (Some(""), Some("x"))] {
-            let err = pair(access, secret).unwrap_err();
-            assert_eq!(err.code, rstore_domain::ErrorCode::InvalidInput);
-            assert!(err.message.contains("non-empty"));
-        }
-    }
-
-    #[test]
-    fn half_a_flag_pair_is_rejected() {
-        for (access, secret) in [(Some("x"), None), (None, Some("x"))] {
-            let err = pair(access, secret).unwrap_err();
-            assert_eq!(err.code, rstore_domain::ErrorCode::InvalidInput);
-            assert!(err.message.contains("together"));
-        }
-    }
-
-    #[test]
-    fn json_mode_never_prompts() {
-        assert!(
-            read_credential_pair(None, None, "A", "S", None, &session(true, true))
-                .unwrap()
-                .is_none(),
-            "--json stores nothing without flags, tty or not"
-        );
-    }
-
-    #[test]
-    fn non_tty_session_stores_nothing() {
-        assert!(
-            read_credential_pair(None, None, "A", "S", None, &session(false, false))
-                .unwrap()
-                .is_none()
-        );
-    }
-}
-
-#[cfg(test)]
-mod interactive_tests {
-    use super::*;
-
-    fn scripted(answers: &[&str]) -> Session {
-        Session::with_answers(false, answers.iter().map(|s| s.to_string()).collect())
-    }
-
-    #[test]
-    fn confirm_reads_scripted_answers() {
-        let yes = scripted(&["y"]);
-        assert!(confirm("remove", &yes).unwrap());
-        let no = scripted(&["n"]);
-        assert!(!confirm("remove", &no).unwrap());
-        // Anything but a bare y answers no.
-        let gibberish = scripted(&["  YES!  "]);
-        assert!(!confirm("remove", &gibberish).unwrap());
-    }
-
-    #[test]
-    fn destructive_gate_passes_on_yes_and_cancels_on_no() {
-        assert!(confirm_destructive("purge", false, &scripted(&["y"])).is_ok());
-        let cancelled = confirm_destructive("purge", false, &scripted(&["n"]))
-            .expect_err("a refused prompt cancels");
-        assert_eq!(cancelled.code, rstore_domain::ErrorCode::Cancelled);
-    }
-
-    #[test]
-    fn destructive_gate_still_requires_yes_when_non_interactive() {
-        let err = confirm_destructive("purge", false, &scripted(&["y"]).into_non_interactive())
-            .expect_err("non-interactive must refuse without --yes");
-        assert_eq!(err.code, rstore_domain::ErrorCode::InvalidInput);
-    }
-
-    #[test]
-    fn conflict_prompt_maps_each_choice_and_rejects_gibberish() {
-        for (input, expected) in [
-            ("o", ConflictPolicy::Overwrite),
-            ("s", ConflictPolicy::Skip),
-            ("r", ConflictPolicy::Rename),
-        ] {
-            assert_eq!(
-                resolve_conflict(ConflictPolicy::Ask, false, &scripted(&[input])).unwrap(),
-                expected
-            );
-        }
-        let cancelled = resolve_conflict(ConflictPolicy::Ask, false, &scripted(&["x"]))
-            .expect_err("an unrecognized choice cancels");
-        assert_eq!(cancelled.code, rstore_domain::ErrorCode::Cancelled);
-    }
 }

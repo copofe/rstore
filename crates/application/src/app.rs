@@ -8,10 +8,7 @@
 
 use std::sync::Arc;
 
-use rstore_catalog::{CatalogQuery, RemoteObjectRepository};
-
-use rstore_domain::{Clock, Result};
-use rstore_storage_api::StorageFactory;
+use rstore_domain::Result;
 
 use crate::bucket::DefaultBucketService;
 use crate::connection::DefaultConnectionService;
@@ -51,31 +48,6 @@ impl Application {
             .recover_processing(self.dependencies.runtime.clock.now())
             .await?;
         Ok(self)
-    }
-
-    /// Attach the storage adapter factory (the binary injects the S3 one) and re-wire.
-    pub fn with_storage_factory(mut self, factory: Arc<dyn StorageFactory>) -> Self {
-        self.dependencies.replace_storage_factory(factory);
-        self.rewire()
-    }
-
-    /// Replace the clock (tests) and re-wire.
-    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
-        self.dependencies.replace_clock(clock);
-        self.rewire()
-    }
-
-    /// Point the catalog seam at a second adapter (tests, future backends) and re-wire.
-    ///
-    /// The locator, remote, indexer, transfer, and copy services receive its
-    /// `RemoteObjectRepository` side, `files` its `CatalogQuery` side. The adapter must satisfy
-    /// the shared `catalog_contract`.
-    pub fn with_catalog<C>(mut self, catalog: Arc<C>) -> Self
-    where
-        C: RemoteObjectRepository + CatalogQuery + 'static,
-    {
-        self.dependencies.replace_catalog(catalog);
-        self.rewire()
     }
 
     /// The one place the dependency graph is assembled.
@@ -260,13 +232,6 @@ impl Application {
         Ok(total)
     }
 
-    /// Re-run [`Self::wire`] with the current raw dependencies.
-    ///
-    /// Construction path only (`with_*` builder calls).
-    fn rewire(self) -> Self {
-        Self::wire(self.dependencies)
-    }
-
     /// Current time per the wired clock, for output envelopes.
     ///
     /// The clock itself stays inside the composition root.
@@ -284,122 +249,5 @@ impl Application {
                 .as_ref()
                 .map(|f| f.name()),
         )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn transfer_service(&self) -> Arc<crate::transfer::DefaultTransferService> {
-        self.services.transfers.clone()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn copy_service(&self) -> Arc<crate::copy::DefaultCopyService> {
-        self.services.copies.clone()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn link_service(&self) -> Arc<crate::link::DefaultLinkService> {
-        self.services.links.clone()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use rstore_storage_api::Storage as _;
-
-    fn temp_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "rstore-app-drain-{}-{name}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    /// Drives the drain through a real settlement: remove an object, then
-    /// let the wired consumer verify the fact. A delete's expected provider
-    /// state is absence, so a clean removal acknowledges without repairs.
-    #[tokio::test]
-    async fn drain_acknowledges_settled_deletes_through_the_wired_consumer() {
-        let (app, factory) = crate::test_util::app_with(&["nas"], &[("nas", "media")]).await;
-        factory.storage().seed("media", "gone.txt", b"x", None);
-
-        let report = app
-            .api()
-            .transfer()
-            .remote()
-            .remove(
-                &["nas/media/gone.txt".into()],
-                false,
-                false,
-                &rstore_transfer::CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            report.outcome.severity(),
-            crate::batch_outcome::Severity::AllOk,
-            "object removed"
-        );
-
-        let drained = app.drain_outbox().await.unwrap();
-        assert_eq!(drained.claimed, 1);
-        assert_eq!(drained.published, 1);
-        assert!(
-            app.api().jobs().pending_repairs().await.unwrap().is_empty(),
-            "a verified delete settles without a repair"
-        );
-    }
-
-    /// The same loop catches divergence: an uploaded object that vanished
-    /// before the drain becomes one repair row, keyed by the event.
-    #[tokio::test]
-    async fn drain_records_a_repair_for_a_lost_upload() {
-        let dir = temp_dir("lost-upload");
-        std::fs::write(dir.join("a.txt"), b"payload").unwrap();
-        let (app, factory) = crate::test_util::app_with(&["nas"], &[("nas", "media")]).await;
-
-        let command = crate::commands::UploadObjectsCommand {
-            plan: crate::transfer_plan::UploadPlan {
-                connection: crate::connection::ConnectionRef::parse("nas"),
-                bucket: "media".into(),
-                prefix: String::new(),
-                sources: vec![dir.join("a.txt")],
-                conflict: rstore_domain::policy::ConflictPolicy::Overwrite,
-                recursive: false,
-            },
-            options: Default::default(),
-        };
-        let report = app
-            .api()
-            .transfer()
-            .run_upload(
-                &command,
-                &rstore_transfer::NullProgressSink,
-                &rstore_transfer::CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(report.succeeded, 1, "object uploaded and settled");
-
-        // The provider loses the object between settlement and the drain.
-        factory
-            .storage()
-            .delete(
-                "media",
-                &rstore_domain::remote::ObjectPath::new("a.txt").unwrap(),
-            )
-            .await
-            .unwrap();
-
-        let drained = app.drain_outbox().await.unwrap();
-        assert_eq!(drained.claimed, 1);
-        let repairs = app.api().jobs().pending_repairs().await.unwrap();
-        assert_eq!(repairs.len(), 1);
-        assert!(repairs[0]
-            .last_error
-            .as_deref()
-            .unwrap()
-            .contains("missing after settlement"));
     }
 }

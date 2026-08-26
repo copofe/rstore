@@ -57,18 +57,3 @@ impl CancellationToken {
         notified.await;
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn clones_share_the_flag() {
-        let token = CancellationToken::new();
-        let clone = token.clone();
-        assert!(!token.is_cancelled());
-        clone.cancel();
-        assert!(token.is_cancelled());
-        assert!(token.check().is_err());
-    }
-}

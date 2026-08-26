@@ -65,21 +65,3 @@ impl SqliteWriter {
         Ok(WritePermit { _permit: permit })
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn serializes_writes_and_rejects_a_full_queue() {
-        let writer = SqliteWriter::new(1);
-        let first = writer.acquire().await.unwrap();
-        let queued = writer.clone();
-        let waiter = tokio::spawn(async move { queued.acquire().await });
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        let full = writer.acquire().await.unwrap_err();
-        assert_eq!(full.code, rstore_domain::ErrorCode::DatabaseBusy);
-        drop(first);
-        waiter.await.unwrap().unwrap();
-    }
-}

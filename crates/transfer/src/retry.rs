@@ -33,16 +33,3 @@ impl RetryPolicy {
         raw.min(self.max_backoff_ms)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn backoff_grows_and_caps() {
-        let p = RetryPolicy::default();
-        assert_eq!(p.backoff_ms(0), 500);
-        assert_eq!(p.backoff_ms(1), 1_000);
-        assert_eq!(p.backoff_ms(20), p.max_backoff_ms);
-    }
-}

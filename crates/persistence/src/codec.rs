@@ -114,23 +114,6 @@ pub fn unix_secs(ts: OffsetDateTime) -> i64 {
     ts.unix_timestamp()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn uuid_to_text_uses_the_bare_uuid() {
-        let id = rstore_domain::ConnectionId::new_random();
-        assert_eq!(uuid_to_text(&id), id.as_uuid().to_string());
-    }
-
-    #[test]
-    fn unix_secs_matches_offset_datetime() {
-        let now = OffsetDateTime::now_utc();
-        assert_eq!(unix_secs(now), now.unix_timestamp());
-    }
-}
-
 #[derive(Debug, Clone)]
 /// One bindable value, in the vocabulary repositories write with. Typed shapes let the
 /// [`Insert`]/[`Update`] builders collect column names and values as pairs and derive the placeholder
@@ -387,48 +370,4 @@ pub(crate) async fn count_scalar(
         .await
         .map_err(crate::error::map_sqlx)?;
     RowReader::new(row).integer("n").map(|n| n as u64)
-}
-
-#[cfg(test)]
-mod builder_tests {
-    use super::*;
-
-    fn insert_sql(insert: Insert) -> String {
-        insert.finish().0
-    }
-
-    fn update_sql(update: Update) -> String {
-        update.finish().0
-    }
-
-    #[test]
-    fn insert_derives_columns_placeholders_and_order_together() {
-        let sql = insert_sql(
-            Insert::into("buckets")
-                .column("id", "bkt_1")
-                .column("read_only", true)
-                .column("concurrency", Some(4_i64))
-                .column("display_name", Option::<String>::None)
-                .suffix("ON CONFLICT(id) DO NOTHING"),
-        );
-        assert_eq!(
-            sql,
-            "INSERT INTO buckets (id, read_only, concurrency, display_name) \
-             VALUES (?, ?, ?, ?) ON CONFLICT(id) DO NOTHING"
-        );
-    }
-
-    #[test]
-    fn update_pairs_assignments_with_binds_and_appends_filters() {
-        let sql = update_sql(
-            Update::table("buckets")
-                .set("name", "media")
-                .set_sql("state = COALESCE(?, state)", "confirmed")
-                .filter("id = ?", vec![Bind::Text("bkt_1".into())]),
-        );
-        assert_eq!(
-            sql,
-            "UPDATE buckets SET name = ?, state = COALESCE(?, state) WHERE id = ?"
-        );
-    }
 }

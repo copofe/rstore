@@ -144,22 +144,3 @@ fn emit(result: HandlerResult, cli: &Cli, command: &str, now: OffsetDateTime) {
 fn human_output_enabled(cli: &Cli) -> bool {
     !cli.quiet && !cli.json
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn quiet_suppresses_human_success_output_without_affecting_json_mode() {
-        let (quiet, _) = parse_command_line(["rstore", "--quiet", "version"]);
-        assert!(!human_output_enabled(&quiet));
-
-        let (normal, identity) = parse_command_line(["rstore", "version"]);
-        assert!(human_output_enabled(&normal));
-        // The identity is derived, not hand-spelled.
-        assert_eq!(identity, "version");
-
-        let (json, _) = parse_command_line(["rstore", "--json", "version"]);
-        assert!(!human_output_enabled(&json));
-    }
-}

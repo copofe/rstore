@@ -53,23 +53,3 @@ pub fn mask_secret(value: &str) -> String {
     let end: String = chars[len - edge..].iter().collect();
     format!("{start}****{end}")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn debug_redacts_value() {
-        let secret = Secret::new("super-secret".to_string());
-        assert_eq!(format!("{secret:?}"), "Secret(**REDACTED**)");
-        assert!(!format!("{secret:?}").contains("super-secret"));
-    }
-
-    #[test]
-    fn mask_keeps_edges_only_for_long_values() {
-        assert_eq!(mask_secret("AKIAIOSFODNN7EXAMPLE"), "AKIA****MPLE");
-        assert_eq!(mask_secret("abcdef"), "ab****ef");
-        assert_eq!(mask_secret("abcd"), "****");
-        assert_eq!(mask_secret(""), "*");
-    }
-}

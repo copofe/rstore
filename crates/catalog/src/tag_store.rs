@@ -2,10 +2,8 @@
 //!
 //! The narrow slice of tag bookkeeping a service needs when it follows
 //! objects across copies: list a source's associations and attach them to
-//! the target. Implemented over SQLite by `rstore_persistence::TagRepository`
-//! with an in-memory second adapter in `rstore_test_support`, so services can
-//! hold `Arc<dyn TagStore>` instead of the concrete repository (no per-service
-//! SQLite).
+//! the target. Implemented over SQLite by `rstore_persistence::TagRepository`,
+//! so services hold `Arc<dyn TagStore>` instead of the concrete repository.
 
 use async_trait::async_trait;
 use rstore_domain::id::{TagId, WorkspaceId};

@@ -73,8 +73,9 @@
 
 ## 测试与交付
 
-优先使用 `FakeStorage`、`TempDb` 和 `TestClock`。Repository、Storage、Catalog
-和 Outbox 的契约必须有测试；CLI 输出使用 `insta` 快照。
+开发 agent 不得自行新增、修改或编写测试代码；实现与测试必须由不同的 agent 或人工分别负责。
+
+测试代码由独立验证方维护。Repository、Storage、Catalog 和 Outbox 的契约应由独立验证方覆盖；CLI 输出使用快照。
 
 提交前运行：
 

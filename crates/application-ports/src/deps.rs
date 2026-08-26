@@ -121,25 +121,4 @@ impl ApplicationDependencies {
             runtime,
         }
     }
-
-    /// Installs or replaces the optional provider storage factory.
-    pub fn replace_storage_factory(&mut self, factory: Arc<dyn StorageFactory>) {
-        self.runtime.storage_factory = Some(factory);
-    }
-
-    /// Installs or replaces the clock that stamps every core timestamp.
-    pub fn replace_clock(&mut self, clock: Arc<dyn Clock>) {
-        self.runtime.clock = clock;
-    }
-
-    /// Points both catalog ports — write ([`CatalogDependencies::catalog`])
-    /// and read ([`CatalogDependencies::catalog_query`]) — at one shared
-    /// implementation.
-    pub fn replace_catalog<C>(&mut self, catalog: Arc<C>)
-    where
-        C: RemoteObjectRepository + CatalogQuery + 'static,
-    {
-        self.catalog.catalog = catalog.clone();
-        self.catalog.catalog_query = catalog;
-    }
 }

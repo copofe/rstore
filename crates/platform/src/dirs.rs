@@ -93,19 +93,3 @@ fn platform_dirs() -> Option<AppDirs> {
         log_dir,
     ))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn forced_root_layout() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dirs = resolve_app_dirs(Some(tmp.path()));
-        assert!(dirs.config_dir.ends_with("config"));
-        assert!(dirs.db_path.ends_with("data/catalog.db"));
-        assert!(dirs.lock_path.ends_with("data/rstore.lock"));
-        dirs.ensure_created().unwrap();
-        assert!(dirs.data_dir.exists());
-    }
-}

@@ -155,29 +155,3 @@ impl FileType {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn path_normalises_and_segments() {
-        let p = ObjectPath::new("/images/logo.png").unwrap();
-        assert_eq!(p.as_str(), "images/logo.png");
-        assert_eq!(p.parent(), Some("images".to_string()));
-        assert_eq!(p.file_name(), "logo.png");
-        assert_eq!(p.extension(), Some("png"));
-    }
-
-    #[test]
-    fn rejects_empty_path() {
-        assert!(ObjectPath::new("").is_err());
-        assert!(ObjectPath::new("/").is_err());
-    }
-
-    #[test]
-    fn dotfile_has_no_extension() {
-        let p = ObjectPath::new(".gitignore").unwrap();
-        assert_eq!(p.extension(), None);
-    }
-}

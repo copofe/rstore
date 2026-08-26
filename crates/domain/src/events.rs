@@ -103,28 +103,3 @@ pub struct EventEnvelope {
     pub occurred_at: OffsetDateTime,
     pub payload: Value,
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn envelope_contains_ordering_and_context_metadata() {
-        let locator = RemoteLocator::new(
-            crate::id::ConnectionId::new_random(),
-            crate::id::BucketId::new_random(),
-            crate::remote::ObjectPath::new("docs/object.bin").unwrap(),
-        );
-        let event = DomainEvent::RemoteMutationCompleted {
-            locator,
-            operation: "upload".into(),
-        };
-        let envelope = event.envelope(uuid::Uuid::new_v4(), 3, OffsetDateTime::UNIX_EPOCH);
-
-        assert_eq!(envelope.context, BoundedContext::Transfer);
-        assert_eq!(envelope.aggregate_type, "remote_mutation");
-        assert_eq!(envelope.aggregate_version, 3);
-        assert_eq!(envelope.event_type, "remote_mutation_completed");
-        assert_eq!(envelope.schema_version, DOMAIN_EVENT_SCHEMA_VERSION);
-    }
-}

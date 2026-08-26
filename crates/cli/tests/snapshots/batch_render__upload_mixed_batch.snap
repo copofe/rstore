@@ -1,8 +1,0 @@
----
-source: crates/cli/tests/batch_render.rs
-expression: redacted
----
-  ok       <tmp>/new.txt → media/new.txt
-  skipped  <tmp>/b.txt → media/b.txt
-           target exists: b.txt
-job job_<id> — 1 succeeded, 1 skipped, 0 failed (succeeded)

@@ -16,9 +16,5 @@ time.workspace = true
 tracing.workspace = true
 tokio.workspace = true
 
-[dev-dependencies]
-rstore-test-support.workspace = true
-parking_lot.workspace = true
-
 [lints]
 workspace = true
