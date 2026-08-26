@@ -163,9 +163,9 @@ Rust symbol conventions: types, traits, commands, queries, and views are
 `PascalCase`; functions, modules, and fields are `snake_case`. Stable write
 use cases take `*Command` or `*Input` parameters; reads return domain types
 or application-facing `*View` / `*Page` / `*Report` / `*Outcome` values.
-Domain facts are `*Event`; runtime progress messages are deliberately named
-differently (`ProgressEvent`, `JobNotification`) so delivery semantics stay
-visible in the type name.
+Domain facts are `*Event`; runtime progress messages use distinct,
+runtime-only names such as `Progress`, so delivery semantics stay visible in
+the type name.
 
 Business identifiers are always newtypes from `rstore-domain::id`
 (`ConnectionId`, `BucketId`, …) rendered as `<prefix>_<uuid>` strings;
@@ -225,9 +225,10 @@ requires updating this document first.
 8. **Secrets stay sealed.** Credentials persist inside the connection row,
    live in memory as `Secret<T>`, never enter exports, generic JSON, logs,
    or error context, and render only as masked previews.
-9. **Events and notifications are different things.** Domain events are
+9. **Events and runtime messages are different things.** Domain events are
    durable facts carried by the outbox with idempotency, ordering, and retry
-   metadata; progress notifications are best-effort runtime messages.
+   metadata; progress messages are best-effort runtime messages. A desktop
+   notification channel is not wired yet.
 10. **Output discipline.** Results and JSON go to stdout; progress, warnings,
     and logs go to stderr. Destructive commands require `--yes` when no
     terminal can confirm them, and batch commands exit non-zero when any item

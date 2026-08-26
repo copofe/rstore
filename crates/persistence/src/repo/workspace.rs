@@ -24,6 +24,19 @@ impl WorkspaceRepository {
     pub(crate) fn new(gate: WriteGate, read_pool: SqlitePool) -> Self {
         Self { gate, read_pool }
     }
+
+    async fn get_with_executor<'e, E>(executor: E, id: WorkspaceId) -> Result<Option<Workspace>>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+    {
+        let row = sqlx::query(&format!("SELECT {COLUMNS} FROM workspaces WHERE id = ?"))
+            .bind(uuid_to_text(&id))
+            .fetch_optional(executor)
+            .await
+            .map_err(map_sqlx)?;
+        row.map(|r| row_to_workspace(&RowReader::new(r)))
+            .transpose()
+    }
 }
 
 #[async_trait]
@@ -95,13 +108,7 @@ impl WorkspaceStore for WorkspaceRepository {
     }
 
     async fn get(&self, id: WorkspaceId) -> Result<Option<Workspace>> {
-        let row = sqlx::query(&format!("SELECT {COLUMNS} FROM workspaces WHERE id = ?"))
-            .bind(uuid_to_text(&id))
-            .fetch_optional(&self.read_pool)
-            .await
-            .map_err(map_sqlx)?;
-        row.map(|r| row_to_workspace(&RowReader::new(r)))
-            .transpose()
+        Self::get_with_executor(&self.read_pool, id).await
     }
 
     async fn get_by_name(&self, name: &str) -> Result<Option<Workspace>> {
@@ -121,32 +128,38 @@ impl WorkspaceStore for WorkspaceRepository {
         description: Option<Option<&str>>,
         at: OffsetDateTime,
     ) -> Result<()> {
-        let _write = self.gate.permit().await?;
-        let existing = self
-            .get(id)
-            .await?
-            .ok_or_else(|| Error::not_found("workspace not found"))?;
-        let new_name = name.unwrap_or(&existing.name).to_string();
-        let new_description = match description {
-            Some(None) => None,
-            Some(Some(d)) => Some(d.to_string()),
-            None => existing.description.clone(),
-        };
-        // Uniqueness rides the schema's lower(name) index; a self-rename keeps exactly one row with that
-        // name, so it cannot violate the index.
-        Update::table("workspaces")
-            .set("name", &new_name)
-            .set("description", &new_description)
-            .set("updated_at", unix_secs(at))
-            .filter("id = ?", [Bind::Text(uuid_to_text(&id))])
-            .execute(self.gate.pool())
-            .await
-            .map_err(|e| {
-                crate::error::with_conflict_message(e, || {
-                    format!("workspace `{new_name}` already exists")
+        let name = name.map(str::to_owned);
+        let description = description.map(|value| value.map(str::to_owned));
+        self.gate
+            .write_unit("workspace update", move |tx| {
+                Box::pin(async move {
+                    let existing = Self::get_with_executor(&mut **tx, id)
+                        .await?
+                        .ok_or_else(|| Error::not_found("workspace not found"))?;
+                    let new_name = name.as_deref().unwrap_or(&existing.name).to_owned();
+                    let new_description = match description {
+                        Some(None) => None,
+                        Some(Some(value)) => Some(value),
+                        None => existing.description,
+                    };
+                    // Uniqueness rides the schema's lower(name) index; a self-rename keeps exactly one row with that
+                    // name, so it cannot violate the index.
+                    Update::table("workspaces")
+                        .set("name", &new_name)
+                        .set("description", &new_description)
+                        .set("updated_at", unix_secs(at))
+                        .filter("id = ?", [Bind::Text(uuid_to_text(&id))])
+                        .execute(&mut **tx)
+                        .await
+                        .map_err(|e| {
+                            crate::error::with_conflict_message(e, || {
+                                format!("workspace `{new_name}` already exists")
+                            })
+                        })?;
+                    Ok(())
                 })
-            })?;
-        Ok(())
+            })
+            .await
     }
 
     async fn delete(&self, id: WorkspaceId) -> Result<bool> {

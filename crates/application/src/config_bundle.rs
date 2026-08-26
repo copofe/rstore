@@ -100,13 +100,16 @@ impl ImportPlan {
 }
 
 /// Registry portability service.
-pub struct DefaultConfigTransferService {
+pub(crate) struct DefaultConfigTransferService {
     connections: Arc<dyn ConnectionService>,
     buckets: Arc<dyn BucketService>,
 }
 
 impl DefaultConfigTransferService {
-    pub fn new(connections: Arc<dyn ConnectionService>, buckets: Arc<dyn BucketService>) -> Self {
+    pub(crate) fn new(
+        connections: Arc<dyn ConnectionService>,
+        buckets: Arc<dyn BucketService>,
+    ) -> Self {
         Self {
             connections,
             buckets,
@@ -115,7 +118,7 @@ impl DefaultConfigTransferService {
 
     /// Serialise the registry without credential values; the exported bundle never contains a
     /// secret.
-    pub async fn export(&self) -> Result<ConfigBundle> {
+    pub(crate) async fn export(&self) -> Result<ConfigBundle> {
         let list = self
             .connections
             .list()
@@ -208,7 +211,11 @@ impl DefaultConfigTransferService {
     /// Execute or preview a previously derived plan.
     ///
     /// Existing names are skipped and never overwritten.
-    pub async fn import(&self, bundle: &ConfigBundle, dry_run: bool) -> Result<ImportReport> {
+    pub(crate) async fn import(
+        &self,
+        bundle: &ConfigBundle,
+        dry_run: bool,
+    ) -> Result<ImportReport> {
         let plan = self.plan(bundle).await?;
         let report = plan.report(dry_run);
         if !dry_run {

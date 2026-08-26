@@ -32,19 +32,19 @@ pub struct HealthReport {
 ///
 /// Counting-only by contract: its sole dependency is the [`RuntimeStats`] port, counts stay
 /// counts (no entity lists cross this seam), and the database path is supplied by the caller.
-pub struct HealthService {
+pub(crate) struct HealthService {
     stats: Arc<dyn RuntimeStats>,
 }
 
 impl HealthService {
-    pub fn new(stats: Arc<dyn RuntimeStats>) -> Self {
+    pub(crate) fn new(stats: Arc<dyn RuntimeStats>) -> Self {
         Self { stats }
     }
 
     /// Gather every health field. Individual probes degrade to zero-count defaults rather than
     /// failing the whole report — a broken probe is itself a finding, and the schema-mismatch
     /// check still renders.
-    pub async fn health(
+    pub(crate) async fn health(
         &self,
         db_path: &Path,
         storage_adapter: Option<&'static str>,

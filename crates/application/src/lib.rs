@@ -59,7 +59,7 @@ pub use copy::{validate_copy_target, CopyOptions, CopyPair};
 pub use diagnostics::{CapabilityReport, CheckResult, ConnectionDiagnostics, ConnectionTestReport};
 pub use files::{FileEntry, FilesPage, FilesService};
 pub use gateway::RemoteGateway;
-pub use health::{HealthReport, HealthService};
+pub use health::HealthReport;
 pub use indexer::{BucketIndexStatus, IndexReport, IndexService};
 pub use job::{JobRef, JobService};
 pub use link::{

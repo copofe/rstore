@@ -1,6 +1,6 @@
 //! `url` handlers (LINK-): signed/public links over resolved remote URIs.
 //!
-//! Lives beside the access/link surface it drives (`app.access().links()`),
+//! Lives beside the access/link surface it drives (`app.access()`),
 //! not in a shared junk drawer.
 
 use super::HandlerResult;
@@ -26,7 +26,7 @@ pub(super) async fn url(
         signed: args.signed,
         ttl_seconds: ttl,
     };
-    let outcome = app.access().links().generate(&uris, &request).await;
+    let outcome = app.access().generate(&uris, &request).await;
 
     let mut human = String::new();
     let mut errors = Vec::new();

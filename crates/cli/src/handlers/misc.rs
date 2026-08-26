@@ -28,11 +28,7 @@ pub(super) async fn doctor(
     app: &rstore_application::ApplicationApi,
     dirs: &AppDirs,
 ) -> HandlerResult {
-    let report = app
-        .diagnostics()
-        .health()
-        .health(&dirs.db_path, app.diagnostics().storage_adapter())
-        .await;
+    let report = app.diagnostics().health(&dirs.db_path).await;
 
     let data = super::json_value(&report)?;
 
@@ -78,7 +74,7 @@ pub(super) async fn config_export(
     out: Option<&str>,
     app: &rstore_application::ApplicationApi,
 ) -> HandlerResult {
-    let bundle = app.config().transfer().export().await?;
+    let bundle = app.config().export().await?;
     let json = serde_json::to_string_pretty(&bundle)
         .map_err(|e| rstore_domain::Error::unknown("serialise config bundle").with_source(e))?;
     match out {
@@ -106,7 +102,7 @@ pub(super) async fn config_import(
         .map_err(|e| rstore_domain::Error::io("read bundle").with_source(e))?;
     let bundle: rstore_application::ConfigBundle = serde_json::from_str(&raw)
         .map_err(|e| rstore_domain::Error::invalid_input("parse bundle").with_source(e))?;
-    let report = app.config().transfer().import(&bundle, dry_run).await?;
+    let report = app.config().import(&bundle, dry_run).await?;
     let data = super::json_value(&report)?;
     let human = format!(
         "{}{} connection(s) ({} skipped), {} bucket(s) ({} skipped){}\n",

@@ -52,6 +52,16 @@ impl MutationOperation {
     }
 }
 
+/// Result of trying to make a remote mutation durable locally.
+///
+/// Catalog projection is allowed only for [`Self::Committed`]. A failed
+/// receipt/outbox transaction still records a repair, but it must not make the
+/// local catalog claim a mutation that has no durable fact behind it.
+pub(crate) enum RemoteSettlement {
+    Committed(ReceiptId),
+    RepairRequired(String),
+}
+
 /// Catalog projection steps that can fail after a durable settlement; each
 /// maps to a distinct repair stage.
 #[derive(Debug, Clone, Copy)]
@@ -162,10 +172,14 @@ impl MutationCoordinator {
         locator: &RemoteLocator,
         metadata: Option<&ObjectMetadata>,
         at: OffsetDateTime,
-    ) -> ReceiptId {
-        let receipt_id = self
+    ) -> RemoteSettlement {
+        let receipt_id = match self
             .record_remote_success(operation, locator, metadata, None)
-            .await;
+            .await
+        {
+            RemoteSettlement::Committed(receipt_id) => receipt_id,
+            settlement @ RemoteSettlement::RepairRequired(_) => return settlement,
+        };
         let stage = match operation {
             MutationOperation::Delete => ProjectionStage::Tombstone,
             MutationOperation::Upload | MutationOperation::Copy => ProjectionStage::ObjectUpsert,
@@ -185,7 +199,7 @@ impl MutationCoordinator {
                         locator = %locator,
                         "upsert settlement missing object metadata"
                     );
-                    return receipt_id;
+                    return RemoteSettlement::Committed(receipt_id);
                 };
                 crate::catalog_follow::upsert_confirmed(
                     self.catalog.as_ref(),
@@ -201,7 +215,7 @@ impl MutationCoordinator {
             self.note_failure(receipt_id, operation, stage, locator, &error)
                 .await;
         }
-        receipt_id
+        RemoteSettlement::Committed(receipt_id)
     }
 
     /// Records a settlement follow-up failure as a repair keyed to the
@@ -228,14 +242,15 @@ impl MutationCoordinator {
 
     /// Commits the atomic settlement unit: one remote-mutation receipt plus
     /// its outbox event, written together via the unit of work. On commit
-    /// failure queues a `RemoteMutation` repair so the mutation is retried.
+    /// failure queues a `RemoteMutation` repair and prevents catalog
+    /// projection because no durable receipt exists.
     pub(crate) async fn record_remote_success(
         &self,
         operation: MutationOperation,
         locator: &RemoteLocator,
         metadata: Option<&ObjectMetadata>,
         job_id: Option<JobId>,
-    ) -> ReceiptId {
+    ) -> RemoteSettlement {
         let now = self.clock.now();
         let receipt_id = ReceiptId::new_random();
         let event_id = Uuid::new_v4();
@@ -271,17 +286,18 @@ impl MutationCoordinator {
         let result = self.unit_of_work.commit(receipt, outbox_event).await;
 
         match result {
-            Ok(()) => receipt_id,
+            Ok(()) => RemoteSettlement::Committed(receipt_id),
             Err(error) => {
+                let detail = format!("remote mutation receipt/outbox failed: {error}");
                 self.record_repair(
                     receipt_id,
                     RepairKind::RemoteMutation,
                     operation,
                     locator,
-                    &format!("remote mutation receipt/outbox failed: {error}"),
+                    &detail,
                 )
                 .await;
-                receipt_id
+                RemoteSettlement::RepairRequired(detail)
             }
         }
     }

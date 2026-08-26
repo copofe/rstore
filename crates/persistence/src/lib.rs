@@ -224,11 +224,6 @@ impl Database {
         Ok(has_legacy_rows != 0)
     }
 
-    /// The write pool, for tests and direct diagnostics.
-    pub fn pool(&self) -> &SqlitePool {
-        &self.pool
-    }
-
     // Repositories reach the write pool only through this gate: permit and transaction are acquired
     // together, never separately.
     fn gate(&self) -> crate::tx::WriteGate {
@@ -237,7 +232,7 @@ impl Database {
 
     /// Read-side pool reserved for catalog and diagnostics queries. In-memory databases share the write pool:
     /// a separate SQLite memory pool would be a different database.
-    pub fn read_pool(&self) -> &SqlitePool {
+    fn read_pool(&self) -> &SqlitePool {
         &self.read_pool
     }
 

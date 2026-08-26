@@ -8,8 +8,8 @@ terms map to crates. Entries are grouped by concern.
 ## Composition and startup
 
 - **Composition root** — `crates/bootstrap`. The only layer allowed to choose
-  concrete SQLite, storage adapter, outbox, and notification implementations;
-  the only production code that opens the `Database`.
+  concrete SQLite, storage adapter, and outbox implementations; the only
+  production code that opens the `Database`.
 - **Assembly point (`assemble`)** — `rstore_persistence::assemble(db,
   storage_factory) -> ApplicationDependencies`. The single function that
   turns an opened `Database` (which carries the injected clock) plus an

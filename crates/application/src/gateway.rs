@@ -4,8 +4,8 @@
 //! One place owns the chain *resolve config → build adapter*, so every
 //! consumer (bucket, remote, transfer) reports identical, well-classified
 //! failures for a broken connection. Mutations never leave through this
-//! seam unguarded: [`Self::writer`] and [`Self::deleter`] wrap the adapter
-//! in the write guard (see [`crate::guarded_storage`]), so the adapter a
+//! seam unguarded: [`RemoteGateway::writer`] and [`RemoteGateway::deleter`]
+//! wrap the adapter in the write guard, so the adapter a
 //! use case executes through carries the bucket's guard bits with it.
 use std::sync::Arc;
 

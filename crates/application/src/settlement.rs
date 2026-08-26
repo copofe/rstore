@@ -24,7 +24,7 @@ use time::OffsetDateTime;
 
 use crate::copy::{Item, ItemKind};
 use crate::job_run::{ItemVerdict, Step};
-use crate::mutation::{MutationCoordinator, MutationOperation, ProjectionStage};
+use crate::mutation::{MutationCoordinator, MutationOperation, ProjectionStage, RemoteSettlement};
 
 /// Settles confirmed copies (and their move follow-through).
 #[derive(Clone)]
@@ -77,9 +77,29 @@ impl Settlement {
         let now = self.clock.now();
         let source = CatalogObjectRef::new(&item.src.bucket, &item.src_path);
         let target = CatalogObjectRef::new(&item.dst_bucket, &dst_path);
-        let receipt_id = self
+        let settlement = self
             .settle_copy(&source, &target, copied, keep_tags, now)
             .await;
+
+        let receipt_id = match settlement {
+            CopySettlement::Committed(receipt_id) => receipt_id,
+            CopySettlement::RepairRequired(detail) => {
+                let detail = format!("copy completed, but local settlement failed: {detail}");
+                return match item.kind {
+                    // A copy is still a confirmed remote mutation. Keep the
+                    // success disposition while making the missing local
+                    // fact visible in the per-item detail and repair queue.
+                    ItemKind::Copy => Step::Done {
+                        disposition: crate::batch_outcome::Disposition::Succeeded,
+                        detail: Some(detail),
+                        bytes,
+                    },
+                    // A move is not complete until its source is deleted;
+                    // never delete it without a durable copy settlement.
+                    ItemKind::Move => Step::failed_msg(format!("{detail}; source kept")),
+                };
+            }
+        };
 
         match item.kind {
             ItemKind::Copy => Step::Done {
@@ -129,15 +149,21 @@ impl Settlement {
         metadata: &ObjectMetadata,
         preserve_tags: bool,
         at: OffsetDateTime,
-    ) -> ReceiptId {
+    ) -> CopySettlement {
         let target_locator = target.locator();
-        let receipt_id = self
+        let receipt_id = match self
             .mutations
             .settle_confirmed(MutationOperation::Copy, &target_locator, Some(metadata), at)
-            .await;
+            .await
+        {
+            RemoteSettlement::Committed(receipt_id) => receipt_id,
+            RemoteSettlement::RepairRequired(detail) => {
+                return CopySettlement::RepairRequired(detail)
+            }
+        };
 
         if !preserve_tags {
-            return receipt_id;
+            return CopySettlement::Committed(receipt_id);
         }
 
         // Tag mirroring reads through the catalog rather than trusting caller
@@ -148,7 +174,7 @@ impl Settlement {
             .await
         {
             Ok(Some(source_object)) => source_object,
-            Ok(None) => return receipt_id,
+            Ok(None) => return CopySettlement::Committed(receipt_id),
             Err(error) => {
                 self.fail_stage(
                     receipt_id,
@@ -157,7 +183,7 @@ impl Settlement {
                     &error,
                 )
                 .await;
-                return receipt_id;
+                return CopySettlement::Committed(receipt_id);
             }
         };
         let target_object = match self
@@ -166,7 +192,7 @@ impl Settlement {
             .await
         {
             Ok(Some(target_object)) => target_object,
-            Ok(None) => return receipt_id,
+            Ok(None) => return CopySettlement::Committed(receipt_id),
             Err(error) => {
                 self.fail_stage(
                     receipt_id,
@@ -175,7 +201,7 @@ impl Settlement {
                     &error,
                 )
                 .await;
-                return receipt_id;
+                return CopySettlement::Committed(receipt_id);
             }
         };
         let associations = match self.tags.associations_for_object(source_object.id).await {
@@ -188,7 +214,7 @@ impl Settlement {
                     &error,
                 )
                 .await;
-                return receipt_id;
+                return CopySettlement::Committed(receipt_id);
             }
         };
         for (workspace, tag) in associations {
@@ -202,7 +228,7 @@ impl Settlement {
                 .await;
             }
         }
-        receipt_id
+        CopySettlement::Committed(receipt_id)
     }
 
     /// Records one failed tag-mirroring stage through the coordinator's
@@ -311,6 +337,12 @@ impl Settlement {
             "{message}; repair recorded"
         );
     }
+}
+
+/// Outcome of settling a copy's receipt/outbox unit and catalog follow-up.
+enum CopySettlement {
+    Committed(ReceiptId),
+    RepairRequired(String),
 }
 
 /// Locator triple identifying one remote object in the catalog; the bucket

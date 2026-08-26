@@ -22,8 +22,8 @@ order is a development order, not a statement of product priority. The
 future GPUI desktop shares the same application core — no duplicated logic,
 and no direct SQLite or provider SDK access.
 
-The current desktop entry point wires bootstrap, the application API, and
-the job-notification subscription only; full pages come later.
+The current desktop entry point wires bootstrap and obtains the application
+API only; job notifications and full pages are deferred.
 
 ## 3. Domain scope
 

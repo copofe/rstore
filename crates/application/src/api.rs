@@ -6,19 +6,20 @@
 //! carries a rule — the bounded repair log on [`JobApi`], the conflict-policy precedence and run
 //! orchestration on [`TransferApi`]). Never mix both for the same service.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::bucket::BucketService;
 use crate::commands::{CopyObjectsCommand, DownloadObjectsCommand, UploadObjectsCommand};
-use crate::config_bundle::DefaultConfigTransferService;
+use crate::config_bundle::{ConfigBundle, DefaultConfigTransferService, ImportReport};
 use crate::connection::ConnectionService;
 use crate::copy::DefaultCopyService;
 use crate::diagnostics::ConnectionDiagnostics;
 use crate::files::FilesService;
-use crate::health::HealthService;
+use crate::health::{HealthReport, HealthService};
 use crate::indexer::IndexService;
 use crate::job::JobService;
-use crate::link::DefaultLinkService;
+use crate::link::{DefaultLinkService, GeneratedLink, LinkProfileInput, LinkRequest};
 use crate::remote::RemoteService;
 use crate::tag::TagService;
 use crate::transfer::DefaultTransferService;
@@ -293,16 +294,37 @@ impl TransferApi {
     }
 }
 
-/// Link generation handle (accessor style).
+/// Link generation operations.
 #[derive(Clone)]
 pub struct AccessApi {
     links: Arc<DefaultLinkService>,
 }
 
 impl AccessApi {
+    /// Read the effective link profile for a bucket.
+    pub async fn profile_for(
+        &self,
+        bucket: &crate::bucket::BucketRef,
+    ) -> Result<rstore_domain::LinkProfile> {
+        self.links.profile_for(bucket).await
+    }
+
+    /// Update and persist a bucket's link profile.
+    pub async fn set_profile(
+        &self,
+        bucket: &crate::bucket::BucketRef,
+        input: LinkProfileInput,
+    ) -> Result<rstore_domain::LinkProfile> {
+        self.links.set_profile(bucket, input).await
+    }
+
     /// Turn remote references into paths, URIs, URLs, and documents.
-    pub fn links(&self) -> Arc<DefaultLinkService> {
-        self.links.clone()
+    pub async fn generate(
+        &self,
+        uris: &[String],
+        request: &LinkRequest,
+    ) -> crate::batch_outcome::BatchOutcome<GeneratedLink> {
+        self.links.generate(uris, request).await
     }
 }
 
@@ -316,8 +338,8 @@ pub struct DiagnosticsApi {
 
 impl DiagnosticsApi {
     /// Whole-catalog doctor report.
-    pub fn health(&self) -> Arc<HealthService> {
-        self.health.clone()
+    pub async fn health(&self, db_path: &Path) -> HealthReport {
+        self.health.health(db_path, self.storage_adapter).await
     }
 
     /// Registered storage adapter name, or `None` when no factory was injected.
@@ -390,15 +412,20 @@ impl JobApi {
     }
 }
 
-/// Registry import/export handle (accessor style).
+/// Registry import/export operations.
 #[derive(Clone)]
 pub struct ConfigApi {
     config_io: Arc<DefaultConfigTransferService>,
 }
 
 impl ConfigApi {
-    /// Export the registry as a portable bundle and import bundles back in.
-    pub fn transfer(&self) -> Arc<DefaultConfigTransferService> {
-        self.config_io.clone()
+    /// Export the registry as a portable bundle.
+    pub async fn export(&self) -> Result<ConfigBundle> {
+        self.config_io.export().await
+    }
+
+    /// Import a portable registry bundle, optionally as a dry run.
+    pub async fn import(&self, bundle: &ConfigBundle, dry_run: bool) -> Result<ImportReport> {
+        self.config_io.import(bundle, dry_run).await
     }
 }

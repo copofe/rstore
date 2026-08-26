@@ -52,7 +52,6 @@ impl RuntimeConfig {
 /// process lifetime; dropping the runtime releases it.
 pub struct Runtime {
     _lock: Option<AppLock>,
-    db: Database,
     application: Application,
 }
 
@@ -69,7 +68,6 @@ impl Runtime {
             .await?;
         Ok(Self {
             _lock: None,
-            db,
             application,
         })
     }
@@ -112,9 +110,5 @@ impl Runtime {
 
     pub fn application(&self) -> &Application {
         &self.application
-    }
-
-    pub fn database(&self) -> &Database {
-        &self.db
     }
 }

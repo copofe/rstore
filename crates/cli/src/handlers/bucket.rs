@@ -128,7 +128,7 @@ pub(super) async fn bucket(
                 .connections()
                 .resolve(&ConnectionRef::Id(bucket.connection_id))
                 .await?;
-            let profile = app.access().links().profile_for(&bucket_ref).await?;
+            let profile = app.access().profile_for(&bucket_ref).await?;
             let data = serde_json::json!({
                 "bucket": super::json_value(&bucket)?,
                 "link_profile": super::json_value(&profile)?,
@@ -182,7 +182,6 @@ pub(super) async fn bucket(
             let profile = if args.link.any() {
                 Some(
                     app.access()
-                        .links()
                         .set_profile(&bucket_ref, link_input(&args.link)?)
                         .await?,
                 )
@@ -235,7 +234,7 @@ async fn link(
                 .connections()
                 .resolve(&ConnectionRef::Id(resolved_bucket.connection_id))
                 .await?;
-            let profile = app.access().links().profile_for(&reference).await?;
+            let profile = app.access().profile_for(&reference).await?;
             let data = super::json_value(&profile)?;
             let mut fields = super::format::Fields::new();
             push_link_profile(&mut fields, &profile, &connection);
@@ -245,7 +244,6 @@ async fn link(
             let reference = rstore_application::BucketRef::parse(bucket);
             let profile = app
                 .access()
-                .links()
                 .set_profile(&reference, link_input(link)?)
                 .await?;
             let data = super::json_value(&profile)?;

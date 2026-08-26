@@ -101,7 +101,7 @@ pub fn resolve_link_base(
         .to_string()
 }
 
-/// Editable link-profile fields for [`DefaultLinkService::set_profile`].
+/// Editable link-profile fields for the application access surface.
 ///
 /// The outer `None` keeps the current value; the inner `None` (or an empty string, which
 /// normalizes to it) clears a base override.
@@ -118,7 +118,7 @@ pub struct LinkProfileInput {
 ///
 /// Resolves remote URIs against the catalog locator and merges connection defaults with
 /// per-bucket [`LinkProfile`] overrides.
-pub struct DefaultLinkService {
+pub(crate) struct DefaultLinkService {
     gateway: RemoteGateway,
     buckets: Arc<dyn crate::bucket::BucketService>,
     locator: crate::locator::CatalogLocator,
@@ -127,7 +127,7 @@ pub struct DefaultLinkService {
 }
 
 impl DefaultLinkService {
-    pub fn new(
+    pub(crate) fn new(
         gateway: RemoteGateway,
         buckets: Arc<dyn crate::bucket::BucketService>,
         locator: crate::locator::CatalogLocator,
@@ -144,7 +144,10 @@ impl DefaultLinkService {
     }
 
     /// The bucket's link profile (defaults when never configured).
-    pub async fn profile_for(&self, bucket: &crate::bucket::BucketRef) -> Result<LinkProfile> {
+    pub(crate) async fn profile_for(
+        &self,
+        bucket: &crate::bucket::BucketRef,
+    ) -> Result<LinkProfile> {
         let bucket = self.resolve(bucket).await?;
         self.profiles.get(bucket.id).await
     }
@@ -155,7 +158,7 @@ impl DefaultLinkService {
     /// current values, `Some(None)` clears an override, and base-URL values pass through
     /// `ConnectionConfig::normalize_base_url`, so surrounding whitespace, trailing slashes,
     /// and empty strings all normalize away.
-    pub async fn set_profile(
+    pub(crate) async fn set_profile(
         &self,
         bucket: &crate::bucket::BucketRef,
         input: LinkProfileInput,
@@ -188,7 +191,7 @@ impl DefaultLinkService {
     /// Generate links for a batch of URIs; never fails as a whole — each URI
     /// gets an [`ItemOutcome`] carrying either the generated link or the
     /// projected failure.
-    pub async fn generate(
+    pub(crate) async fn generate(
         &self,
         uris: &[String],
         request: &LinkRequest,

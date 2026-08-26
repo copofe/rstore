@@ -52,7 +52,7 @@ pub struct TransferEngine {
 
 impl TransferEngine {
     /// Creates an engine bound to one storage adapter and its checkpoint
-    /// store; tuning rides the per-run [`RunContext`](crate::run::RunContext).
+    /// store; tuning rides the per-run [`RunContext`].
     pub fn new(
         storage: std::sync::Arc<dyn Storage>,
         checkpoints: std::sync::Arc<dyn MultipartStore>,

@@ -61,10 +61,10 @@
 ## 当前架构
 
 - Domain 划分为 Registry、Catalog、Transfer、AccessDiagnostics 四个上下文。
-- Bootstrap 是唯一的 Composition Root，负责具体数据库、Storage、Outbox 和通知通道的组装。
+- Bootstrap 是唯一的 Composition Root，负责具体数据库、Storage 和 Outbox 实现的组装。
 - Application 对外暴露上下文 API；返回值可为 Domain 类型或 Application-facing
   View/Page/Report/Outcome，不暴露 SQLite、AWS SDK 或具体 Service 实现。
-- Domain Event 记录业务事实；进度和桌面通知属于运行时消息。
+- Domain Event 记录业务事实；进度消息属于运行时消息，桌面通知通道尚未接入。
 - Outbox 支持幂等、重试、失败记录和 Repair 查询。
 - Outbox 的消费入口是启动时的一次性排水：Bootstrap 在取得写锁后把积压事件
   交付给 RemoteVerifyHandler（远端复验，缺失入 repair，瞬时错误留队重试）。

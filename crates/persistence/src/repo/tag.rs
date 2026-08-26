@@ -22,6 +22,21 @@ impl TagRepository {
     pub(crate) fn new(gate: WriteGate, read_pool: SqlitePool) -> Self {
         Self { gate, read_pool }
     }
+
+    async fn get_by_id_with_executor<'e, E>(executor: E, id: TagId) -> Result<Option<Tag>>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+    {
+        let row = sqlx::query(
+            "SELECT id, workspace_id, name, normalized_name, color, description, created_at \
+             FROM tags WHERE id = ?",
+        )
+        .bind(uuid_to_text(&id))
+        .fetch_optional(executor)
+        .await
+        .map_err(map_sqlx)?;
+        row.map(|r| row_to_tag(&RowReader::new(r))).transpose()
+    }
 }
 
 #[async_trait::async_trait]
@@ -144,15 +159,7 @@ impl TagStore for TagRepository {
     }
 
     async fn get_by_id(&self, id: TagId) -> Result<Option<Tag>> {
-        let row = sqlx::query(
-            "SELECT id, workspace_id, name, normalized_name, color, description, created_at \
-             FROM tags WHERE id = ?",
-        )
-        .bind(uuid_to_text(&id))
-        .fetch_optional(&self.read_pool)
-        .await
-        .map_err(map_sqlx)?;
-        row.map(|r| row_to_tag(&RowReader::new(r))).transpose()
+        Self::get_by_id_with_executor(&self.read_pool, id).await
     }
 
     async fn update(
@@ -162,33 +169,40 @@ impl TagStore for TagRepository {
         color: Option<&str>,
         description: Option<Option<&str>>,
     ) -> Result<()> {
-        let _write = self.gate.permit().await?;
-        let existing = self
-            .get_by_id(id)
-            .await?
-            .ok_or_else(|| Error::not_found("tag not found"))?;
-        let new_name = name.unwrap_or(&existing.name).to_string();
-        let normalized = rstore_domain::normalize_tag_name(&new_name);
-        let new_description = match description {
-            None => existing.description,
-            Some(None) => None,
-            Some(Some(d)) => Some(d.to_string()),
-        };
-        let new_color = color.unwrap_or(&existing.color).to_string();
-        Update::table("tags")
-            .set("name", &new_name)
-            .set("normalized_name", &normalized)
-            .set("color", &new_color)
-            .set("description", &new_description)
-            .filter("id = ?", [Bind::Text(uuid_to_text(&id))])
-            .execute(self.gate.pool())
-            .await
-            .map_err(|e| {
-                crate::error::with_conflict_message(e, || {
-                    format!("tag `{new_name}` already exists in this workspace")
+        let name = name.map(str::to_owned);
+        let color = color.map(str::to_owned);
+        let description = description.map(|value| value.map(str::to_owned));
+        self.gate
+            .write_unit("tag update", move |tx| {
+                Box::pin(async move {
+                    let existing = Self::get_by_id_with_executor(&mut **tx, id)
+                        .await?
+                        .ok_or_else(|| Error::not_found("tag not found"))?;
+                    let new_name = name.as_deref().unwrap_or(&existing.name).to_owned();
+                    let normalized = rstore_domain::normalize_tag_name(&new_name);
+                    let new_description = match description {
+                        None => existing.description,
+                        Some(None) => None,
+                        Some(Some(value)) => Some(value),
+                    };
+                    let new_color = color.as_deref().unwrap_or(&existing.color).to_owned();
+                    Update::table("tags")
+                        .set("name", &new_name)
+                        .set("normalized_name", &normalized)
+                        .set("color", &new_color)
+                        .set("description", &new_description)
+                        .filter("id = ?", [Bind::Text(uuid_to_text(&id))])
+                        .execute(&mut **tx)
+                        .await
+                        .map_err(|e| {
+                            crate::error::with_conflict_message(e, || {
+                                format!("tag `{new_name}` already exists in this workspace")
+                            })
+                        })?;
+                    Ok(())
                 })
-            })?;
-        Ok(())
+            })
+            .await
     }
 
     async fn delete(&self, id: TagId) -> Result<bool> {

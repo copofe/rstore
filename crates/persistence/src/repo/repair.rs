@@ -1,10 +1,9 @@
 //! SQLite repair repository: the persistence side of the repair lifecycle.
 //!
-//! One write path ([`RepairRepository::insert`] upserting on the
-//! deterministic identity) serves every producer; the outbox dead-letter
-//! transaction reuses the same statement in-transaction through
-//! [`upsert_repair`], so a repair row is written identically no matter
-//! which producer opened it.
+//! One write path (`RepairStore::insert` upserting on the deterministic
+//! identity) serves every producer; the outbox dead-letter transaction
+//! reuses the same statement in-transaction through `upsert_repair`, so a
+//! repair row is written identically no matter which producer opened it.
 
 use std::sync::Arc;
 

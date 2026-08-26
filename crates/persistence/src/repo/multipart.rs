@@ -31,12 +31,15 @@ impl SqliteMultipartStore {
         }
     }
 
-    async fn row_id(
-        &self,
+    async fn row_id<'e, E>(
+        executor: E,
         connection: ConnectionId,
         bucket: &str,
         key: &str,
-    ) -> Result<Option<i64>> {
+    ) -> Result<Option<i64>>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+    {
         let row = sqlx::query(
             "SELECT id FROM multipart_uploads
              WHERE connection_id = ? AND bucket = ? AND key = ?",
@@ -44,7 +47,7 @@ impl SqliteMultipartStore {
         .bind(crate::codec::uuid_to_text(&connection))
         .bind(bucket)
         .bind(key)
-        .fetch_optional(&self.read_pool)
+        .fetch_optional(executor)
         .await
         .map_err(map_sqlx)?;
         row.map(|row| RowReader::new(row).integer("id")).transpose()
@@ -171,25 +174,34 @@ impl SqliteMultipartStore {
         key: &str,
         part: &UploadedPart,
     ) -> Result<()> {
-        let _write = self.gate.permit().await?;
-        let part_size = i64::try_from(part.size)
-            .map_err(|e| Error::invalid_input("multipart part is too large").with_source(e))?;
-        let row_id = self
-            .row_id(connection, bucket, key)
-            .await?
-            .ok_or_else(|| Error::not_found("multipart checkpoint row"))?;
-        Insert::into("multipart_parts")
-            .column("multipart_upload_id", row_id)
-            .column("part_number", part.part_number as i64)
-            .column("etag", &part.etag)
-            .column("size", part_size)
-            .column("uploaded_at", crate::codec::unix_secs(self.clock.now()))
-            .suffix(
-                "ON CONFLICT(multipart_upload_id, part_number) DO UPDATE SET \
-                 etag = excluded.etag, size = excluded.size",
-            )
-            .execute(self.gate.pool())
-            .await?;
-        Ok(())
+        let bucket = bucket.to_owned();
+        let key = key.to_owned();
+        let part = part.clone();
+        let uploaded_at = self.clock.now();
+        self.gate
+            .write_unit("multipart part", move |tx| {
+                Box::pin(async move {
+                    let part_size = i64::try_from(part.size).map_err(|e| {
+                        Error::invalid_input("multipart part is too large").with_source(e)
+                    })?;
+                    let row_id = Self::row_id(&mut **tx, connection, &bucket, &key)
+                        .await?
+                        .ok_or_else(|| Error::not_found("multipart checkpoint row"))?;
+                    Insert::into("multipart_parts")
+                        .column("multipart_upload_id", row_id)
+                        .column("part_number", part.part_number as i64)
+                        .column("etag", &part.etag)
+                        .column("size", part_size)
+                        .column("uploaded_at", crate::codec::unix_secs(uploaded_at))
+                        .suffix(
+                            "ON CONFLICT(multipart_upload_id, part_number) DO UPDATE SET \
+                             etag = excluded.etag, size = excluded.size",
+                        )
+                        .execute(&mut **tx)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .await
     }
 }
