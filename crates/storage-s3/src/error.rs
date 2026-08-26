@@ -121,9 +121,18 @@ pub(crate) fn classify(code: &str, transport: Option<Transport>) -> (ErrorCode, 
     let ec = if c.contains("nosuchkey")
         || c.contains("nosuchbucket")
         || c.contains("notfound")
+        || c.contains("nosuchupload")
         || c == "404"
     {
         (ErrorCode::NotFound, false)
+    } else if c.contains("invalidpart")
+        || c.contains("entitytoosmall")
+        || c.contains("invalidargument")
+    {
+        // Multipart legality violations (unknown/gapped/out-of-order part,
+        // undersized non-final part, out-of-range part number): decisive
+        // caller errors, never transient.
+        (ErrorCode::InvalidInput, false)
     } else if c.contains("accessdenied") || c == "403" {
         (ErrorCode::Forbidden, false)
     } else if c.contains("invalidaccesskeyid")
@@ -178,6 +187,11 @@ mod tests {
         let cases: &[(&str, Option<Transport>, ErrorCode, bool)] = &[
             ("NoSuchKey", None, ErrorCode::NotFound, false),
             ("NoSuchBucket", None, ErrorCode::NotFound, false),
+            ("NoSuchUpload", None, ErrorCode::NotFound, false),
+            ("InvalidPart", None, ErrorCode::InvalidInput, false),
+            ("InvalidPartOrder", None, ErrorCode::InvalidInput, false),
+            ("EntityTooSmall", None, ErrorCode::InvalidInput, false),
+            ("InvalidArgument", None, ErrorCode::InvalidInput, false),
             ("404", None, ErrorCode::NotFound, false),
             ("AccessDenied", None, ErrorCode::Forbidden, false),
             ("403", None, ErrorCode::Forbidden, false),

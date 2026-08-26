@@ -19,6 +19,7 @@ pub mod diagnostics;
 pub(crate) mod expand;
 pub mod files;
 pub mod gateway;
+pub(crate) mod guarded_storage;
 pub mod health;
 mod index_run;
 pub mod indexer;

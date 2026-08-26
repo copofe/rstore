@@ -14,7 +14,8 @@ use rstore_storage_api::{MultipartStore, StorageFactory};
 
 use crate::{
     BucketStore, ConnectionStore, IgnoreRuleStore, IndexRunStore, JobRepository, LinkProfileStore,
-    RepairRepository, RuntimeStats, SettingsStore, TagStore, UnitOfWork, WorkspaceStore,
+    OutboxStore, RepairRepository, RuntimeStats, SettingsStore, TagStore, UnitOfWork,
+    WorkspaceStore,
 };
 
 /// Shared handle to the [`ConnectionStore`] port.
@@ -42,6 +43,8 @@ pub type StatsPort = Arc<dyn RuntimeStats>;
 pub type UnitOfWorkPort = Arc<dyn UnitOfWork>;
 /// Shared handle to the [`RepairRepository`] port.
 pub type RepairPort = Arc<dyn RepairRepository>;
+/// Shared handle to the [`OutboxStore`] port.
+pub type OutboxPort = Arc<dyn OutboxStore>;
 /// Shared handle to the catalog write port (`rstore_catalog::RemoteObjectRepository`).
 pub type CatalogPort = Arc<dyn RemoteObjectRepository>;
 /// Shared handle to the catalog read port (`rstore_catalog::CatalogQuery`).
@@ -89,6 +92,7 @@ pub struct RuntimeDependencies {
     pub storage_factory: Option<Arc<dyn StorageFactory>>,
     pub unit_of_work: UnitOfWorkPort,
     pub repairs: RepairPort,
+    pub outbox: OutboxPort,
 }
 
 /// All dependencies required to construct the application core.

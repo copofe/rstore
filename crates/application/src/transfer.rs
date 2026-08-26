@@ -187,10 +187,10 @@ impl DefaultTransferService {
             .plan_target_with_retry(&plan.connection, &plan.bucket, options.retry, cancel)
             .await?;
 
-        // The write guard is the gateway's writer handle: holding one proves
-        // the bucket accepted mutations before the engine exists.
-        let writer = self.gateway.writer(storage.clone(), &bucket)?;
-        let storage = writer.storage().clone();
+        // The write guard is the gateway's writer adapter: the engine's
+        // every write call re-checks the bucket's guard bits, so a
+        // read-only target fails here before any item runs.
+        let storage = self.gateway.writer(storage, &bucket)?;
 
         let engine = TransferEngine::new(storage, self.checkpoints.clone(), options.config);
         let items = crate::transfer_plan::upload_items(prepared, config.id, &bucket.name)
@@ -304,47 +304,34 @@ impl DefaultTransferService {
             dry_run,
             progress,
             cancel,
-            |item| {
+            |item| async move {
+                if dry_run {
+                    return crate::job_run::ItemVerdict::preview(item.preview());
+                }
+                let result = match &item {
+                    EngineItem::Upload(req) => engine.upload(req, progress, cancel).await,
+                    EngineItem::Download { request, .. } => {
+                        engine.download(request, progress, cancel).await
+                    }
+                };
+                crate::job_run::ItemVerdict::from_engine_result(result)
+            },
+            |item, verdict| {
                 let bucket = bucket.clone();
                 async move {
-                    if dry_run {
-                        return crate::job_run::Step::preview(item.preview());
-                    }
-                    let result = match &item {
-                        EngineItem::Upload(req) => engine.upload(req, progress, cancel).await,
-                        EngineItem::Download { request, .. } => {
-                            engine.download(request, progress, cancel).await
-                        }
-                    };
-                    let out = match result {
-                        Ok(out) => out,
-                        Err(e) if e.code == rstore_domain::ErrorCode::Cancelled => {
-                            return crate::job_run::Step::Interrupted
-                        }
-                        Err(e) => return crate::job_run::Step::failed(&e),
-                    };
-                    let (disposition, detail) =
-                        crate::transfer_report::disposition_from_engine(&out);
-
                     // Only successful uploads index metadata; downloads carry
                     // no catalog follow-up of their own.
-                    if disposition.is_success() {
-                        if let (EngineItem::Upload(_), Some(metadata)) = (&item, out.metadata) {
-                            self.mutations
-                                .settle_upload(
-                                    bucket.connection_id,
-                                    bucket.id,
-                                    &metadata,
-                                    self.clock.now(),
-                                )
-                                .await;
-                        }
+                    if let (EngineItem::Upload(_), Some(metadata)) = (&item, verdict.metadata) {
+                        self.mutations
+                            .settle_upload(
+                                bucket.connection_id,
+                                bucket.id,
+                                &metadata,
+                                self.clock.now(),
+                            )
+                            .await;
                     }
-                    crate::job_run::Step::Done {
-                        disposition,
-                        detail,
-                        bytes: out.bytes,
-                    }
+                    verdict.step
                 }
             },
         )

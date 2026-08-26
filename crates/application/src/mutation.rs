@@ -234,7 +234,7 @@ impl MutationCoordinator {
         .await
         {
             self.projection_failure(
-                Some(settlement.receipt_id()),
+                settlement.receipt_id(),
                 MutationOperation::Upload,
                 ProjectionStage::ObjectUpsert,
                 &locator,
@@ -269,7 +269,7 @@ impl MutationCoordinator {
         .await
         {
             self.projection_failure(
-                Some(settlement.receipt_id()),
+                settlement.receipt_id(),
                 MutationOperation::Copy,
                 ProjectionStage::ObjectUpsert,
                 &target_locator,
@@ -297,7 +297,7 @@ impl MutationCoordinator {
             Ok(None) => return settlement,
             Err(error) => {
                 self.projection_failure(
-                    Some(settlement.receipt_id()),
+                    settlement.receipt_id(),
                     MutationOperation::Copy,
                     ProjectionStage::SourceLookup,
                     &target_locator,
@@ -320,7 +320,7 @@ impl MutationCoordinator {
             Ok(None) => return settlement,
             Err(error) => {
                 self.projection_failure(
-                    Some(settlement.receipt_id()),
+                    settlement.receipt_id(),
                     MutationOperation::Copy,
                     ProjectionStage::TargetLookup,
                     &target_locator,
@@ -334,7 +334,7 @@ impl MutationCoordinator {
             Ok(associations) => associations,
             Err(error) => {
                 self.projection_failure(
-                    Some(settlement.receipt_id()),
+                    settlement.receipt_id(),
                     MutationOperation::Copy,
                     ProjectionStage::TagRead,
                     &target_locator,
@@ -351,7 +351,7 @@ impl MutationCoordinator {
                 .await
             {
                 self.projection_failure(
-                    Some(settlement.receipt_id()),
+                    settlement.receipt_id(),
                     MutationOperation::Copy,
                     ProjectionStage::TagWrite,
                     &target_locator,
@@ -378,7 +378,7 @@ impl MutationCoordinator {
             .await;
         if let Err(error) = self.catalog.tombstone(connection, bucket, path, at).await {
             self.projection_failure(
-                Some(settlement.receipt_id()),
+                settlement.receipt_id(),
                 MutationOperation::Delete,
                 ProjectionStage::Tombstone,
                 &locator,
@@ -442,7 +442,7 @@ impl MutationCoordinator {
     ) {
         let locator = RemoteLocator::new(source.connection, source.bucket_id, source.path.clone());
         self.record_repair(
-            Some(copy.receipt_id()),
+            copy.receipt_id(),
             RepairKind::MoveFollowup,
             MutationOperation::Copy,
             &locator,
@@ -459,7 +459,7 @@ impl MutationCoordinator {
     /// Persists a projection failure as a repair and logs a warning.
     async fn projection_failure(
         &self,
-        receipt_id: Option<ReceiptId>,
+        receipt_id: ReceiptId,
         operation: MutationOperation,
         stage: ProjectionStage,
         locator: &RemoteLocator,
@@ -529,7 +529,7 @@ impl MutationCoordinator {
             Ok(()) => RemoteSettlement::Durable { receipt_id },
             Err(error) => {
                 self.record_repair(
-                    Some(receipt_id),
+                    receipt_id,
                     RepairKind::RemoteMutation,
                     operation,
                     locator,
@@ -544,7 +544,7 @@ impl MutationCoordinator {
     /// Records a failed catalog projection stage as a queryable repair.
     pub(crate) async fn record_projection_failure(
         &self,
-        receipt_id: Option<ReceiptId>,
+        receipt_id: ReceiptId,
         operation: MutationOperation,
         stage: ProjectionStage,
         locator: &RemoteLocator,
@@ -569,17 +569,21 @@ impl MutationCoordinator {
 
     /// Inserts a repair row; a failing insert itself is logged loudly because
     /// there is no deeper fallback for losing repair records.
+    ///
+    /// Identity derives from the receipt, so re-recording the same failed
+    /// follow-up refreshes the same row instead of accumulating.
     async fn record_repair(
         &self,
-        receipt_id: Option<ReceiptId>,
+        receipt_id: ReceiptId,
         kind: RepairKind,
         operation: MutationOperation,
         locator: &RemoteLocator,
         error: &str,
     ) {
         let item = RepairItem {
-            id: RepairId::new_random(),
-            receipt_id,
+            id: RepairId::from_receipt(receipt_id),
+            event_id: None,
+            receipt_id: Some(receipt_id),
             kind,
             status: RepairStatus::Required,
             attempts: 0,
@@ -816,7 +820,7 @@ mod tests {
             .receipt_id();
         coordinator
             .record_projection_failure(
-                Some(receipt_id),
+                receipt_id,
                 MutationOperation::Copy,
                 ProjectionStage::ObjectUpsert,
                 &locator,

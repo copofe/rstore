@@ -356,15 +356,15 @@ pub async fn catalog_contract(fx: &dyn CatalogFixture) {
     );
     assert_eq!(stored.size, 50);
     let deleted = objects
-        .get(o7.id)
+        .find_by_locator(o7.connection_id, o7.bucket_id, &o7.path)
         .await
-        .expect("contract get")
+        .expect("contract find_by_locator")
         .expect("deleted row present");
     assert_eq!(deleted.state, ObjectState::Deleted);
     let typed = objects
-        .get(o1.id)
+        .find_by_locator(o1.connection_id, o1.bucket_id, &o1.path)
         .await
-        .expect("contract get")
+        .expect("contract find_by_locator")
         .expect("row present");
     assert_eq!(typed.content_type.as_deref(), Some("image/png"));
     assert_eq!(typed.last_modified, t(1000));
@@ -877,11 +877,21 @@ pub async fn catalog_contract(fx: &dyn CatalogFixture) {
         1
     );
     assert_eq!(
-        objects.get(w1.id).await.expect("get").expect("row").state,
+        objects
+            .find_by_locator(w1.connection_id, w1.bucket_id, &w1.path)
+            .await
+            .expect("contract find_by_locator")
+            .expect("row")
+            .state,
         ObjectState::Stale
     );
     assert_eq!(
-        objects.get(w3.id).await.expect("get").expect("row").state,
+        objects
+            .find_by_locator(w3.connection_id, w3.bucket_id, &w3.path)
+            .await
+            .expect("contract find_by_locator")
+            .expect("row")
+            .state,
         ObjectState::Confirmed
     );
 
@@ -914,37 +924,26 @@ pub async fn catalog_contract(fx: &dyn CatalogFixture) {
         2
     );
 
-    let removed = objects
-        .delete_all_in_bucket(writes.id)
+    // The rebuild spelling: a boundary earlier than every remaining row's
+    // confirmation flips them all, and the prune removes exactly those.
+    let flipped = objects
+        .mark_stale_older_than(writes.id, t(99999))
         .await
-        .expect("delete_all_in_bucket");
-    assert_eq!(removed, 2);
+        .expect("mark_stale_older_than");
     assert_eq!(
-        objects
-            .count_in_bucket(writes.id)
-            .await
-            .expect("count_in_bucket"),
-        0
-    );
-    assert_eq!(
-        objects.count_stale(writes.id).await.expect("count_stale"),
-        0
-    );
-
-    objects.upsert(&w1).await.expect("reseed rebuild row");
-    assert_eq!(
-        objects
-            .mark_all_stale_in_bucket(writes.id)
-            .await
-            .expect("mark_all_stale_in_bucket"),
-        1
+        flipped, 2,
+        "a far-future boundary marks every remaining row"
     );
     assert_eq!(
         objects
             .delete_stale_in_bucket(writes.id)
             .await
             .expect("delete_stale_in_bucket"),
-        1
+        2
     );
-    assert_eq!(objects.count_in_bucket(writes.id).await.unwrap(), 0);
+    assert_eq!(
+        objects.count_in_bucket(writes.id).await.unwrap(),
+        0,
+        "bucket drained through the rebuild spelling"
+    );
 }

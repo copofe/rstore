@@ -436,7 +436,14 @@ async fn fts_index_follows_deletes_and_updates() {
     }
     assert_eq!(count(&repo, &scope, "vanish").await, 1);
 
-    repo.delete(o.id).await.unwrap();
+    repo.tombstone(
+        o.connection_id,
+        o.bucket_id,
+        &o.path,
+        time::OffsetDateTime::UNIX_EPOCH,
+    )
+    .await
+    .unwrap();
     assert_eq!(count(&repo, &scope, "vanish").await, 0);
 
     let mut again = object("dir/returned.txt", 1);

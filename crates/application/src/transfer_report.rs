@@ -3,7 +3,7 @@
 //! [`Disposition`] vocabulary, and the report aggregates into a [`Severity`]
 //! so entry layers never re-derive "did this batch succeed" from counts.
 
-use crate::batch_outcome::{BlockReason, Disposition, Severity, SkipReason};
+use crate::batch_outcome::{Disposition, Severity};
 use rstore_domain::job::JobState;
 use rstore_domain::JobId;
 
@@ -60,32 +60,5 @@ impl TransferReport {
         } else {
             Severity::AllOk
         }
-    }
-}
-
-/// Maps one engine item outcome onto the unified vocabulary. `Failed` is
-/// never produced here — engine items either succeed, are skipped by the
-/// conflict policy, are blocked by an unresolvable policy, or abort the whole
-/// run before a report exists.
-pub(crate) fn disposition_from_engine(
-    item: &rstore_transfer::ItemOutcome,
-) -> (Disposition, Option<String>) {
-    if item.dry_run {
-        (
-            Disposition::Skipped(SkipReason::DryRun),
-            item.detail.clone(),
-        )
-    } else if item.skipped {
-        (
-            Disposition::Skipped(SkipReason::Conflict),
-            item.detail.clone(),
-        )
-    } else if item.blocked {
-        (
-            Disposition::Blocked(BlockReason::Unresolved),
-            item.detail.clone(),
-        )
-    } else {
-        (Disposition::Succeeded, None)
     }
 }

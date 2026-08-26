@@ -3,18 +3,15 @@
 //!
 //! One place owns the chain *resolve config → build adapter*, so every
 //! consumer (bucket, remote, transfer) reports identical, well-classified
-//! failures for a broken connection.
+//! failures for a broken connection. Mutations never leave through this
+//! seam unguarded: [`Self::writer`] and [`Self::deleter`] wrap the adapter
+//! in the write guard (see [`crate::guarded_storage`]), so the adapter a
+//! use case executes through carries the bucket's guard bits with it.
 use std::sync::Arc;
-
-use bytes::Bytes;
 
 use rstore_application_ports::ConnectionStore;
 use rstore_domain::connection::ConnectionConfig;
-use rstore_domain::remote::ObjectPath;
 use rstore_domain::{Error, Result};
-use rstore_storage_api::model::{
-    DeleteOutcome, ListOptions, ListPage, ObjectMetadata, PresignRequest, PresignedUrl, ReadRange,
-};
 use rstore_storage_api::{Storage, StorageFactory};
 use rstore_transfer::{CancellationToken, RetryPolicy, RetryingStorage};
 
@@ -104,145 +101,32 @@ impl RemoteGateway {
         )
     }
 
-    /// Read-only view of one bucket. Infallible: reads need no guard.
-    pub fn reader(&self, storage: Arc<dyn Storage>, bucket: &rstore_domain::Bucket) -> Reader {
-        Reader {
-            storage,
-            bucket: bucket.name.clone(),
-        }
-    }
-
-    /// Mutation view of one bucket. `Err(Forbidden)` when the bucket is
-    /// read-only — the guard is the door, not a convention on callers.
+    /// Mutation adapter for one bucket: the given adapter wrapped in the
+    /// write guard. `Err(Forbidden)` when the bucket is read-only — the
+    /// guard is the door, not a convention on callers. The returned
+    /// adapter re-checks the guard bits on every write call, so it can
+    /// travel into the transfer engine, the relay, or the copy entry
+    /// without opening a bypass.
     pub fn writer(
         &self,
         storage: Arc<dyn Storage>,
         bucket: &rstore_domain::Bucket,
-    ) -> Result<Writer> {
-        if bucket.config.read_only {
-            return Err(Error::forbidden(format!(
-                "bucket `{}` is read-only; mutations are refused",
-                bucket.name
-            )));
-        }
-        Ok(Writer {
-            storage,
-            bucket: bucket.name.clone(),
-        })
+    ) -> Result<Arc<dyn Storage>> {
+        crate::guarded_storage::GuardedStorage::writer(storage, bucket)
     }
 
-    /// Delete view of one bucket. `Err(Forbidden)` unless deletions are
-    /// allowed *and* the bucket is not read-only; the two flags are
-    /// independent on purpose.
+    /// Delete adapter for one bucket. `Err(Forbidden)` unless deletions
+    /// are allowed *and* the bucket is not read-only; the two flags are
+    /// independent on purpose. The returned adapter guards every delete
+    /// call the same way [`Self::writer`] guards mutations.
     pub fn deleter(
         &self,
         storage: Arc<dyn Storage>,
         bucket: &rstore_domain::Bucket,
-    ) -> Result<Deleter> {
-        if bucket.config.read_only {
-            return Err(Error::forbidden(format!(
-                "bucket `{}` is read-only; deletions are refused",
-                bucket.name
-            )));
-        }
-        if !bucket.config.allow_delete {
-            return Err(Error::forbidden(format!(
-                "bucket `{}` does not allow deletions; enable them with bucket edit",
-                bucket.name
-            )));
-        }
-        Ok(Deleter {
-            storage,
-            bucket: bucket.name.clone(),
-        })
+    ) -> Result<Arc<dyn Storage>> {
+        crate::guarded_storage::GuardedStorage::deleter(storage, bucket)
     }
 }
-
-/// Bucket-bound read handle: every call targets the bound bucket.
-pub struct Reader {
-    storage: Arc<dyn Storage>,
-    bucket: String,
-}
-
-impl Reader {
-    /// The bound bucket name.
-    pub fn bucket(&self) -> &str {
-        &self.bucket
-    }
-
-    /// Head a single object in the bound bucket.
-    pub async fn stat(&self, key: &ObjectPath) -> Result<ObjectMetadata> {
-        self.storage.stat(&self.bucket, key).await
-    }
-
-    /// Read object bytes, optionally a sub-range.
-    pub async fn read(&self, key: &ObjectPath, range: Option<ReadRange>) -> Result<Bytes> {
-        self.storage.read(&self.bucket, key, range).await
-    }
-
-    /// List objects under a prefix of the bound bucket.
-    pub async fn list(&self, opts: &ListOptions) -> Result<ListPage> {
-        self.storage.list(&self.bucket, opts).await
-    }
-
-    /// Presign a GET for a key in the bound bucket; the request's bucket is
-    /// forced to the binding so a handle cannot sign for another bucket.
-    pub async fn presign(&self, req: &PresignRequest) -> Result<PresignedUrl> {
-        let mut req = req.clone();
-        req.bucket = self.bucket.clone();
-        self.storage.presign(&req).await
-    }
-}
-
-/// Bucket-bound mutation proof; obtainable only through
-/// [`RemoteGateway::writer`], so holding one proves the guard passed. The
-/// transfer-crate machinery that executes mutations takes a `&dyn Storage`,
-/// so the handle doubles as its explicit escape hatch.
-pub struct Writer {
-    storage: Arc<dyn Storage>,
-    bucket: String,
-}
-
-impl Writer {
-    /// The bound bucket name.
-    pub fn bucket(&self) -> &str {
-        &self.bucket
-    }
-}
-
-/// Bucket-bound delete handle; obtainable only through
-/// [`RemoteGateway::deleter`], so holding one proves both guards passed.
-pub struct Deleter {
-    storage: Arc<dyn Storage>,
-    bucket: String,
-}
-
-impl Deleter {
-    /// The bound bucket name.
-    pub fn bucket(&self) -> &str {
-        &self.bucket
-    }
-
-    /// Delete one object; a missing object is an outcome, not an error.
-    pub async fn delete(&self, key: &ObjectPath) -> Result<DeleteOutcome> {
-        self.storage.delete(&self.bucket, key).await
-    }
-}
-
-/// Borrow the underlying adapter — the deliberate escape hatch for
-/// transfer-crate machinery (engine, relay, move verification) that takes a
-/// `&dyn Storage`. Every bypass is this explicit.
-macro_rules! raw_storage {
-    ($($t:ty),* $(,)?) => {$(
-        impl $t {
-            /// The decorated adapter behind this handle.
-            pub fn storage(&self) -> &Arc<dyn Storage> {
-                &self.storage
-            }
-        }
-    )*};
-}
-raw_storage!(Reader, Writer, Deleter,);
 
 #[cfg(test)]
 mod tests {

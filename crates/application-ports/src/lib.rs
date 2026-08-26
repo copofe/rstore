@@ -348,9 +348,18 @@ impl RepairStatus {
 }
 
 /// Small structured repair record exposed to diagnostics and job views.
+///
+/// Identity is deterministic: event-driven repairs (delivery dead-letters,
+/// verification divergences) carry the outbox [`Self::event_id`],
+/// receipt-driven repairs (settlement/projection failures) carry
+/// [`Self::receipt_id`]; re-recording the same cause upserts the same row.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepairItem {
     pub id: RepairId,
+    /// The outbox event this repair derives from, when event-driven.
+    pub event_id: Option<uuid::Uuid>,
+    /// The durable mutation receipt this repair follows, when
+    /// receipt-driven.
     pub receipt_id: Option<ReceiptId>,
     pub kind: RepairKind,
     pub status: RepairStatus,
@@ -361,7 +370,9 @@ pub struct RepairItem {
     pub operation: Option<String>,
 }
 
-/// Persistence port for repair records produced by failed follow-ups.
+/// Persistence port for repair records. [`RepairRepository::insert`] is the
+/// single write path — a plain upsert keyed by the deterministic identity —
+/// shared by every producer, including the store's own dead-letter.
 #[async_trait]
 pub trait RepairRepository: Send + Sync {
     async fn insert(&self, item: &RepairItem) -> Result<()>;
@@ -398,18 +409,20 @@ pub trait RemoteMutationRepository: Send + Sync {
 
 /// Reliable outbox/repair port. The first implementation is SQLite-backed;
 /// the interface is intentionally independent of a worker or UI runtime.
+///
+/// Delivery policy lives here in its entirety: [`OutboxStore::retry`] owns
+/// the backoff schedule and the exhausted-attempts dead-letter decision, so
+/// no dispatcher can drift from it.
 #[async_trait]
 pub trait OutboxStore: Send + Sync {
     async fn append(&self, event: &OutboxEvent) -> Result<()>;
     async fn claim_due(&self, now: OffsetDateTime, limit: u32) -> Result<Vec<OutboxEvent>>;
     async fn recover_processing(&self, now: OffsetDateTime) -> Result<u64>;
     async fn acknowledge(&self, event_id: uuid::Uuid, at: OffsetDateTime) -> Result<()>;
-    async fn retry(
-        &self,
-        event_id: uuid::Uuid,
-        next_attempt_at: OffsetDateTime,
-        error: &str,
-    ) -> Result<()>;
+    /// Schedules the next delivery attempt under the store's backoff
+    /// policy, or — once attempts are exhausted — dead-letters the event
+    /// into a repair row derived from the event's identity.
+    async fn retry(&self, event_id: uuid::Uuid, error: &str, now: OffsetDateTime) -> Result<()>;
     async fn repairs(&self, limit: u32) -> Result<Vec<RepairItem>>;
 }
 

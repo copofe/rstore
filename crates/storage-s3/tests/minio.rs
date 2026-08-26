@@ -111,7 +111,7 @@ async fn minio_satisfies_storage_contract() {
 
     let storage = make_storage(&minio, AddressingStyle::Path);
     rstore_test_support::storage_contract(&storage, &bucket).await;
-
+    rstore_test_support::multipart_legality_negatives(&storage, &bucket).await;
     // The part-copy path for objects beyond the atomic limit, with the
     // limit lowered so a small object exercises `UploadPartCopy`: the
     // copied bytes are identical and the size survives the part assembly.

@@ -7,7 +7,9 @@ pub mod args;
 pub mod handlers;
 pub mod output;
 
-pub use args::{command_domains, Cli, Command, ConfigCommand, ConnectionCommand};
+pub use args::{
+    command_domains, parse_command_line, Cli, Command, ConfigCommand, ConnectionCommand,
+};
 pub use handlers::{resolve_dirs, run_api, HandlerResult};
 pub use output::{envelope, error_envelope, exit_code_for, version_output, HandlerOutput};
 

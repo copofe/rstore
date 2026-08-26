@@ -158,27 +158,6 @@ impl RemoteObjectRepository for SqliteRemoteObjectRepository {
             .await
     }
 
-    async fn get(&self, id: RemoteObjectId) -> Result<Option<RemoteObject>> {
-        let row = sqlx::query(&format!(
-            "SELECT {COLUMNS} FROM remote_objects WHERE id = ?"
-        ))
-        .bind(uuid_to_text(&id))
-        .fetch_optional(&self.read_pool)
-        .await
-        .map_err(map_sqlx)?;
-        row.map(row_to_object).transpose()
-    }
-
-    async fn delete(&self, id: RemoteObjectId) -> Result<()> {
-        let _write = self.gate.permit().await?;
-        sqlx::query("DELETE FROM remote_objects WHERE id = ?")
-            .bind(uuid_to_text(&id))
-            .execute(self.gate.pool())
-            .await
-            .map_err(map_sqlx)?;
-        Ok(())
-    }
-
     async fn count_in_bucket(&self, bucket: BucketId) -> Result<u64> {
         crate::codec::count_scalar(
             &self.read_pool,
@@ -234,19 +213,6 @@ impl RemoteObjectRepository for SqliteRemoteObjectRepository {
         Ok(affected)
     }
 
-    async fn mark_all_stale_in_bucket(&self, bucket: BucketId) -> Result<u64> {
-        let _write = self.gate.permit().await?;
-        let affected = sqlx::query(
-            "UPDATE remote_objects SET state = 'stale' WHERE bucket_id = ? AND state != 'stale'",
-        )
-        .bind(uuid_to_text(&bucket))
-        .execute(self.gate.pool())
-        .await
-        .map_err(map_sqlx)?
-        .rows_affected();
-        Ok(affected)
-    }
-
     async fn delete_stale_in_bucket(&self, bucket: BucketId) -> Result<u64> {
         let _write = self.gate.permit().await?;
         let affected =
@@ -256,17 +222,6 @@ impl RemoteObjectRepository for SqliteRemoteObjectRepository {
                 .await
                 .map_err(map_sqlx)?
                 .rows_affected();
-        Ok(affected)
-    }
-
-    async fn delete_all_in_bucket(&self, bucket: BucketId) -> Result<u64> {
-        let _write = self.gate.permit().await?;
-        let affected = sqlx::query("DELETE FROM remote_objects WHERE bucket_id = ?")
-            .bind(uuid_to_text(&bucket))
-            .execute(self.gate.pool())
-            .await
-            .map_err(map_sqlx)?
-            .rows_affected();
         Ok(affected)
     }
 
@@ -340,25 +295,16 @@ impl rstore_catalog::CatalogQuery for SqliteRemoteObjectRepository {
         sort: rstore_catalog::FileSort,
         page: &rstore_catalog::PageRequest,
     ) -> Result<rstore_catalog::Page<RemoteObject>> {
-        let limit = page.limit.max(1);
         let query = super::catalog_sql::CatalogSql::select(COLUMNS, &scope.workspace, filter)?;
-        let query = match &page.after {
-            Some(cursor) => query.ordered_after(sort, cursor)?,
-            None => query,
-        };
-        let mut rows = query.ordered(sort, limit).fetch(&self.read_pool).await?;
-        let has_more = rows.len() > limit as usize;
-        rows.truncate(limit as usize);
-        let items: Vec<RemoteObject> =
-            rows.into_iter().map(row_to_object).collect::<Result<_>>()?;
-        let next_cursor = if has_more {
-            items
-                .last()
-                .map(|o| rstore_catalog::order::cursor_of(o, sort.field))
-        } else {
-            None
-        };
-        Ok(rstore_catalog::Page { items, next_cursor })
+        fetch_keyset_page(
+            &self.read_pool,
+            query,
+            sort,
+            page,
+            row_to_object,
+            |object| rstore_catalog::order::cursor_of(object, sort.field),
+        )
+        .await
     }
 
     async fn count(
@@ -366,13 +312,7 @@ impl rstore_catalog::CatalogQuery for SqliteRemoteObjectRepository {
         scope: rstore_catalog::Scope,
         filter: &rstore_catalog::FileFilter,
     ) -> Result<u64> {
-        let rows = super::catalog_sql::CatalogSql::count(&scope.workspace, filter)?
-            .fetch(&self.read_pool)
-            .await?;
-        let Some(row) = rows.into_iter().next() else {
-            return Err(Error::database("count query returned no scalar row"));
-        };
-        Ok(RowReader::new(row).integer("n")? as u64)
+        count_matches(&self.read_pool, &scope.workspace, filter).await
     }
 
     async fn page(
@@ -382,47 +322,73 @@ impl rstore_catalog::CatalogQuery for SqliteRemoteObjectRepository {
         sort: rstore_catalog::FileSort,
         page: &rstore_catalog::PageRequest,
     ) -> Result<rstore_catalog::CatalogPage> {
-        let limit = page.limit.max(1);
         let mut read = self.read_pool.begin().await.map_err(map_sqlx)?;
-        let total_rows = super::catalog_sql::CatalogSql::count(&scope.workspace, filter)?
-            .fetch(&mut *read)
-            .await?;
-        let total = RowReader::new(
-            total_rows
-                .into_iter()
-                .next()
-                .ok_or_else(|| Error::database("count query returned no scalar row"))?,
-        )
-        .integer("n")? as u64;
+        let total = count_matches(&mut *read, &scope.workspace, filter).await?;
         let query = super::catalog_sql::CatalogSql::page(COLUMNS, &scope.workspace, filter)?;
-        let query = match &page.after {
-            Some(cursor) => query.ordered_after(sort, cursor)?,
-            None => query,
-        };
-        let mut rows = query.ordered(sort, limit).fetch(&mut *read).await?;
+        let fetched = fetch_keyset_page(
+            &mut *read,
+            query,
+            sort,
+            page,
+            |row| row_to_catalog_page_item(RowReader::new(row)),
+            |item| rstore_catalog::order::cursor_of(&item.object, sort.field),
+        )
+        .await?;
         read.commit().await.map_err(map_sqlx)?;
-        let has_more = rows.len() > limit as usize;
-        rows.truncate(limit as usize);
-        let items = rows
-            .into_iter()
-            .map(|row| {
-                let row = RowReader::new(row);
-                row_to_catalog_page_item(row)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let next_cursor = if has_more {
-            items
-                .last()
-                .map(|item| rstore_catalog::order::cursor_of(&item.object, sort.field))
-        } else {
-            None
-        };
         Ok(rstore_catalog::CatalogPage {
-            items,
+            items: fetched.items,
             total,
-            next_cursor,
+            next_cursor: fetched.next_cursor,
         })
     }
+}
+
+/// The one keyset-pagination choreography: apply the cursor predicate, fetch
+/// one row past the limit, truncate, and derive the continuation cursor from
+/// the last delivered item. Every read shape (search, mixed page) shares it.
+async fn fetch_keyset_page<'e, E, T>(
+    executor: E,
+    query: super::catalog_sql::CatalogSql,
+    sort: rstore_catalog::FileSort,
+    page: &rstore_catalog::PageRequest,
+    decode: impl FnMut(sqlx::sqlite::SqliteRow) -> Result<T>,
+    cursor_of_item: impl Fn(&T) -> String,
+) -> Result<rstore_catalog::Page<T>>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let limit = page.limit.max(1);
+    let query = match &page.after {
+        Some(cursor) => query.ordered_after(sort, cursor)?,
+        None => query,
+    };
+    let mut rows = query.ordered(sort, limit).fetch(executor).await?;
+    let has_more = rows.len() > limit as usize;
+    rows.truncate(limit as usize);
+    let items = rows.into_iter().map(decode).collect::<Result<Vec<_>>>()?;
+    let next_cursor = has_more
+        .then(|| items.last().map(&cursor_of_item))
+        .flatten();
+    Ok(rstore_catalog::Page { items, next_cursor })
+}
+
+/// The one scalar-count shape over the filter, shared by `count` and the
+/// mixed page's total.
+async fn count_matches<'e, E>(
+    executor: E,
+    workspace: &rstore_domain::WorkspaceId,
+    filter: &rstore_catalog::FileFilter,
+) -> Result<u64>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let rows = super::catalog_sql::CatalogSql::count(workspace, filter)?
+        .fetch(executor)
+        .await?;
+    let Some(row) = rows.into_iter().next() else {
+        return Err(Error::database("count query returned no scalar row"));
+    };
+    Ok(RowReader::new(row).integer("n")? as u64)
 }
 
 fn row_to_catalog_page_item(row: RowReader) -> Result<rstore_catalog::CatalogPageItem> {

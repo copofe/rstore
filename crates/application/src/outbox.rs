@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use rstore_application_ports::{OutboxEvent, OutboxStore, RepairItem};
 use rstore_domain::Result;
 use std::sync::Arc;
-use time::{Duration, OffsetDateTime};
+use time::OffsetDateTime;
 
 /// Per-cycle outcome of [`OutboxDispatcher::dispatch_once`].
 ///
@@ -59,11 +59,10 @@ impl OutboxDispatcher {
 
     /// Run one dispatch cycle.
     ///
-    /// Flow: claim up to `batch_size` due events, then for each one acknowledge on handler
-    /// success, or on failure schedule a retry with `2^attempts` seconds of exponential
-    /// backoff (attempts clamped so the delay stays bounded). Events that exhaust the store's
-    /// attempt limit turn into repair items; the report counts pending repairs after the
-    /// cycle.
+    /// Flow: claim up to `batch_size` due events, then for each one
+    /// acknowledge on handler success, or hand the failure to the store's
+    /// `retry` — which owns the backoff schedule and the dead-letter
+    /// decision. The report counts pending repairs after the cycle.
     pub async fn dispatch_once<H: OutboxHandler + ?Sized>(
         &self,
         now: OffsetDateTime,
@@ -80,10 +79,8 @@ impl OutboxDispatcher {
                     published += 1;
                 }
                 Err(error) => {
-                    let backoff_seconds = 2_i64.pow(event.attempts.clamp(1, 8));
-                    let retry_at = now + Duration::seconds(backoff_seconds);
                     self.store
-                        .retry(event.event_id, retry_at, &error.to_string())
+                        .retry(event.event_id, &error.to_string(), now)
                         .await?;
                     retried += 1;
                 }

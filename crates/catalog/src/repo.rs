@@ -37,12 +37,6 @@ pub trait RemoteObjectRepository: Send + Sync {
         Ok(())
     }
 
-    /// Fetch one row by id; `None` when absent or tombstoned away.
-    async fn get(&self, id: RemoteObjectId) -> Result<Option<RemoteObject>>;
-
-    /// Remove a row outright (no tombstone is kept).
-    async fn delete(&self, id: RemoteObjectId) -> Result<()>;
-
     /// Number of rows currently indexed for `bucket`.
     async fn count_in_bucket(&self, bucket: BucketId) -> Result<u64>;
 
@@ -76,16 +70,8 @@ pub trait RemoteObjectRepository: Send + Sync {
         before: time::OffsetDateTime,
     ) -> Result<u64>;
 
-    /// Mark every row in a bucket as stale before a rebuild. Existing rows
-    /// remain visible until the replacement scan commits.
-    async fn mark_all_stale_in_bucket(&self, bucket: BucketId) -> Result<u64>;
-
     /// Remove rows left stale by a completed rebuild.
     async fn delete_stale_in_bucket(&self, bucket: BucketId) -> Result<u64>;
-
-    /// Remove every catalog row of a bucket. Tag associations cascade; tag
-    /// definitions survive.
-    async fn delete_all_in_bucket(&self, bucket: BucketId) -> Result<u64>;
 
     /// Tombstones past retention: count only (dry-run support). Adapters
     /// without tombstone records report zero.
@@ -380,20 +366,6 @@ impl RemoteObjectRepository for InMemoryCatalog {
         Ok(())
     }
 
-    async fn get(&self, id: RemoteObjectId) -> Result<Option<RemoteObject>> {
-        Ok(self
-            .objects
-            .lock()
-            .expect("catalog poisoned")
-            .get(&id)
-            .cloned())
-    }
-
-    async fn delete(&self, id: RemoteObjectId) -> Result<()> {
-        self.objects.lock().expect("catalog poisoned").remove(&id);
-        Ok(())
-    }
-
     async fn count_in_bucket(&self, bucket: BucketId) -> Result<u64> {
         Ok(self
             .objects
@@ -477,31 +449,12 @@ impl RemoteObjectRepository for InMemoryCatalog {
         Ok(flipped)
     }
 
-    async fn mark_all_stale_in_bucket(&self, bucket: BucketId) -> Result<u64> {
-        let mut objects = self.objects.lock().expect("catalog poisoned");
-        let mut marked = 0;
-        for object in objects.values_mut().filter(|o| o.bucket_id == bucket) {
-            if object.state != rstore_domain::ObjectState::Stale {
-                object.state = rstore_domain::ObjectState::Stale;
-                marked += 1;
-            }
-        }
-        Ok(marked)
-    }
-
     async fn delete_stale_in_bucket(&self, bucket: BucketId) -> Result<u64> {
         let mut objects = self.objects.lock().expect("catalog poisoned");
         let before = objects.len();
         objects.retain(|_, object| {
             !(object.bucket_id == bucket && object.state == rstore_domain::ObjectState::Stale)
         });
-        Ok((before - objects.len()) as u64)
-    }
-
-    async fn delete_all_in_bucket(&self, bucket: BucketId) -> Result<u64> {
-        let mut objects = self.objects.lock().expect("catalog poisoned");
-        let before = objects.len();
-        objects.retain(|_, o| o.bucket_id != bucket);
         Ok((before - objects.len()) as u64)
     }
 }

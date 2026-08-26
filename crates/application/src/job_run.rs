@@ -1,20 +1,25 @@
-//! Persisted transfer-run loop shared by upload, download, and copy jobs.
+//! Persisted transfer-run loop shared by upload, download, copy, and removal
+//! jobs.
 //!
-//! Drives a batch of [`RunItem`]s through a caller-supplied closure, mirroring
-//! every settled item into the durable job record and a [`TransferReport`].
-//! Contract: the job reaches a terminal state exactly once, via
-//! `JobRepository::commit_terminal`; interruption (cancel token or an
+//! Drives a batch of [`RunItem`]s through a caller-supplied execution closure
+//! and a settlement hook, mirroring every settled item into the durable job
+//! record and a [`TransferReport`]. The loop owns the verdict vocabulary
+//! ([`ItemVerdict`] → [`Step`] → report item), the one
+//! settle-on-success enforcement point (a successful remote mutation is
+//! settled exactly here, before it can be counted), and the terminal-state
+//! commit; interruption (cancel token, a cancelled engine result, or an
 //! `Step::Interrupted` step) marks remaining pending items cancelled and
 //! commits `Interrupted`.
 
 use std::future::Future;
 
-use crate::batch_outcome::{Disposition, Failure, SkipReason};
+use crate::batch_outcome::{BlockReason, Disposition, Failure, SkipReason};
 use crate::transfer_report::{TransferReport, TransferReportItem};
 use rstore_application_ports::JobRepository;
 use rstore_domain::job::{ItemState, Job, JobItem, JobKind, JobState};
-use rstore_domain::{Clock, JobId, Result};
-use rstore_transfer::{CancellationToken, Progress, ProgressSink};
+use rstore_domain::{Clock, ErrorCode, JobId, Result};
+use rstore_storage_api::model::ObjectMetadata;
+use rstore_transfer::{CancellationToken, ItemOutcome, Progress, ProgressSink};
 
 /// Maximum characters of a per-item error detail persisted on the job record.
 const ERROR_CODE_CAP: usize = 200;
@@ -104,6 +109,64 @@ impl Step {
     }
 }
 
+/// What one executed item reports back to the run loop: its verdict plus the
+/// adapter metadata a settlement may need. Engine-driven flows (upload,
+/// copy) carry the transferred object's metadata; native flows (removal)
+/// carry `None`.
+pub struct ItemVerdict {
+    pub step: Step,
+    pub metadata: Option<ObjectMetadata>,
+}
+
+impl ItemVerdict {
+    /// A loop-native verdict with no engine metadata.
+    pub fn from_step(step: Step) -> Self {
+        Self {
+            step,
+            metadata: None,
+        }
+    }
+
+    /// A dry-run/preview verdict.
+    pub fn preview(detail: impl Into<String>) -> Self {
+        Self::from_step(Step::preview(detail))
+    }
+
+    /// Maps one engine outcome onto the run vocabulary: previews, conflict
+    /// skips, and blocks keep their detail; transfers carry bytes and the
+    /// adapter's metadata for the settlement hook.
+    pub fn from_outcome(outcome: &ItemOutcome) -> Self {
+        let disposition = if outcome.dry_run {
+            Disposition::Skipped(SkipReason::DryRun)
+        } else if outcome.skipped {
+            Disposition::Skipped(SkipReason::Conflict)
+        } else if outcome.blocked {
+            Disposition::Blocked(BlockReason::Unresolved)
+        } else {
+            Disposition::Succeeded
+        };
+        Self {
+            step: Step::Done {
+                disposition,
+                detail: outcome.detail.clone(),
+                bytes: outcome.bytes,
+            },
+            metadata: outcome.metadata.clone(),
+        }
+    }
+
+    /// Maps one engine result: a cancelled item interrupts the run instead
+    /// of counting as a failure — the one cancellation interpretation for
+    /// every batch operation.
+    pub fn from_engine_result(outcome: Result<ItemOutcome>) -> Self {
+        match outcome {
+            Ok(outcome) => Self::from_outcome(&outcome),
+            Err(e) if e.code == ErrorCode::Cancelled => Self::from_step(Step::Interrupted),
+            Err(e) => Self::from_step(Step::failed(&e)),
+        }
+    }
+}
+
 /// Persists a fresh job in `Pending` state and transitions it to `Running`.
 async fn create_job<T>(
     jobs: &dyn JobRepository,
@@ -129,15 +192,21 @@ async fn create_job<T>(
 }
 
 #[allow(clippy::too_many_arguments)]
-/// Runs every item through `per_item`, persisting per-item state and emitting
-/// progress as it goes, then commits a single terminal state:
+/// Runs every item through `per_item`, settles every success through
+/// `settle`, persists per-item state, and commits a single terminal state:
 /// `Succeeded`, `PartialSuccess` (some failed/blocked), or `Failed` (none
 /// succeeded). Returns the resulting [`TransferReport`].
+///
+/// `settle` is the enforcement point for the settlement rule: it runs only
+/// for items `per_item` reported as succeeded, receives the item and its
+/// verdict (engine metadata included), and may revise the verdict — a move
+/// whose post-copy verification fails comes back as a failure. Flows without
+/// a settlement pass the verdict through unchanged.
 ///
 /// # Errors
 /// Propagates repository failures; a failing terminal commit leaves the job
 /// record in `Running` so a later sweep can mark stale runs interrupted.
-pub async fn run_items<T, F, Fut>(
+pub async fn run_items<T, F, Fut, S, SFut>(
     jobs: &dyn JobRepository,
     clock: &dyn Clock,
     kind: JobKind,
@@ -146,10 +215,14 @@ pub async fn run_items<T, F, Fut>(
     progress: &dyn ProgressSink,
     cancel: &CancellationToken,
     mut per_item: F,
+    mut settle: S,
 ) -> Result<TransferReport>
 where
+    T: Clone,
     F: FnMut(T) -> Fut,
-    Fut: Future<Output = Step>,
+    Fut: Future<Output = ItemVerdict>,
+    S: FnMut(T, ItemVerdict) -> SFut,
+    SFut: Future<Output = Step>,
 {
     let mut job = create_job(jobs, clock, kind, &items).await?;
     let mut report = TransferReport {
@@ -166,24 +239,31 @@ where
 
     let total = job.items.len() as u64;
 
-    for (index, item) in items.into_iter().enumerate() {
+    for (index, item) in items.iter().enumerate() {
         if cancel.is_cancelled() || cancel.check().is_err() {
             return interrupt(jobs, clock, job, index, report).await;
         }
 
-        let RunItem {
-            source,
-            target,
-            work,
-            ..
-        } = item;
-        let Step::Done {
-            disposition,
-            detail,
-            bytes,
-        } = per_item(work).await
-        else {
-            return interrupt(jobs, clock, job, index, report).await;
+        let verdict = per_item(item.work.clone()).await;
+        let succeeded = matches!(
+            verdict.step,
+            Step::Done {
+                disposition: Disposition::Succeeded,
+                ..
+            }
+        );
+        let settled = match verdict.step {
+            Step::Interrupted => return interrupt(jobs, clock, job, index, report).await,
+            _ if succeeded => settle(item.work.clone(), verdict).await,
+            done => done,
+        };
+        let (disposition, detail, bytes) = match settled {
+            Step::Done {
+                disposition,
+                detail,
+                bytes,
+            } => (disposition, detail, bytes),
+            Step::Interrupted => return interrupt(jobs, clock, job, index, report).await,
         };
 
         match &disposition {
@@ -214,8 +294,8 @@ where
         job.items[index].bytes_done = bytes;
         job.items[index].bytes_total = bytes;
         report.items.push(TransferReportItem {
-            source,
-            target,
+            source: item.source.clone(),
+            target: item.target.clone(),
             kind: kind.as_str(),
             disposition,
             detail,
@@ -398,12 +478,13 @@ mod tests {
             &NullProgressSink,
             &CancellationToken::new(),
             |bytes| async move {
-                Step::Done {
+                ItemVerdict::from_step(Step::Done {
                     disposition: Disposition::Succeeded,
                     detail: None,
                     bytes,
-                }
+                })
             },
+            |_, verdict| async move { verdict.step },
         )
         .await
         .unwrap();
@@ -439,12 +520,13 @@ mod tests {
             &NullProgressSink,
             &CancellationToken::new(),
             |disposition| async move {
-                Step::Done {
+                ItemVerdict::from_step(Step::Done {
                     detail: (!disposition.is_success()).then(|| "x".repeat(250)),
                     disposition,
                     bytes: 0,
-                }
+                })
             },
+            |_, verdict| async move { verdict.step },
         )
         .await
         .unwrap();
@@ -471,7 +553,8 @@ mod tests {
             false,
             &NullProgressSink,
             &CancellationToken::new(),
-            |_| async { Step::succeeded() },
+            |_| async { ItemVerdict::from_step(Step::succeeded()) },
+            |_, verdict| async move { verdict.step },
         )
         .await
         .unwrap_err();
@@ -501,9 +584,10 @@ mod tests {
                 let cancel = cancel_from_work.clone();
                 async move {
                     cancel.cancel();
-                    Step::succeeded()
+                    ItemVerdict::from_step(Step::succeeded())
                 }
             },
+            |_, verdict| async move { verdict.step },
         )
         .await
         .unwrap();
@@ -515,5 +599,140 @@ mod tests {
         assert_eq!(job.state, JobState::Interrupted);
         assert_eq!(job.items[0].state, ItemState::Succeeded);
         assert_eq!(job.items[1].state, ItemState::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn settle_hook_may_revise_a_succeeded_item() {
+        let jobs = MemoryJobs::default();
+        let report = run_items(
+            &jobs,
+            &TestClock::default(),
+            JobKind::Move,
+            vec![
+                RunItem::new("kept", "kept", "kept-copy", false),
+                RunItem::new("revised", "revised", "revised-copy", true),
+            ],
+            false,
+            &NullProgressSink,
+            &CancellationToken::new(),
+            |_revise| async { ItemVerdict::from_step(Step::succeeded()) },
+            |revise, verdict| async move {
+                if revise {
+                    // A failed move verification revises the verdict before
+                    // counting.
+                    Step::failed_msg("verify failed after copy")
+                } else {
+                    verdict.step
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.succeeded, 1);
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.state, JobState::PartialSuccess);
+        let job = jobs.get(report.job_id).await.unwrap().unwrap();
+        assert_eq!(job.items[0].state, ItemState::Succeeded);
+        assert_eq!(job.items[1].state, ItemState::Failed);
+        assert_eq!(
+            job.items[1].error.as_deref(),
+            Some("verify failed after copy")
+        );
+    }
+
+    #[tokio::test]
+    async fn settle_hook_runs_only_for_succeeded_items() {
+        let jobs = MemoryJobs::default();
+        let settled = std::sync::atomic::AtomicUsize::new(0);
+        let report = run_items(
+            &jobs,
+            &TestClock::default(),
+            JobKind::Delete,
+            vec![
+                RunItem::new("a", "a", "a", Disposition::Succeeded),
+                RunItem::new("b", "b", "b", Disposition::Skipped(SkipReason::Conflict)),
+                RunItem::new(
+                    "c",
+                    "c",
+                    "c",
+                    Disposition::Failed(Failure::from_error(&Error::not_found("x"))),
+                ),
+            ],
+            false,
+            &NullProgressSink,
+            &CancellationToken::new(),
+            |disposition| async move { ItemVerdict::from_step(Step::done(disposition, None)) },
+            |_, verdict| {
+                settled.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move { verdict.step }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.succeeded, 1);
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.failed, 1);
+        assert_eq!(
+            settled.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only the succeeded item settles"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_engine_result_interrupts_the_run() {
+        let jobs = MemoryJobs::default();
+        let report = run_items(
+            &jobs,
+            &TestClock::default(),
+            JobKind::Copy,
+            vec![
+                RunItem::new("a", "a", "a-copy", ()),
+                RunItem::new("b", "b", "b-copy", ()),
+            ],
+            false,
+            &NullProgressSink,
+            &CancellationToken::new(),
+            |_| async { ItemVerdict::from_engine_result(Err(Error::cancelled())) },
+            |_, verdict| async move { verdict.step },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.state, JobState::Interrupted);
+        let job = jobs.get(report.job_id).await.unwrap().unwrap();
+        assert_eq!(job.items[0].state, ItemState::Cancelled);
+        assert_eq!(job.items[1].state, ItemState::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn dry_run_outcome_counts_as_a_deliberate_skip() {
+        let jobs = MemoryJobs::default();
+        let report = run_items(
+            &jobs,
+            &TestClock::default(),
+            JobKind::Copy,
+            vec![RunItem::new("a", "a", "a-copy", ())],
+            true,
+            &NullProgressSink,
+            &CancellationToken::new(),
+            |_| async {
+                ItemVerdict::from_outcome(&rstore_transfer::ItemOutcome::preview(
+                    "would copy to bucket/key".into(),
+                ))
+            },
+            |_, verdict| async move { verdict.step },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.succeeded, 0);
+        assert_eq!(
+            report.items[0].detail.as_deref(),
+            Some("would copy to bucket/key")
+        );
     }
 }

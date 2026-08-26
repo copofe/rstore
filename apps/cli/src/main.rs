@@ -8,27 +8,25 @@
 //! Command identity and the version renderer come from the library (single
 //! source); the envelope timestamp flows from the injected clock.
 
-use clap::Parser;
 use rstore_bootstrap::Runtime;
 use rstore_cli::args::{Cli, Command};
 use rstore_cli::output::{envelope, error_envelope, exit_code_for};
-use rstore_cli::{resolve_dirs, version_output, HandlerResult};
+use rstore_cli::{parse_command_line, resolve_dirs, version_output, HandlerResult};
 use rstore_domain::{Clock, SystemClock};
 use time::OffsetDateTime;
 
 #[tokio::main]
 async fn main() {
-    let cli = Cli::parse();
+    let (cli, command) = parse_command_line(std::env::args_os());
     let dirs = resolve_dirs(&cli);
     init_tracing(&cli.log_level, &dirs);
 
     // `version` needs no database; handle it before acquiring the lock.
     if let Command::Version = cli.command {
-        emit(Ok(version_output()), &cli, "version", SystemClock.now());
+        emit(Ok(version_output()), &cli, &command, SystemClock.now());
         return;
     }
 
-    let command = cli.command.path();
     let now = SystemClock.now();
 
     // Full startup sequence: create data directories, acquire the
@@ -38,7 +36,7 @@ async fn main() {
     let runtime = match Runtime::open_locked(&dirs).await {
         Ok(runtime) => runtime,
         Err(e) => {
-            emit(Err(e), &cli, command, now);
+            emit(Err(e), &cli, &command, now);
             return;
         }
     };
@@ -64,7 +62,7 @@ async fn main() {
     let app = runtime.application();
     let api = app.api();
     let result = rstore_cli::run_api(&cli, &api, &dirs, &cancel).await;
-    emit(result, &cli, command, app.now());
+    emit(result, &cli, &command, app.now());
 }
 
 /// Initialise structured logging: stderr for the console and a daily-rolling
@@ -153,13 +151,15 @@ mod tests {
 
     #[test]
     fn quiet_suppresses_human_success_output_without_affecting_json_mode() {
-        let quiet = Cli::parse_from(["rstore", "--quiet", "version"]);
+        let (quiet, _) = parse_command_line(["rstore", "--quiet", "version"]);
         assert!(!human_output_enabled(&quiet));
 
-        let normal = Cli::parse_from(["rstore", "version"]);
+        let (normal, identity) = parse_command_line(["rstore", "version"]);
         assert!(human_output_enabled(&normal));
+        // The identity is derived, not hand-spelled.
+        assert_eq!(identity, "version");
 
-        let json = Cli::parse_from(["rstore", "--json", "version"]);
+        let (json, _) = parse_command_line(["rstore", "--json", "version"]);
         assert!(!human_output_enabled(&json));
     }
 }

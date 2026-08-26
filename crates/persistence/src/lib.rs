@@ -455,6 +455,7 @@ pub fn assemble(
             storage_factory,
             unit_of_work: Arc::new(db.clone()),
             repairs: Arc::new(db.outbox()),
+            outbox: Arc::new(db.outbox()),
         },
     )
 }

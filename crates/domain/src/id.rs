@@ -165,6 +165,23 @@ define_id!(
     "rep"
 );
 
+/// Repair identity is deterministic: one underlying cause maps to exactly
+/// one repair row, so repeated dispatch or re-projection upserts the same
+/// row instead of accumulating duplicates.
+impl RepairId {
+    /// Identity for event-driven repairs: outbox delivery dead-letters and
+    /// remote-verification divergences.
+    pub const fn from_event(event_id: uuid::Uuid) -> Self {
+        Self(event_id)
+    }
+
+    /// Identity for receipt-driven repairs: settlement and projection
+    /// failures behind a durable remote-mutation receipt.
+    pub const fn from_receipt(receipt: ReceiptId) -> Self {
+        Self(receipt.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

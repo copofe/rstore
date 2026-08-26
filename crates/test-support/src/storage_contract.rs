@@ -336,3 +336,115 @@ pub async fn storage_contract(storage: &dyn Storage, bucket: &str) {
             .expect("contract cleanup delete");
     }
 }
+
+/// The multipart-legality negatives every adapter must reject: the S3
+/// completion rules (part-set legality, minimum non-final size, issued
+/// etags, part-number range) and unknown-upload handling. These are the
+/// rules the in-memory fake simulates — running them here, against the fake
+/// and any real provider alike, keeps the transcription honest.
+///
+/// Failures are expected as `InvalidInput` for legality violations and
+/// `NotFound` for unknown upload ids; providers report them as
+/// InvalidPart/EntityTooSmall/InvalidArgument/NoSuchUpload and the adapter's
+/// classification maps them into that vocabulary.
+pub async fn multipart_legality_negatives(storage: &dyn Storage, bucket: &str) {
+    use rstore_storage_api::model::UploadedPart;
+
+    let fabricated = |part_number: u32, etag: &str, size: u64| UploadedPart {
+        part_number,
+        etag: etag.into(),
+        size,
+    };
+
+    // Undersized non-final part: a real upload of the tail keeps the
+    // submission honest, the fabricated small head is the violation.
+    let upload = storage
+        .create_multipart(bucket, &key("legality/small.bin"), &PutOptions::default())
+        .await
+        .expect("create small-part upload");
+    let tail = upload
+        .upload_part(2, Bytes::from_static(b"tail"))
+        .await
+        .expect("upload real tail part");
+    let error = upload
+        .complete(&[fabricated(1, "etag-1", 10), tail])
+        .await
+        .expect_err("undersized non-final part must be rejected");
+    assert_eq!(error.code, rstore_domain::ErrorCode::InvalidInput);
+    upload.abort().await.expect("abort after rejection");
+
+    // Fabricated etag: never issued by any UploadPart.
+    let upload = storage
+        .create_multipart(bucket, &key("legality/forged.bin"), &PutOptions::default())
+        .await
+        .expect("create forged-etag upload");
+    let error = upload
+        .complete(&[fabricated(1, "forged", 5)])
+        .await
+        .expect_err("forged etag must be rejected");
+    assert_eq!(error.code, rstore_domain::ErrorCode::InvalidInput);
+    upload.abort().await.expect("abort after rejection");
+
+    // Duplicate part numbers.
+    let upload = storage
+        .create_multipart(bucket, &key("legality/dup.bin"), &PutOptions::default())
+        .await
+        .expect("create duplicate-part upload");
+    let first = upload
+        .upload_part(1, Bytes::from_static(b"one"))
+        .await
+        .expect("upload first part");
+    let duplicate = UploadedPart { ..first.clone() };
+    let error = upload
+        .complete(&[first.clone(), duplicate])
+        .await
+        .expect_err("duplicate part numbers must be rejected");
+    assert_eq!(error.code, rstore_domain::ErrorCode::InvalidInput);
+
+    // Descending order over the same upload's real parts.
+    let second = upload
+        .upload_part(2, Bytes::from_static(b"two"))
+        .await
+        .expect("upload second part");
+    let error = upload
+        .complete(&[second, first])
+        .await
+        .expect_err("descending part order must be rejected");
+    assert_eq!(error.code, rstore_domain::ErrorCode::InvalidInput);
+    upload.abort().await.expect("abort after rejection");
+
+    // Part numbers outside the S3 range 1..=10000.
+    for illegal in [0u32, 10_001] {
+        let upload = storage
+            .create_multipart(
+                bucket,
+                &key(&format!("legality/range-{illegal}.bin")),
+                &PutOptions::default(),
+            )
+            .await
+            .expect("create range upload");
+        let error = upload
+            .complete(&[fabricated(illegal, &format!("etag-{illegal}"), 5)])
+            .await
+            .expect_err(&format!("part number {illegal} must be rejected"));
+        assert_eq!(error.code, rstore_domain::ErrorCode::InvalidInput);
+        upload.abort().await.expect("abort after rejection");
+    }
+
+    // Unknown upload id: part upload and abort both surface it. Abort is
+    // strict — a session over a foreign id never silently succeeds.
+    let ghost = storage
+        .adopt_multipart(bucket, &key("legality/ghost.bin"), "no-such-upload-id")
+        .await
+        .expect("adopt ghost session");
+    let error = ghost
+        .upload_part(1, Bytes::from_static(b"x"))
+        .await
+        .expect_err("unknown upload id must surface on part upload");
+    assert_eq!(error.code, rstore_domain::ErrorCode::NotFound);
+    let error = ghost
+        .abort()
+        .await
+        .expect_err("unknown upload id must surface on abort");
+    assert_eq!(error.code, rstore_domain::ErrorCode::NotFound);
+}

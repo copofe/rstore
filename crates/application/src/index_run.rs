@@ -98,7 +98,12 @@ impl IndexRunLifecycle {
                 Ok(None)
             }
             RunMode::Rebuild => {
-                catalog.mark_all_stale_in_bucket(self.bucket_id).await?;
+                // Every row that exists when a rebuild begins was confirmed
+                // before it started — the refresh spelling with the run's
+                // own start marks exactly those.
+                catalog
+                    .mark_stale_older_than(self.bucket_id, self.run.started_at)
+                    .await?;
                 self.runs.clear_checkpoint(self.bucket_id).await?;
                 Ok(None)
             }

@@ -1,7 +1,7 @@
 //! Copy/move orchestration: expands source references into per-item work,
-//! proves guards before the first item runs, executes items through the
-//! transfer copy entry, and settles catalog state (including move
-//! completion with verification).
+//! issues guard adapters before the first item runs (and executes through
+//! them), runs items through the transfer copy entry, and settles catalog
+//! state (including move completion with verification).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,6 +13,7 @@ use rstore_domain::remote::ObjectPath;
 use rstore_domain::{Clock, Error, Result};
 use rstore_transfer::{CancellationToken, ProgressSink};
 
+use crate::gateway::RemoteGateway;
 use crate::reference::RemoteUri;
 use crate::transfer::TransferReport;
 
@@ -23,11 +24,18 @@ pub struct CopyPair {
     pub target: String,
 }
 
+#[derive(Clone)]
 struct Item {
     src: Arc<crate::batch_plan::Endpoint>,
     src_path: ObjectPath,
     dst: Arc<crate::batch_plan::Endpoint>,
     dst_path: ObjectPath,
+    /// The guard-issued mutation adapter for the target bucket: the copy
+    /// executes through it, so the guard travels with the item.
+    dst_storage: Arc<dyn rstore_storage_api::Storage>,
+    /// The delete-guarded adapter for a move's source bucket; its presence
+    /// is the move flag.
+    src_delete: Option<Arc<dyn rstore_storage_api::Storage>>,
     source_label: String,
     target_label: String,
 }
@@ -45,7 +53,6 @@ pub struct CopyOptions {
 
     pub config: rstore_transfer::TransferConfig,
 }
-
 /// Validates that every pair has a legal target shape before any work starts.
 ///
 /// Multiple sources, or any expanding directory source, require every target
@@ -74,53 +81,28 @@ pub fn validate_copy_target(pairs: &[CopyPair], recursive: bool) -> Result<()> {
     Ok(())
 }
 
-/// Pre-run guard sweep for a copy/move batch.
-///
-/// Writer guards are proven once per unique target bucket before the first
-/// item runs, so a read-only target fails the run up front instead of
-/// producing N blocked lines and exit 0. Move sources keep their deleter
-/// handles — the per-item code needs the guarded adapter for the final
-/// delete. The item body itself executes through the transfer copy entry,
-/// which owns stat, conflict probing, and routing.
-#[derive(Default)]
-struct CopyHandles {
-    guarded_writers: std::collections::HashSet<rstore_domain::BucketId>,
-    deleters: HashMap<rstore_domain::BucketId, crate::gateway::Deleter>,
-}
+/// Gateway guard-issuance function: [`RemoteGateway::writer`] or
+/// [`RemoteGateway::deleter`].
+type GuardIssue = fn(
+    &crate::gateway::RemoteGateway,
+    Arc<dyn rstore_storage_api::Storage>,
+    &rstore_domain::Bucket,
+) -> rstore_domain::Result<Arc<dyn rstore_storage_api::Storage>>;
 
-impl CopyHandles {
-    /// Proves the target bucket accepts mutations once per unique bucket.
-    fn guard_writer(
-        &mut self,
-        gateway: &crate::gateway::RemoteGateway,
-        endpoint: &crate::batch_plan::Endpoint,
-    ) -> Result<()> {
-        if self.guarded_writers.insert(endpoint.bucket.id) {
-            gateway.writer(endpoint.storage.clone(), &endpoint.bucket)?;
-        }
-        Ok(())
-    }
-
-    /// Resolves (and memoizes) the delete handle for a move source bucket.
-    fn deleter(
-        &mut self,
-        gateway: &crate::gateway::RemoteGateway,
-        endpoint: &crate::batch_plan::Endpoint,
-    ) -> Result<()> {
-        match self.deleters.entry(endpoint.bucket.id) {
-            std::collections::hash_map::Entry::Occupied(_) => Ok(()),
-            std::collections::hash_map::Entry::Vacant(vacant) => {
-                vacant.insert(gateway.deleter(endpoint.storage.clone(), &endpoint.bucket)?);
-                Ok(())
-            }
-        }
-    }
-
-    fn deleter_for(&self, id: &rstore_domain::BucketId) -> &crate::gateway::Deleter {
-        self.deleters
-            .get(id)
-            .expect("deleter guarded before the run")
-    }
+/// Issue a guard adapter once per unique bucket, memoized for the batch.
+fn guarded_once(
+    issued: &mut HashMap<rstore_domain::BucketId, Arc<dyn rstore_storage_api::Storage>>,
+    gateway: &crate::gateway::RemoteGateway,
+    endpoint: &crate::batch_plan::Endpoint,
+    issue: GuardIssue,
+) -> rstore_domain::Result<Arc<dyn rstore_storage_api::Storage>> {
+    use std::collections::hash_map::Entry;
+    Ok(match issued.entry(endpoint.bucket.id) {
+        Entry::Occupied(occupied) => occupied.get().clone(),
+        Entry::Vacant(vacant) => vacant
+            .insert(issue(gateway, endpoint.storage.clone(), &endpoint.bucket)?)
+            .clone(),
+    })
 }
 
 pub struct DefaultCopyService {
@@ -134,7 +116,7 @@ pub struct DefaultCopyService {
 impl DefaultCopyService {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        gateway: crate::gateway::RemoteGateway,
+        gateway: RemoteGateway,
         locator: crate::locator::CatalogLocator,
         jobs: Arc<dyn JobRepository>,
         clock: Arc<dyn Clock>,
@@ -153,13 +135,20 @@ impl DefaultCopyService {
     ///
     /// Endpoints are memoized through `endpoints` so a batch touching one
     /// connection/bucket combination builds its storage adapter only once.
+    /// Guard adapters are issued the same way — one per unique bucket — and
+    /// carried on every item: a read-only target or an undeletable move
+    /// source fails the run here, before any item executes, and the
+    /// adapter the item runs through is the one the guard issued.
     async fn expand(
         &self,
         pairs: &[CopyPair],
         recursive: bool,
+        delete_source: bool,
         endpoints: &mut crate::batch_plan::Endpoints,
     ) -> Result<Vec<Item>> {
         let mut items = Vec::new();
+        let mut writers = HashMap::new();
+        let mut deleters = HashMap::new();
         for pair in pairs {
             let src_uri = RemoteUri::parse(&pair.source)?;
             let dst_uri = RemoteUri::parse(&pair.target)?;
@@ -177,6 +166,18 @@ impl DefaultCopyService {
                     dst_uri.key.clone()
                 };
                 let dst_path = ObjectPath::new(dst_key)?;
+                let dst_storage =
+                    guarded_once(&mut writers, &self.gateway, &dst, RemoteGateway::writer)?;
+                let src_delete = if delete_source {
+                    Some(guarded_once(
+                        &mut deleters,
+                        &self.gateway,
+                        &entry.endpoint,
+                        RemoteGateway::deleter,
+                    )?)
+                } else {
+                    None
+                };
                 items.push(Item {
                     source_label: entry.label.clone(),
                     target_label: dst.label(dst_path.as_str()),
@@ -184,6 +185,8 @@ impl DefaultCopyService {
                     dst: dst.clone(),
                     src_path: entry.path,
                     dst_path,
+                    dst_storage,
+                    src_delete,
                 });
             }
         }
@@ -232,20 +235,9 @@ impl DefaultCopyService {
         validate_copy_target(pairs, options.recursive)?;
         let mut endpoints = crate::batch_plan::Endpoints::default();
         let items = self
-            .expand(pairs, options.recursive, &mut endpoints)
+            .expand(pairs, options.recursive, delete_source, &mut endpoints)
             .await?;
 
-        // Guards ride the gateway's capability handles, resolved once per
-        // unique bucket before any item runs: a read-only target or an
-        // undeletable move source fails the run here instead of producing N
-        // blocked lines and exit 0.
-        let mut handles = CopyHandles::default();
-        for item in &items {
-            handles.guard_writer(&self.gateway, &item.dst)?;
-            if delete_source {
-                handles.deleter(&self.gateway, &item.src)?;
-            }
-        }
         let items = items
             .into_iter()
             .map(|item| {
@@ -254,7 +246,6 @@ impl DefaultCopyService {
                 crate::job_run::RunItem::new(format!("{source} -> {target}"), source, target, item)
             })
             .collect();
-        let handles = &handles;
         crate::job_run::run_items(
             self.jobs.as_ref(),
             self.clock.as_ref(),
@@ -267,61 +258,56 @@ impl DefaultCopyService {
                 let item_cancel = cancel.clone();
                 let item_progress: &dyn ProgressSink = progress;
                 async move {
-                    match self
-                        .one(
-                            &item,
-                            handles,
-                            options,
-                            delete_source,
-                            &item_cancel,
-                            item_progress,
-                        )
-                        .await
-                    {
-                        Ok(step) => step,
-                        Err(e) => crate::job_run::Step::failed(&e),
-                    }
+                    let result = self
+                        .execute_item(&item, options, &item_cancel, item_progress)
+                        .await;
+                    crate::job_run::ItemVerdict::from_engine_result(result)
+                }
+            },
+            |item, verdict| async move {
+                match self.settle_item(&item, verdict, options).await {
+                    Ok(step) => step,
+                    Err(e) => crate::job_run::Step::failed(&e),
                 }
             },
         )
         .await
     }
 
-    /// Copies a single item. The transfer entry owns the source stat, the
-    /// conflict decision, and the same-connection/relay routing; this side
-    /// settles the durable catalog state and finishes moves.
-    async fn one(
+    /// Executes one item through the transfer copy entry. The entry owns the
+    /// source stat, the conflict decision, and the same-connection/relay
+    /// routing; this side only annotates a move's preview.
+    async fn execute_item(
         &self,
         item: &Item,
-        handles: &CopyHandles,
         options: &CopyOptions,
-        delete_source: bool,
         cancel: &rstore_transfer::CancellationToken,
         progress: &dyn rstore_transfer::ProgressSink,
-    ) -> Result<crate::job_run::Step> {
+    ) -> Result<rstore_transfer::ItemOutcome> {
         let Item {
             src,
             dst,
             src_path,
             dst_path,
+            dst_storage,
             ..
         } = item;
 
-        // Guards already ran at the gateway when the run's handles were
-        // built; blocked-before-any-item is the contract here.
+        // The target runs through the guard-issued adapter; the source
+        // stays raw because a copy only reads from it.
         let source = rstore_transfer::CopyEndpoint::new(
             &src.storage,
             src.bucket.connection_id,
             &src.bucket.name,
         );
         let target = rstore_transfer::CopyEndpoint::new(
-            &dst.storage,
+            dst_storage,
             dst.bucket.connection_id,
             &dst.bucket.name,
         );
         let request = rstore_transfer::CopyRequest::new(src_path, dst_path, options.conflict);
 
-        let mut outcome = match rstore_transfer::copy(
+        let mut outcome = rstore_transfer::copy(
             source,
             target,
             &request,
@@ -330,27 +316,39 @@ impl DefaultCopyService {
             &options.config,
             progress,
         )
-        .await
-        {
-            Ok(outcome) => outcome,
-            Err(e) => return Ok(crate::job_run::Step::failed(&e)),
-        };
+        .await?;
 
         // A move's preview names the delete that would follow it.
-        if outcome.dry_run && delete_source {
+        if outcome.dry_run && item.src_delete.is_some() {
             if let Some(detail) = &mut outcome.detail {
                 detail.push_str(" (then delete source)");
             }
         }
+        Ok(outcome)
+    }
 
-        let (disposition, detail) = crate::transfer_report::disposition_from_engine(&outcome);
-        if !disposition.is_success() {
-            return Ok(crate::job_run::Step::done(disposition, detail));
-        }
-        let copied = outcome
-            .metadata
-            .as_ref()
-            .expect("a transferred item carries the adapter's metadata");
+    /// Settles one succeeded copy: receipt plus outbox fact, catalog
+    /// projection, and — for moves — verification and source deletion. A
+    /// failed move verification revises the item to a failure.
+    async fn settle_item(
+        &self,
+        item: &Item,
+        verdict: crate::job_run::ItemVerdict,
+        options: &CopyOptions,
+    ) -> Result<crate::job_run::Step> {
+        // The loop settles only succeeded items, so the verdict is a Done.
+        let bytes = match verdict.step {
+            crate::job_run::Step::Done { bytes, .. } => bytes,
+            crate::job_run::Step::Interrupted => 0,
+        };
+        let Some(copied) = verdict.metadata.as_ref() else {
+            // Settling runs only for succeeded items; those always carry the
+            // adapter's metadata.
+            return Ok(crate::job_run::Step::succeeded());
+        };
+        let Item {
+            src, dst, src_path, ..
+        } = item;
         // The conflict policy may have renamed the target; the adapter's
         // metadata reports the key that actually landed.
         let dst_path = ObjectPath::new(copied.key.clone())?;
@@ -370,16 +368,18 @@ impl DefaultCopyService {
             crate::mutation::CopyFollowUp::new(source, target, copied, options.keep_tags, now);
         let settlement = self.mutations.settle_copy(&follow_up).await;
 
-        if delete_source {
+        // Moves carry the delete-guarded source adapter on the item; its
+        // presence is the move flag.
+        if let Some(delete_storage) = item.src_delete.as_ref() {
             let source = crate::mutation::MoveEndpoint {
-                storage: handles.deleter_for(&src.bucket.id).storage().as_ref(),
+                storage: delete_storage.as_ref(),
                 connection: src.bucket.connection_id,
                 bucket_id: src.bucket.id,
                 bucket_name: &src.bucket.name,
                 path: src_path,
             };
             let target = crate::mutation::MoveEndpoint {
-                storage: dst.storage.as_ref(),
+                storage: item.dst_storage.as_ref(),
                 connection: dst.bucket.connection_id,
                 bucket_id: dst.bucket.id,
                 bucket_name: &dst.bucket.name,
@@ -392,9 +392,9 @@ impl DefaultCopyService {
                     .await
                 {
                     crate::mutation::MoveFinish::Completed => crate::job_run::Step::Done {
-                        disposition,
+                        disposition: crate::batch_outcome::Disposition::Succeeded,
                         detail: None,
-                        bytes: outcome.bytes,
+                        bytes,
                     },
                     crate::mutation::MoveFinish::VerifyFailed(message)
                     | crate::mutation::MoveFinish::DeleteFailed(message) => {
@@ -405,9 +405,9 @@ impl DefaultCopyService {
         }
 
         Ok(crate::job_run::Step::Done {
-            disposition,
+            disposition: crate::batch_outcome::Disposition::Succeeded,
             detail: None,
-            bytes: outcome.bytes,
+            bytes,
         })
     }
 }

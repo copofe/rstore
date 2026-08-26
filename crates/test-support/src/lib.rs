@@ -22,6 +22,6 @@ pub use catalog_contract::{catalog_contract, CatalogFixture};
 pub use clock::TestClock;
 pub use factory::FakeStorageFactory;
 pub use fake::{FakeStorage, StorageMethod};
-pub use storage_contract::storage_contract;
+pub use storage_contract::{multipart_legality_negatives, storage_contract};
 pub use tag_store::InMemoryTagStore;
 pub use temp_db::TempDb;

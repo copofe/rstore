@@ -1,10 +1,11 @@
 //! Command-line argument definitions: the full clap command tree of the CLI.
-//! Every command is dispatched through the Bootstrap-created Application API,
-//! and [`Command::path`] feeds the envelope `command` field.
+//! Every command is dispatched through the Bootstrap-created Application API;
+//! [`parse_command_line`] derives the envelope's `command` identity from the
+//! same tree, so the grammar has exactly one spelling.
 
 use std::path::PathBuf;
 
-use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 
 /// `rstore` — Remote Storage Workbench CLI.
 #[derive(Parser, Debug)]
@@ -123,102 +124,32 @@ pub enum Command {
     Version,
 }
 
-impl Command {
-    /// Dotted path used as the envelope `command` field. The single
-    /// source of command identity — the binary and the library both read it.
-    pub fn path(&self) -> &'static str {
-        match self {
-            Command::Connection { action } => match action {
-                ConnectionCommand::Add { .. } => "connection.add",
-                ConnectionCommand::List { .. } => "connection.list",
-                ConnectionCommand::Show { .. } => "connection.show",
-                ConnectionCommand::Test { .. } => "connection.test",
-                ConnectionCommand::Edit { .. } => "connection.edit",
-                ConnectionCommand::Remove { .. } => "connection.remove",
-            },
-            Command::Bucket { action } => match action {
-                BucketCommand::Discover { .. } => "bucket.discover",
-                BucketCommand::Link { action } => match action {
-                    LinkProfileCommand::Show { .. } => "bucket.link.show",
-                    LinkProfileCommand::Set { .. } => "bucket.link.set",
-                },
-                BucketCommand::Add { .. } => "bucket.add",
-                BucketCommand::List => "bucket.list",
-                BucketCommand::Show { .. } => "bucket.show",
-                BucketCommand::Edit { .. } => "bucket.edit",
-                BucketCommand::Remove { .. } => "bucket.remove",
-                BucketCommand::Ignore { action } => match action {
-                    IgnoreCommand::Add { .. } => "bucket.ignore.add",
-                    IgnoreCommand::List { .. } => "bucket.ignore.list",
-                    IgnoreCommand::Remove { .. } => "bucket.ignore.remove",
-                },
-            },
-            Command::Config { action } => match action {
-                ConfigCommand::Show => "config.show",
-                ConfigCommand::Export { .. } => "config.export",
-                ConfigCommand::Import { .. } => "config.import",
-            },
-            Command::Doctor => "doctor",
-            Command::Version => "version",
-            Command::Workspace { action } => match action {
-                WorkspaceCommand::Create { .. } => "workspace.create",
-                WorkspaceCommand::List => "workspace.list",
-                WorkspaceCommand::Show { .. } => "workspace.show",
-                WorkspaceCommand::Edit { .. } => "workspace.edit",
-                WorkspaceCommand::Remove { .. } => "workspace.remove",
-                WorkspaceCommand::Bucket { action } => match action {
-                    WorkspaceBucketCommand::Add { .. } => "workspace.bucket.add",
-                    WorkspaceBucketCommand::Remove { .. } => "workspace.bucket.remove",
-                    WorkspaceBucketCommand::List { .. } => "workspace.bucket.list",
-                },
-            },
-            Command::Remote { action } => match action {
-                RemoteCommand::Ls { .. } => "remote.ls",
-                RemoteCommand::Stat { .. } => "remote.stat",
-            },
-            Command::Index { action } => match action {
-                IndexCommand::Start { .. } => "index.start",
-                IndexCommand::Status => "index.status",
-                IndexCommand::Stats => "index.stats",
-                IndexCommand::Pause { .. } => "index.pause",
-                IndexCommand::Resume { .. } => "index.resume",
-                IndexCommand::Cancel { .. } => "index.cancel",
-                IndexCommand::Refresh { .. } => "index.refresh",
-                IndexCommand::Rebuild { .. } => "index.rebuild",
-            },
-            Command::Files { action } => match action {
-                FilesCommand::List { .. } => "files.list",
-                FilesCommand::Search { .. } => "files.search",
-                FilesCommand::Show { .. } => "files.show",
-            },
-            Command::Tag { action } => match action {
-                TagCommand::Create { .. } => "tag.create",
-                TagCommand::List { .. } => "tag.list",
-                TagCommand::Edit { .. } => "tag.edit",
-                TagCommand::Remove { .. } => "tag.remove",
-                TagCommand::Merge { .. } => "tag.merge",
-                TagCommand::Add { .. } => "tag.add",
-                TagCommand::Detach { .. } => "tag.detach",
-            },
-            Command::Upload { .. } => "upload",
-            Command::Download { .. } => "download",
-            Command::Cp { .. } => "cp",
-            Command::Mv { .. } => "mv",
-            Command::Rm { .. } => "rm",
-            Command::Task { action } => match action {
-                TaskCommand::List => "task.list",
-                TaskCommand::Show { .. } => "task.show",
-                TaskCommand::Pause { .. } => "task.pause",
-                TaskCommand::Resume { .. } => "task.resume",
-                TaskCommand::Retry { .. } => "task.retry",
-                TaskCommand::Cancel { .. } => "task.cancel",
-            },
-            Command::Url { .. } => "url",
-            Command::Catalog { action } => match action {
-                CatalogCommand::Gc { .. } => "catalog.gc",
-            },
-        }
+/// Parses a command line into the typed grammar plus its dotted command
+/// identity, derived from the clap tree itself — there is no second,
+/// hand-typed spelling of the grammar left to drift.
+///
+/// Exits the process on parse errors, exactly like [`Cli::parse`] would.
+pub fn parse_command_line<I, T>(argv: I) -> (Cli, String)
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let matches = Cli::command()
+        .try_get_matches_from(argv)
+        .unwrap_or_else(|error| error.exit());
+
+    // The matched subcommand chain is the command identity: `rstore bucket
+    // link show` becomes `bucket.link.show`.
+    let mut parts: Vec<&str> = Vec::new();
+    let mut cursor = &matches;
+    while let Some((name, sub)) = cursor.subcommand() {
+        parts.push(name);
+        cursor = sub;
     }
+    let identity = parts.join(".");
+
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+    (cli, identity)
 }
 
 /// Top-level command domains derived from clap's command tree, so command

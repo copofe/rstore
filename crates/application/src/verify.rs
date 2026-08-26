@@ -3,11 +3,12 @@
 //!
 //! The mutation coordinator commits a receipt and an outbox fact in one
 //! transaction; that receipt alone proves local durability, not provider-side
-//! presence. This handler closes the loop: for every `RemoteMutationCompleted`
+//! state. This handler closes the loop: for every `RemoteMutationCompleted`
 //! fact it re-stats the remote object and either lets the event be
-//! acknowledged (object present) or records a repair item (permanent
-//! divergence). Transient provider errors return `Err`, so the dispatcher's
-//! backoff retry applies instead of consuming the event.
+//! acknowledged or records a repair item (permanent divergence). The expected
+//! state follows the operation — uploads and copies must be present, deletes
+//! must be absent. Transient provider errors return `Err`, so the
+//! dispatcher's backoff retry applies instead of consuming the event.
 
 use std::sync::Arc;
 
@@ -69,8 +70,11 @@ impl RemoteVerifyHandler {
         let (locator, operation) = match domain {
             DomainEvent::RemoteMutationCompleted { locator, operation } => (locator, operation),
         };
+        // The operation decides which provider state counts as settled:
+        // everything but a delete must still be present.
+        let expect_present = operation != crate::mutation::MutationOperation::Delete.as_str();
 
-        match self.verify_presence(&locator).await {
+        match self.verify_presence(&locator, expect_present).await {
             // Verified: the dispatcher acknowledges the fact.
             Ok(Ok(())) => Ok(()),
             // Permanent divergence: record it for `repair`, then acknowledge —
@@ -90,6 +94,7 @@ impl RemoteVerifyHandler {
     async fn verify_presence(
         &self,
         locator: &RemoteLocator,
+        expect_present: bool,
     ) -> Result<std::result::Result<(), String>> {
         let bucket = self
             .buckets
@@ -125,12 +130,18 @@ impl RemoteVerifyHandler {
         };
 
         match storage.stat(&bucket.name, &locator.path).await {
-            Ok(_) => Ok(Ok(())),
-            Err(error) if error.code == ErrorCode::NotFound => Ok(Err(format!(
+            Ok(_) if expect_present => Ok(Ok(())),
+            Ok(_) => Ok(Err(format!(
+                "object `{}/{}` still present after delete",
+                bucket.name,
+                locator.path.as_str()
+            ))),
+            Err(error) if error.code == ErrorCode::NotFound && expect_present => Ok(Err(format!(
                 "object `{}/{}` missing after settlement",
                 bucket.name,
                 locator.path.as_str()
             ))),
+            Err(error) if error.code == ErrorCode::NotFound => Ok(Ok(())),
             Err(error) => Err(error),
         }
     }
@@ -143,7 +154,10 @@ impl RemoteVerifyHandler {
         detail: String,
     ) -> Result<()> {
         let item = RepairItem {
-            id: RepairId::new_random(),
+            // Identity derives from the event: a repeat verification of the
+            // same fact refreshes the same repair row.
+            id: RepairId::from_event(event.event_id),
+            event_id: Some(event.event_id),
             receipt_id: None,
             kind: RepairKind::RemoteMutation,
             status: RepairStatus::Required,
@@ -297,8 +311,12 @@ mod tests {
 
         // No object seeded: the write was lost.
         let handler = handler_for(&database, Arc::new(FakeStorageFactory::new()));
+        // The repair's event reference is a foreign key: store the fact
+        // first, as the dispatcher always does.
+        let fact = event(locator(connection, bucket, "lost.txt"));
+        database.outbox().append(&fact).await.unwrap();
         handler
-            .handle(&event(locator(connection, bucket, "lost.txt")))
+            .handle(&fact)
             .await
             .expect("permanent divergence still acknowledges");
 
@@ -355,12 +373,14 @@ mod tests {
         seed_connection(&database, connection).await;
 
         let handler = handler_for(&database, Arc::new(FakeStorageFactory::new()));
+        let fact = event(locator(
+            connection,
+            rstore_domain::BucketId::new_random(),
+            "a.txt",
+        ));
+        database.outbox().append(&fact).await.unwrap();
         handler
-            .handle(&event(locator(
-                connection,
-                rstore_domain::BucketId::new_random(),
-                "a.txt",
-            )))
+            .handle(&fact)
             .await
             .expect("acknowledged with a repair row");
 
@@ -383,6 +403,7 @@ mod tests {
         poison.payload = serde_json::json!({"type": "something_else"});
 
         let handler = handler_for(&database, Arc::new(FakeStorageFactory::new()));
+        database.outbox().append(&poison).await.unwrap();
         handler.handle(&poison).await.expect("poison acknowledged");
         let repairs = database.outbox().repairs(10).await.unwrap();
         assert!(repairs[0]

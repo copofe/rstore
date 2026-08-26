@@ -262,12 +262,12 @@ CREATE INDEX IF NOT EXISTS idx_receipts_job ON remote_mutation_receipts(job_id, 
 CREATE TABLE IF NOT EXISTS repair_items (
     id                TEXT PRIMARY KEY,
     event_id          TEXT REFERENCES outbox_events(event_id) ON DELETE SET NULL,
-    receipt_id        TEXT REFERENCES remote_mutation_receipts(receipt_id) ON DELETE SET NULL,
+    -- No FK on receipt_id: a settlement-failure repair cites exactly the
+    -- receipt that failed to land, so the referenced row may not exist.
+    receipt_id        TEXT,
     kind              TEXT NOT NULL,
     status            TEXT NOT NULL
                       CHECK (status IN ('repair_required', 'resolved')),
-    aggregate_type    TEXT,
-    aggregate_id      TEXT,
     locator_json      TEXT,
     operation         TEXT,
     attempts          INTEGER NOT NULL DEFAULT 0,
@@ -278,10 +278,3 @@ CREATE TABLE IF NOT EXISTS repair_items (
 );
 CREATE INDEX IF NOT EXISTS idx_repair_due
     ON repair_items(status, next_attempt_at, updated_at, id);
-
-CREATE TABLE IF NOT EXISTS consumer_checkpoints (
-    consumer_id    TEXT PRIMARY KEY,
-    last_event_id  TEXT,
-    last_event_at  INTEGER,
-    updated_at     INTEGER NOT NULL
-);

@@ -20,6 +20,13 @@ use crate::multipart::MultipartSession;
 /// in `ObjectPath::new` is enforced at this interface, not hoped for at every
 /// call site. Listing prefixes stay plain strings: a prefix may be empty (the
 /// bucket root) and is never an object address.
+///
+/// The methods split into reads (`list_buckets`, `list`, `stat`, `read`,
+/// `presign`) and writes (`put`, `copy`, `delete`, `create_multipart`,
+/// `adopt_multipart`). The application layer wraps mutation paths in a
+/// write guard that refuses writes on guarded buckets — when adding a
+/// method, classify it there too
+/// (`crates/application/src/guarded_storage.rs`).
 #[async_trait]
 pub trait Storage: Send + Sync {
     /// Human-readable adapter name (e.g. `"s3"`, `"fake"`).

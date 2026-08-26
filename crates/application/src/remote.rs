@@ -306,18 +306,29 @@ impl RemoteService for DefaultRemoteService {
             &rstore_transfer::NullProgressSink,
             cancel,
             |item| async move {
-                match self
-                    .remove_one(
-                        &item.endpoint.bucket,
-                        &item.endpoint.storage,
+                self.remove_one(
+                    &item.endpoint.bucket,
+                    &item.endpoint.storage,
+                    &item.path,
+                    dry_run,
+                )
+                .await
+                .map_or_else(
+                    |e| crate::job_run::ItemVerdict::from_engine_result(Err(e)),
+                    crate::job_run::ItemVerdict::from_step,
+                )
+            },
+            |item, verdict| async move {
+                // Delete settlement needs no engine metadata.
+                self.mutations
+                    .settle_delete(
+                        item.endpoint.bucket.connection_id,
+                        item.endpoint.bucket.id,
                         &item.path,
-                        dry_run,
+                        self.clock.now(),
                     )
-                    .await
-                {
-                    Ok(step) => step,
-                    Err(e) => crate::job_run::Step::failed(&e),
-                }
+                    .await;
+                verdict.step
             },
         )
         .await?;
@@ -327,8 +338,9 @@ impl RemoteService for DefaultRemoteService {
 
 impl DefaultRemoteService {
     /// Removes one object after the delete guard, stat re-verification and
-    /// dry-run. The guard rides the gateway's delete handle: a refused bucket
-    /// becomes a per-item block, which is what a mixed-bucket batch reports.
+    /// dry-run. The guard rides the gateway's delete adapter — reads pass
+    /// it, the delete re-checks the bits — so a refused bucket becomes a
+    /// per-item block, which is what a mixed-bucket batch reports.
     async fn remove_one(
         &self,
         bucket: &rstore_domain::Bucket,
@@ -336,8 +348,8 @@ impl DefaultRemoteService {
         path: &ObjectPath,
         dry_run: bool,
     ) -> Result<crate::job_run::Step> {
-        let deleter = match self.gateway.deleter(storage.clone(), bucket) {
-            Ok(d) => d,
+        let storage = match self.gateway.deleter(storage.clone(), bucket) {
+            Ok(guarded) => guarded,
             Err(e) => {
                 return Ok(crate::job_run::Step::done(
                     Disposition::Blocked(BlockReason::DeleteForbidden),
@@ -362,11 +374,7 @@ impl DefaultRemoteService {
             )));
         }
 
-        deleter.delete(path).await?;
-
-        self.mutations
-            .settle_delete(bucket.connection_id, bucket.id, path, self.clock.now())
-            .await;
+        storage.delete(&bucket.name, path).await?;
         Ok(crate::job_run::Step::succeeded())
     }
 }

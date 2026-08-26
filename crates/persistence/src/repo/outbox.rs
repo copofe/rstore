@@ -151,32 +151,7 @@ impl OutboxRepository {
 impl RepairRepository for OutboxRepository {
     async fn insert(&self, item: &RepairItem) -> Result<()> {
         let _write = self.gate.permit().await?;
-        let now = self.clock.now();
-        sqlx::query(
-            "INSERT INTO repair_items \
-             (id, receipt_id, kind, status, locator_json, operation, attempts, last_error, \
-              next_attempt_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(id) DO UPDATE SET status = excluded.status, \
-                 receipt_id = excluded.receipt_id, \
-                 locator_json = excluded.locator_json, operation = excluded.operation, \
-                 attempts = excluded.attempts, last_error = excluded.last_error, \
-                 next_attempt_at = excluded.next_attempt_at, updated_at = excluded.updated_at",
-        )
-        .bind(item.id.to_string())
-        .bind(item.receipt_id.as_ref().map(ReceiptId::to_string))
-        .bind(item.kind.as_str())
-        .bind(item.status.as_str())
-        .bind(&item.locator)
-        .bind(&item.operation)
-        .bind(i64::from(item.attempts))
-        .bind(&item.last_error)
-        .bind(unix_secs(item.next_attempt_at))
-        .bind(unix_secs(now))
-        .bind(unix_secs(now))
-        .execute(self.gate.pool())
-        .await
-        .map_err(map_sqlx)?;
-        Ok(())
+        upsert_repair(self.gate.pool(), item, self.clock.now()).await
     }
 
     async fn list(&self, limit: u32) -> Result<Vec<RepairItem>> {
@@ -290,14 +265,8 @@ impl OutboxStore for OutboxRepository {
         Ok(())
     }
 
-    async fn retry(
-        &self,
-        event_id: uuid::Uuid,
-        next_attempt_at: OffsetDateTime,
-        error: &str,
-    ) -> Result<()> {
+    async fn retry(&self, event_id: uuid::Uuid, error: &str, now: OffsetDateTime) -> Result<()> {
         let error = error.to_owned();
-        let clock = self.clock.clone();
         self.gate
             .write_unit("outbox retry", move |tx| {
                 Box::pin(async move {
@@ -316,7 +285,6 @@ impl OutboxStore for OutboxRepository {
                     let event = row_to_event(row)?;
                     let attempts = i64::from(event.attempts);
                     if attempts >= MAX_ATTEMPTS {
-                        let now = clock.now();
                         Self::append_event(tx, &event).await?;
                         sqlx::query(
                             "UPDATE outbox_events SET status = 'repair_required', last_error = ? \
@@ -327,29 +295,29 @@ impl OutboxStore for OutboxRepository {
                         .execute(&mut **tx)
                         .await
                         .map_err(map_sqlx)?;
-                        sqlx::query(
-                            "INSERT INTO repair_items \
-                             (id, event_id, kind, status, aggregate_type, aggregate_id, operation, \
-                              attempts, last_error, next_attempt_at, created_at, updated_at) \
-                             VALUES (?, ?, 'outbox_delivery', 'repair_required', ?, ?, ?, 1, ?, ?, ?, ?) \
-                             ON CONFLICT(id) DO UPDATE SET status = 'repair_required', \
-                                 attempts = repair_items.attempts + 1, last_error = excluded.last_error, \
-                                 next_attempt_at = excluded.next_attempt_at, updated_at = excluded.updated_at",
-                        )
-                        .bind(RepairId::from_uuid(event.event_id).to_string())
-                        .bind(event.event_id.to_string())
-                        .bind(&event.aggregate_type)
-                        .bind(&event.aggregate_id)
-                        .bind(&event.event_type)
-                        .bind(&error)
-                        .bind(unix_secs(now))
-                        .bind(unix_secs(now))
-                        .bind(unix_secs(now))
-                        .execute(&mut **tx)
-                        .await
-                        .map_err(map_sqlx)?;
+                        // The dead-letter repair derives its identity from
+                        // the event, so a repeat dead-letter refreshes the
+                        // same row instead of opening another.
+                        let item = RepairItem {
+                            id: RepairId::from_event(event.event_id),
+                            event_id: Some(event.event_id),
+                            receipt_id: None,
+                            kind: RepairKind::OutboxDelivery,
+                            status: RepairStatus::Required,
+                            attempts: event.attempts,
+                            last_error: Some(error.clone()),
+                            next_attempt_at: now,
+                            locator: None,
+                            operation: Some(event.event_type.clone()),
+                        };
+                        upsert_repair(&mut **tx, &item, now).await?;
                         return Ok(());
                     }
+
+                    // Backoff schedule: 2^attempts seconds, bounded so the
+                    // delay never overflows.
+                    let backoff_seconds = 2_i64.pow(event.attempts.clamp(1, 8));
+                    let next_attempt_at = now + time::Duration::seconds(backoff_seconds);
 
                     sqlx::query(
                         "UPDATE outbox_events SET status = 'pending', available_at = ?, last_error = ? \
@@ -379,7 +347,7 @@ impl OutboxStore for OutboxRepository {
 
     async fn repairs(&self, limit: u32) -> Result<Vec<RepairItem>> {
         let rows = sqlx::query(
-            "SELECT id, receipt_id, kind, status, attempts, last_error, next_attempt_at, locator_json, operation \
+            "SELECT id, event_id, receipt_id, kind, status, attempts, last_error, next_attempt_at, locator_json, operation \
              FROM repair_items WHERE status != 'resolved' \
              ORDER BY next_attempt_at, updated_at, id LIMIT ?",
         )
@@ -392,6 +360,11 @@ impl OutboxStore for OutboxRepository {
                 let reader = RowReader::new(row);
                 Ok(RepairItem {
                     id: reader.text("id")?.parse()?,
+                    event_id: reader
+                        .opt_text("event_id")?
+                        .map(|token| token.parse())
+                        .transpose()
+                        .map_err(|e| Error::database("decode repair event id").with_source(e))?,
                     receipt_id: reader
                         .opt_text("receipt_id")?
                         .map(|token| token.parse())
@@ -407,6 +380,42 @@ impl OutboxStore for OutboxRepository {
             })
             .collect()
     }
+}
+
+/// The single repair write path: an upsert keyed by the deterministic
+/// identity, so every producer (including the store's own dead-letter)
+/// shares one statement, one column set, and one attempts rule — the
+/// writer's value wins.
+async fn upsert_repair<'e, E>(executor: E, item: &RepairItem, now: OffsetDateTime) -> Result<()>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    sqlx::query(
+        "INSERT INTO repair_items \
+         (id, event_id, receipt_id, kind, status, locator_json, operation, attempts, last_error, \
+          next_attempt_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(id) DO UPDATE SET status = excluded.status, \
+             event_id = excluded.event_id, receipt_id = excluded.receipt_id, \
+             locator_json = excluded.locator_json, operation = excluded.operation, \
+             attempts = excluded.attempts, last_error = excluded.last_error, \
+             next_attempt_at = excluded.next_attempt_at, updated_at = excluded.updated_at",
+    )
+    .bind(item.id.to_string())
+    .bind(item.event_id.map(|id| id.to_string()))
+    .bind(item.receipt_id.as_ref().map(ReceiptId::to_string))
+    .bind(item.kind.as_str())
+    .bind(item.status.as_str())
+    .bind(&item.locator)
+    .bind(&item.operation)
+    .bind(i64::from(item.attempts))
+    .bind(&item.last_error)
+    .bind(unix_secs(item.next_attempt_at))
+    .bind(unix_secs(now))
+    .bind(unix_secs(now))
+    .execute(executor)
+    .await
+    .map_err(map_sqlx)?;
+    Ok(())
 }
 
 fn row_to_event(row: SqliteRow) -> Result<OutboxEvent> {
@@ -525,13 +534,24 @@ mod tests {
             .await
             .unwrap();
         outbox
-            .retry(EVT2, OffsetDateTime::UNIX_EPOCH, "temporary")
+            .retry(EVT2, "temporary", OffsetDateTime::UNIX_EPOCH)
             .await
             .unwrap();
 
+        // The store owns the backoff schedule: the first failed attempt
+        // (2^1 seconds) holds the event out of the due queue…
         assert_eq!(
             outbox
                 .claim_due(OffsetDateTime::UNIX_EPOCH, 1)
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+        // …and releases it once the backoff elapses.
+        assert_eq!(
+            outbox
+                .claim_due(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(2), 1)
                 .await
                 .unwrap()
                 .len(),
@@ -545,21 +565,25 @@ mod tests {
         let outbox = db.outbox();
         outbox.append(&event(EVT_DEAD)).await.unwrap();
 
-        for attempt in 0..MAX_ATTEMPTS {
-            let claimed = outbox
-                .claim_due(OffsetDateTime::UNIX_EPOCH, 1)
-                .await
-                .unwrap();
+        // Drive the delivery attempts through the store's own backoff
+        // schedule: after the n-th claim, retry pushes the next attempt
+        // 2^n seconds out.
+        let mut now = OffsetDateTime::UNIX_EPOCH;
+        for attempt in 1..=MAX_ATTEMPTS {
+            let claimed = outbox.claim_due(now, 1).await.unwrap();
             assert_eq!(claimed.len(), 1, "attempt {attempt}");
             outbox
-                .retry(EVT_DEAD, OffsetDateTime::UNIX_EPOCH, "consumer failed")
+                .retry(EVT_DEAD, "consumer failed", now)
                 .await
                 .unwrap();
+            now += time::Duration::seconds(2_i64.pow(u32::try_from(attempt).unwrap()));
         }
 
         let repairs = outbox.repairs(10).await.unwrap();
         assert_eq!(repairs.len(), 1);
         assert_eq!(repairs[0].kind, RepairKind::OutboxDelivery);
+        assert_eq!(repairs[0].event_id, Some(EVT_DEAD));
+        assert_eq!(repairs[0].id, RepairId::from_event(EVT_DEAD));
         let status: String =
             sqlx::query_scalar("SELECT status FROM outbox_events WHERE event_id = ?")
                 .bind(EVT_DEAD.to_string())
@@ -567,5 +591,44 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(status, "repair_required");
+
+        // A repeat dead-letter of the same event refreshes the same row
+        // instead of opening another one.
+        outbox
+            .retry(EVT_DEAD, "consumer failed again", now)
+            .await
+            .unwrap();
+        let repairs = outbox.repairs(10).await.unwrap();
+        assert_eq!(repairs.len(), 1);
+        assert!(repairs[0].last_error.as_deref().unwrap().contains("again"));
+    }
+
+    #[tokio::test]
+    async fn repair_insert_upserts_on_the_deterministic_identity() {
+        let db = Database::open_in_memory().await.unwrap();
+        let outbox = db.outbox();
+        let receipt = ReceiptId::new_random();
+        let base = RepairItem {
+            id: RepairId::from_receipt(receipt),
+            event_id: None,
+            receipt_id: Some(receipt),
+            kind: RepairKind::CatalogProjection,
+            status: RepairStatus::Required,
+            attempts: 0,
+            last_error: Some("first failure".into()),
+            next_attempt_at: OffsetDateTime::UNIX_EPOCH,
+            locator: None,
+            operation: Some("copy".into()),
+        };
+
+        outbox.insert(&base).await.unwrap();
+        let mut again = base.clone();
+        again.last_error = Some("second failure".into());
+        outbox.insert(&again).await.unwrap();
+
+        let repairs = outbox.repairs(10).await.unwrap();
+        assert_eq!(repairs.len(), 1, "same receipt, one row");
+        assert_eq!(repairs[0].receipt_id, Some(receipt));
+        assert!(repairs[0].last_error.as_deref().unwrap().contains("second"));
     }
 }

@@ -41,6 +41,7 @@ pub struct DownloadPlan {
 }
 
 /// One executable unit handed to the transfer engine.
+#[derive(Clone)]
 pub(crate) enum EngineItem {
     Upload(UploadRequest),
     Download {

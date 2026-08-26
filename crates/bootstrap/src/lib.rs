@@ -13,7 +13,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use rstore_application::{Application, OutboxDispatcher};
+use rstore_application::Application;
 use rstore_domain::{Clock, Error, Result, SystemClock};
 use rstore_persistence::Database;
 use rstore_platform::{AppDirs, AppLock, LockError};
@@ -54,8 +54,6 @@ pub struct Runtime {
     _lock: Option<AppLock>,
     db: Database,
     application: Application,
-    dispatcher: OutboxDispatcher,
-    verifier: Arc<rstore_application::RemoteVerifyHandler>,
 }
 
 impl Runtime {
@@ -65,18 +63,6 @@ impl Runtime {
         // The configured clock becomes the database's clock: every repository
         // stamp and the application services share one time source.
         let db = Database::open_with_clock(&config.db_path, config.clock.clone()).await?;
-        let outbox = Arc::new(db.outbox());
-        let dispatcher = OutboxDispatcher::new(outbox.clone());
-        dispatcher.recover_processing(config.clock.now()).await?;
-        let verifier = Arc::new(rstore_application::RemoteVerifyHandler::new(
-            rstore_application::RemoteGateway::new(
-                Arc::new(db.connections()),
-                config.storage_factory.clone(),
-            ),
-            Arc::new(db.buckets()),
-            Arc::new(db.outbox()),
-            config.clock.clone(),
-        ));
         let dependencies = rstore_persistence::assemble(&db, config.storage_factory);
         let application = Application::from_dependencies(dependencies)
             .initialize()
@@ -85,8 +71,6 @@ impl Runtime {
             _lock: None,
             db,
             application,
-            dispatcher,
-            verifier,
         })
     }
 
@@ -113,7 +97,7 @@ impl Runtime {
         runtime._lock = Some(lock);
         // Under the write lock: the drain records repairs, so it must respect
         // the single-writer discipline like every other write path.
-        let report = runtime.drain_outbox().await?;
+        let report = runtime.application.drain_outbox().await?;
         if report.claimed > 0 {
             tracing::info!(
                 claimed = report.claimed,
@@ -126,41 +110,11 @@ impl Runtime {
         Ok(runtime)
     }
 
-    /// Deliver every due outbox fact to the remote-verify consumer, looping
-    /// until the backlog is gone or a safety cap of 16 cycles is hit (each
-    /// cycle claims up to one batch).
-    pub async fn drain_outbox(&self) -> Result<rstore_application::DispatchReport> {
-        let mut total = rstore_application::DispatchReport {
-            claimed: 0,
-            published: 0,
-            retried: 0,
-            repair_required: 0,
-        };
-        for _ in 0..16 {
-            let report = self
-                .dispatcher
-                .dispatch_once(self.db.clock().now(), self.verifier.as_ref())
-                .await?;
-            total.claimed += report.claimed;
-            total.published += report.published;
-            total.retried += report.retried;
-            total.repair_required += report.repair_required;
-            if report.claimed == 0 {
-                break;
-            }
-        }
-        Ok(total)
-    }
-
     pub fn application(&self) -> &Application {
         &self.application
     }
 
     pub fn database(&self) -> &Database {
         &self.db
-    }
-
-    pub fn outbox_dispatcher(&self) -> &OutboxDispatcher {
-        &self.dispatcher
     }
 }

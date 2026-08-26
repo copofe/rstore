@@ -62,6 +62,7 @@ impl Endpoints {
 }
 
 /// One planned source item for a remote-side batch operation.
+#[derive(Clone)]
 pub struct RemoteItem {
     pub endpoint: Arc<Endpoint>,
     pub path: ObjectPath,

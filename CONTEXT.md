@@ -26,10 +26,11 @@ terms map to crates. Entries are grouped by concern.
   `(gate, read_pool)` — no construction path can bypass the shared gate.
 - **Startup sequence (`Runtime::open_locked`)** — the complete process-startup
   order: create data directories → take the cross-process write lock → open
-  the database (with the configured clock) → run migrations → recover outbox
-  events stuck in processing → `Application::initialize` (marks orphaned
-  non-terminal jobs interrupted). The returned `Runtime` holds the lock guard
-  for the process lifetime.
+  the database (with the configured clock) → run migrations →
+  `Application::initialize` (startup recovery: orphaned non-terminal jobs are
+  marked interrupted, outbox events stuck mid-processing return to the due
+  queue) → drain the due outbox through the wired remote-verify consumer. The
+  returned `Runtime` holds the lock guard for the process lifetime.
 - **Construction vs recovery** — `Application::from_dependencies` only wires
   services and stays deterministic; `Application::initialize` applies startup
   recovery rules. Deliberately separate so tests can construct without
@@ -47,8 +48,19 @@ terms map to crates. Entries are grouped by concern.
   memory as `Secret<T>`.
 - **Bucket** — a remote bucket registered under a connection, carrying the
   `read_only` and `allow_delete` guard bits. The gateway enforces them at
-  the seam: a `Writer` or `Deleter` handle is only issued when the flags
-  allow the intent, so a use case holding one cannot bypass the guard.
+  the seam by issuing guarded adapters for mutations — never raw ones.
+- **Guarded adapter** — the storage decorator `RemoteGateway::writer` /
+  `deleter` issue over the retry-decorated adapter. The write methods
+  (`put`, `copy`, `delete`, `create_multipart`, `adopt_multipart`) check
+  the guard bits at call time and fail `Forbidden` (`delete` additionally
+  requires `allow_delete`); reads (`stat`, `read`, `list`, `list_buckets`,
+  `presign`) always pass. The guard wraps outside retry, so a refusal is
+  never retried; multipart sessions need no extra guarding because the
+  door — `create/adopt_multipart` — already passed it. Proving the guard
+  and holding the execution adapter are the same object; no business
+  mutation path holds a raw adapter. Connection diagnostics probe
+  credentials, not bucket policy, and use the unguarded adapter by
+  definition.
 - **Workspace** — a local grouping of buckets that scopes catalog rows,
   tags, and ignore rules.
 - **RemoteObject** — the local projection of one remote object in the
@@ -56,7 +68,14 @@ terms map to crates. Entries are grouped by concern.
 - **Job** — the persisted intent and state machine of one batch run
   (pending → running → …); no job survives its process.
 - **Outbox / Repair** — durable recording of remote-change facts, and the
-  queryable record of follow-up failures.
+  queryable record of follow-up failures. Repair identity is deterministic:
+  event-driven repairs (delivery dead-letters, verification divergences)
+  derive their `RepairId` from the outbox event, receipt-driven repairs
+  (settlement/projection failures) from the mutation receipt, so
+  re-recording the same cause upserts one row. One write path
+  (`RepairRepository::insert`) serves every producer; the delivery policy —
+  backoff schedule, attempt ceiling, dead-letter decision — lives entirely
+  in `OutboxStore::retry`.
 - **RemoteMutationReceipt** — the durable fact that a remote operation
   succeeded, committed in the same transaction as its outbox fact.
 - **Storage / StorageFactory** — the provider-neutral storage port and its
@@ -66,8 +85,21 @@ terms map to crates. Entries are grouped by concern.
   probe and rename re-entry live here and nowhere else), route
   same-connection copies to provider-side `Storage::copy` and
   cross-connection copies to the internal relay, and report through
-  `ItemOutcome`, including dry-run previews. Gateway `Writer` handles remain
-  the write-guard proof; settlement stays with the mutation coordinator.
+  `ItemOutcome`, including dry-run previews. Guarded adapters from the
+  gateway remain the write-guard proof; settlement stays with the mutation
+  coordinator.
+
+## Batch execution
+
+- **Run loop (`job_run::run_items`)** — the one batch execution harness for
+  upload, download, copy, move, and removal jobs. It owns the verdict
+  vocabulary (`ItemVerdict` → `Step` → report item), the settle-on-success
+  hook (every successful remote mutation is settled exactly here, before it
+  is counted; a settlement may revise the verdict, as a failed move
+  verification does), the one cancellation interpretation (`Cancelled`
+  interrupts the run), and the single terminal-state commit. Services supply
+  per-item execution and settlement; they no longer call settlements
+  inline.
 
 ## Multipart sessions
 

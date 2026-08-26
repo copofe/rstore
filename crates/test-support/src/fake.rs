@@ -656,7 +656,8 @@ impl MultipartSession for FakeMultipartSession {
 
     async fn abort(&self) -> Result<()> {
         self.store.fault(StorageMethod::AbortMultipart)?;
-        self.store
+        let removed = self
+            .store
             .uploads
             .lock()
             .expect("fake store poisoned")
@@ -665,6 +666,11 @@ impl MultipartSession for FakeMultipartSession {
                 self.key.clone(),
                 self.upload_id.clone(),
             ));
+        if !removed {
+            // Abort is strict: an unknown upload id surfaces, exactly like
+            // the provider's NoSuchUpload.
+            return Err(Error::not_found("multipart upload not found"));
+        }
         self.store
             .parts
             .lock()
@@ -738,6 +744,7 @@ mod tests {
         let s = FakeStorage::new();
         s.seed_bucket("b");
         crate::storage_contract(&s, "b").await;
+        crate::multipart_legality_negatives(&s, "b").await;
     }
 
     #[tokio::test]
@@ -820,67 +827,5 @@ mod tests {
         let meta = upload.complete(&[part]).await.unwrap();
         assert_eq!(meta.size, 5);
         assert_eq!(s.active_upload_count(), 0);
-    }
-
-    /// The S3 legality rules the fake enforces at completion.
-    #[tokio::test]
-    async fn complete_multipart_rejects_illegal_part_lists() {
-        use rstore_storage_api::model::UploadedPart;
-        let s = FakeStorage::new();
-        let key = ObjectPath::new("illegal.bin").unwrap();
-
-        // Undersized non-final part.
-        let upload = s
-            .create_multipart("b", &key, &PutOptions::default())
-            .await
-            .unwrap();
-        let small = UploadedPart {
-            part_number: 1,
-            etag: "etag-1".into(),
-            size: 10,
-        };
-        let tail = upload
-            .upload_part(2, Bytes::from_static(b"tail"))
-            .await
-            .unwrap();
-        let error = upload.complete(&[small, tail]).await.unwrap_err();
-        assert_eq!(error.code, ErrorCode::InvalidInput);
-
-        // Fabricated etag (never issued by an UploadPart).
-        let forged = UploadedPart {
-            part_number: 1,
-            etag: "forged".into(),
-            size: 5,
-        };
-        let error = upload.complete(&[forged]).await.unwrap_err();
-        assert_eq!(error.code, ErrorCode::InvalidInput);
-        upload.abort().await.unwrap();
-
-        // Duplicate part numbers.
-        let upload = s
-            .create_multipart("b", &key, &PutOptions::default())
-            .await
-            .unwrap();
-        let first = upload
-            .upload_part(1, Bytes::from_static(b"one"))
-            .await
-            .unwrap();
-        let duplicate = UploadedPart {
-            etag: first.etag.clone(),
-            ..first.clone()
-        };
-        let error = upload
-            .complete(&[first.clone(), duplicate])
-            .await
-            .unwrap_err();
-        assert_eq!(error.code, ErrorCode::InvalidInput);
-
-        // Descending order.
-        let second = upload
-            .upload_part(2, Bytes::from_static(b"two"))
-            .await
-            .unwrap();
-        let error = upload.complete(&[second, first]).await.unwrap_err();
-        assert_eq!(error.code, ErrorCode::InvalidInput);
     }
 }
