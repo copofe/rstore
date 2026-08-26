@@ -31,7 +31,7 @@ use rstore_storage_api::model::ObjectMetadata;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::ports::{RepairPort, UnitOfWorkPort};
+use rstore_application_ports::deps::{RepairPort, UnitOfWorkPort};
 
 /// Kind of remote mutation being settled.
 #[derive(Debug, Clone, Copy)]

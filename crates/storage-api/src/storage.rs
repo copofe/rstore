@@ -29,9 +29,6 @@ use crate::multipart::MultipartSession;
 /// (`crates/application/src/guarded_storage.rs`).
 #[async_trait]
 pub trait Storage: Send + Sync {
-    /// Human-readable adapter name (e.g. `"s3"`, `"fake"`).
-    fn name(&self) -> &str;
-
     /// List buckets visible to these credentials. Providers or policies that
     /// forbid the call surface a typed error rather than an empty list.
     async fn list_buckets(&self) -> Result<Vec<BucketSummary>>;

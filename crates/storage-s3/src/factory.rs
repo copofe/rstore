@@ -35,7 +35,10 @@ fn normalize_endpoint(endpoint: &str) -> String {
 
 /// Builds a configured S3 client for a connection. This is the one place
 /// credential plaintext is exposed to the SDK (`expose()`).
-pub fn build_client(config: &ConnectionConfig, creds: &StorageCredentials) -> aws_sdk_s3::Client {
+pub(crate) fn build_client(
+    config: &ConnectionConfig,
+    creds: &StorageCredentials,
+) -> aws_sdk_s3::Client {
     let mut builder = aws_sdk_s3::Config::builder()
         .behavior_version(BehaviorVersion::latest())
         .region(aws_sdk_s3::config::Region::new(region_string(

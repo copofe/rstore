@@ -155,10 +155,6 @@ async fn copy_parts_loop(
 
 #[async_trait]
 impl Storage for S3Storage {
-    fn name(&self) -> &str {
-        "s3"
-    }
-
     async fn list_buckets(&self) -> Result<Vec<BucketSummary>> {
         let out = self.client.list_buckets().send().await.map_err(map_sdk)?;
         let mut buckets = Vec::new();

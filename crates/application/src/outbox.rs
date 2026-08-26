@@ -6,7 +6,7 @@
 //! repair item that diagnostics can query.
 
 use async_trait::async_trait;
-use rstore_application_ports::{OutboxEvent, OutboxStore, RepairItem, RepairStore};
+use rstore_application_ports::{OutboxEvent, OutboxStore, RepairStore};
 use rstore_domain::Result;
 use std::sync::Arc;
 use time::OffsetDateTime;
@@ -45,12 +45,6 @@ impl OutboxDispatcher {
             repairs,
             batch_size: 64,
         }
-    }
-
-    /// Override the per-cycle batch size (clamped to at least 1).
-    pub fn with_batch_size(mut self, batch_size: u32) -> Self {
-        self.batch_size = batch_size.max(1);
-        self
     }
 
     /// Reclaim events left in `processing` by a dead dispatcher so they become claimable
@@ -95,10 +89,5 @@ impl OutboxDispatcher {
             retried,
             repair_required,
         })
-    }
-
-    /// List pending repair items, most pressing first, up to `limit`.
-    pub async fn repairs(&self, limit: u32) -> Result<Vec<RepairItem>> {
-        self.repairs.list(limit).await
     }
 }

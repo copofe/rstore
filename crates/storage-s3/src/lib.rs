@@ -9,4 +9,4 @@ pub mod factory;
 mod multipart;
 
 pub use adapter::S3Storage;
-pub use factory::{build_client, S3StorageFactory};
+pub use factory::S3StorageFactory;

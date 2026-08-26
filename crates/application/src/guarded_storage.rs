@@ -102,10 +102,6 @@ impl GuardedStorage {
 
 #[async_trait]
 impl Storage for GuardedStorage {
-    fn name(&self) -> &str {
-        self.storage.name()
-    }
-
     async fn list_buckets(&self) -> Result<Vec<rstore_storage_api::model::BucketSummary>> {
         self.storage.list_buckets().await
     }

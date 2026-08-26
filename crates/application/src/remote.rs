@@ -116,18 +116,6 @@ pub trait RemoteService: Send + Sync {
         dry_run: bool,
         cancel: &rstore_transfer::CancellationToken,
     ) -> Result<RemoveReport>;
-
-    /// Plans and executes a removal in one call.
-    async fn remove(
-        &self,
-        uris: &[String],
-        recursive: bool,
-        dry_run: bool,
-        cancel: &rstore_transfer::CancellationToken,
-    ) -> Result<RemoveReport> {
-        let plan = self.plan_removals(uris, recursive).await?;
-        self.remove_planned(plan, dry_run, cancel).await
-    }
 }
 
 /// The concrete set of items a removal run will process.

@@ -19,7 +19,6 @@ pub mod retrying_storage;
 pub mod run;
 
 pub use cancel::CancellationToken;
-pub use conflict::{decide_target, stat_probe, TargetDecision};
 pub use copy::{copy, CopyEndpoint, CopyRequest};
 pub use engine::{DownloadRequest, TransferEngine, UploadRequest};
 pub use progress::{NullProgressSink, Progress, ProgressSink};

@@ -29,7 +29,6 @@ pub mod link;
 pub mod locator;
 pub(crate) mod mutation;
 pub mod outbox;
-pub mod ports;
 pub mod reference;
 pub mod remote;
 pub(crate) mod settlement;
@@ -67,12 +66,12 @@ pub use link::{
     parse_ttl, resolve_link_base, GeneratedLink, LinkFormat, LinkProfileInput, LinkRequest,
 };
 pub use outbox::{DispatchReport, OutboxDispatcher, OutboxHandler};
-pub use ports::{
+pub use reference::{expand_reference, expand_references, RemoteUri};
+pub use remote::{LsEntry, LsResult, RemoteService, RemoveReport};
+pub use rstore_application_ports::{
     ApplicationDependencies, CatalogDependencies, RegistryDependencies, RuntimeDependencies,
     TransferDependencies,
 };
-pub use reference::{expand_reference, expand_references, RemoteUri};
-pub use remote::{LsEntry, LsResult, RemoteService, RemoveReport};
 pub use rstore_catalog::{FileFilter, FileSort, PageRequest, SortField, SortOrder};
 pub use tag::{CreateTagInput, MergeReport, TagRef, TagService, UpdateTagInput};
 pub use transfer::{

@@ -103,23 +103,8 @@ impl CatalogLocator {
         Ok((config, bucket, storage))
     }
 
-    /// [`Self::resolve_pair`] plus a connected adapter.
-    pub async fn resolve_pair_target(
-        &self,
-        connection: &crate::connection::ConnectionRef,
-        bucket: &str,
-    ) -> Result<(
-        ConnectionConfig,
-        rstore_domain::Bucket,
-        Arc<dyn rstore_storage_api::Storage>,
-    )> {
-        let (config, bucket) = self.resolve_pair(connection, bucket).await?;
-        let storage = self.storage_for(&config, None).await?;
-        Ok((config, bucket, storage))
-    }
-
-    /// [`Self::resolve_pair_target`] with the caller's run policy and
-    /// cancellation token decorating the adapter.
+    /// [`Self::resolve_pair`] with the caller's run policy and cancellation
+    /// token decorating the adapter.
     pub async fn resolve_pair_target_with_retry(
         &self,
         connection: &crate::connection::ConnectionRef,

@@ -253,7 +253,6 @@ impl DefaultTransferService {
         // read-only target fails here before any item runs.
         let storage = self.gateway.writer(storage, &bucket)?;
 
-        let engine = TransferEngine::new(storage, self.checkpoints.clone());
         let items = crate::transfer_plan::upload_items(prepared, config.id, &bucket.name)
             .into_iter()
             .map(EngineItem::into_run_item)
@@ -265,7 +264,7 @@ impl DefaultTransferService {
             bucket,
             progress,
             cancel,
-            &engine,
+            storage,
             options.config,
         )
         .await
@@ -297,7 +296,6 @@ impl DefaultTransferService {
         .map(EngineItem::into_run_item)
         .collect();
 
-        let engine = TransferEngine::new(storage, self.checkpoints.clone());
         self.execute(
             JobKind::Download,
             items,
@@ -305,7 +303,7 @@ impl DefaultTransferService {
             bucket,
             progress,
             cancel,
-            &engine,
+            storage,
             options.config,
         )
         .await
@@ -348,9 +346,10 @@ impl DefaultTransferService {
         bucket: rstore_domain::Bucket,
         progress: &dyn ProgressSink,
         cancel: &CancellationToken,
-        engine: &TransferEngine,
+        storage: Arc<dyn rstore_storage_api::Storage>,
         config: TransferConfig,
     ) -> Result<TransferReport> {
+        let engine = TransferEngine::new(storage, self.checkpoints.clone());
         let context = rstore_transfer::RunContext::new(cancel, config, progress);
         crate::job_run::run_items(
             self.jobs.as_ref(),
@@ -362,6 +361,7 @@ impl DefaultTransferService {
             cancel,
             |item| {
                 let context = &context;
+                let engine = &engine;
                 async move {
                     if dry_run {
                         return crate::job_run::ItemVerdict::preview(item.preview());

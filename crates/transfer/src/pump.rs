@@ -18,7 +18,7 @@ use crate::progress::Progress;
 /// already-stored length — so both the ranges and the progress base model
 /// resume in one place.
 #[derive(Debug, Clone, Copy)]
-pub struct ChunkPlan {
+pub(crate) struct ChunkPlan {
     start: u64,
     total: u64,
     chunk: u64,
@@ -76,7 +76,7 @@ impl ChunkPlan {
 }
 
 /// A ranged-read producer: one (storage, bucket, key) serving chunk bytes.
-pub struct RangedSource<'a> {
+pub(crate) struct RangedSource<'a> {
     storage: &'a dyn Storage,
     bucket: &'a str,
     key: &'a ObjectPath,
@@ -99,7 +99,7 @@ impl<'a> RangedSource<'a> {
 /// Consumer of one chunk's bytes. `index` is the 0-based plan position (its
 /// 1-based value is the multipart part number for part-shaped consumers).
 #[async_trait]
-pub trait ChunkSink {
+pub(crate) trait ChunkSink {
     async fn accept(&mut self, index: usize, body: Bytes) -> Result<()>;
 }
 

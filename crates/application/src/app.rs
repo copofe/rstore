@@ -8,12 +8,12 @@
 
 use std::sync::Arc;
 
+use rstore_application_ports::ApplicationDependencies;
 use rstore_domain::Result;
 
 use crate::bucket::DefaultBucketService;
 use crate::connection::DefaultConnectionService;
 use crate::gateway::RemoteGateway;
-use crate::ports::ApplicationDependencies;
 
 /// The wired application.
 ///

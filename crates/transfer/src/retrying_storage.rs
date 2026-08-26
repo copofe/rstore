@@ -89,10 +89,6 @@ impl RetryingStorage {
 
 #[async_trait]
 impl Storage for RetryingStorage {
-    fn name(&self) -> &str {
-        self.inner.name()
-    }
-
     async fn list_buckets(&self) -> Result<Vec<BucketSummary>> {
         self.retry("list_buckets", || self.inner.list_buckets())
             .await
