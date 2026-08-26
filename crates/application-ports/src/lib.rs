@@ -370,11 +370,11 @@ pub struct RepairItem {
     pub operation: Option<String>,
 }
 
-/// Persistence port for repair records. [`RepairRepository::insert`] is the
+/// Persistence port for repair records. [`RepairStore::insert`] is the
 /// single write path — a plain upsert keyed by the deterministic identity —
-/// shared by every producer, including the store's own dead-letter.
+/// shared by every producer, including the outbox's own dead-letter.
 #[async_trait]
-pub trait RepairRepository: Send + Sync {
+pub trait RepairStore: Send + Sync {
     async fn insert(&self, item: &RepairItem) -> Result<()>;
     async fn list(&self, limit: u32) -> Result<Vec<RepairItem>>;
     async fn resolve(&self, id: RepairId, at: OffsetDateTime) -> Result<bool>;
@@ -407,12 +407,13 @@ pub trait RemoteMutationRepository: Send + Sync {
     async fn get(&self, receipt_id: ReceiptId) -> Result<Option<RemoteMutationReceipt>>;
 }
 
-/// Reliable outbox/repair port. The first implementation is SQLite-backed;
+/// Reliable outbox-delivery port. The first implementation is SQLite-backed;
 /// the interface is intentionally independent of a worker or UI runtime.
 ///
 /// Delivery policy lives here in its entirety: [`OutboxStore::retry`] owns
 /// the backoff schedule and the exhausted-attempts dead-letter decision, so
-/// no dispatcher can drift from it.
+/// no dispatcher can drift from it. Repair records are a separate lifecycle
+/// behind [`RepairStore`].
 #[async_trait]
 pub trait OutboxStore: Send + Sync {
     async fn append(&self, event: &OutboxEvent) -> Result<()>;
@@ -423,7 +424,6 @@ pub trait OutboxStore: Send + Sync {
     /// policy, or — once attempts are exhausted — dead-letters the event
     /// into a repair row derived from the event's identity.
     async fn retry(&self, event_id: uuid::Uuid, error: &str, now: OffsetDateTime) -> Result<()>;
-    async fn repairs(&self, limit: u32) -> Result<Vec<RepairItem>>;
 }
 
 /// Versioned event envelope stored by the outbox.

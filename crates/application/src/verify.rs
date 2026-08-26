@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use rstore_application_ports::{
-    BucketStore, OutboxEvent, RepairItem, RepairKind, RepairRepository, RepairStatus,
+    BucketStore, OutboxEvent, RepairItem, RepairKind, RepairStatus, RepairStore,
 };
 use rstore_domain::events::DomainEvent;
 use rstore_domain::id::RepairId;
@@ -35,7 +35,7 @@ use crate::outbox::OutboxHandler;
 pub struct RemoteVerifyHandler {
     gateway: RemoteGateway,
     buckets: Arc<dyn BucketStore>,
-    repairs: Arc<dyn RepairRepository>,
+    repairs: Arc<dyn RepairStore>,
     clock: Arc<dyn Clock>,
 }
 
@@ -44,7 +44,7 @@ impl RemoteVerifyHandler {
     pub fn new(
         gateway: RemoteGateway,
         buckets: Arc<dyn BucketStore>,
-        repairs: Arc<dyn RepairRepository>,
+        repairs: Arc<dyn RepairStore>,
         clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
@@ -277,7 +277,7 @@ mod tests {
         RemoteVerifyHandler::new(
             gateway,
             Arc::new(db.buckets()),
-            Arc::new(db.outbox()),
+            Arc::new(db.repairs()),
             db.clock(),
         )
     }
@@ -298,7 +298,7 @@ mod tests {
             .handle(&event(locator(connection, bucket, "a.txt")))
             .await
             .expect("verified fact acknowledges");
-        assert!(database.outbox().repairs(10).await.unwrap().is_empty());
+        assert!(database.repairs().list(10).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -320,7 +320,7 @@ mod tests {
             .await
             .expect("permanent divergence still acknowledges");
 
-        let repairs = database.outbox().repairs(10).await.unwrap();
+        let repairs = database.repairs().list(10).await.unwrap();
         assert_eq!(repairs.len(), 1);
         assert_eq!(repairs[0].kind, RepairKind::RemoteMutation);
         assert!(matches!(repairs[0].status, RepairStatus::Required));
@@ -356,7 +356,7 @@ mod tests {
                 .is_err(),
             "transient failure must stay queued"
         );
-        assert!(database.outbox().repairs(10).await.unwrap().is_empty());
+        assert!(database.repairs().list(10).await.unwrap().is_empty());
 
         // Outage over: the same event now verifies cleanly.
         factory.storage().clear_fault(StorageMethod::Stat);
@@ -384,7 +384,7 @@ mod tests {
             .await
             .expect("acknowledged with a repair row");
 
-        let repairs = database.outbox().repairs(10).await.unwrap();
+        let repairs = database.repairs().list(10).await.unwrap();
         assert!(repairs[0]
             .last_error
             .as_deref()
@@ -405,7 +405,7 @@ mod tests {
         let handler = handler_for(&database, Arc::new(FakeStorageFactory::new()));
         database.outbox().append(&poison).await.unwrap();
         handler.handle(&poison).await.expect("poison acknowledged");
-        let repairs = database.outbox().repairs(10).await.unwrap();
+        let repairs = database.repairs().list(10).await.unwrap();
         assert!(repairs[0]
             .last_error
             .as_deref()
@@ -427,7 +427,8 @@ mod tests {
             .await
             .unwrap();
 
-        let dispatcher = crate::outbox::OutboxDispatcher::new(store.clone());
+        let dispatcher =
+            crate::outbox::OutboxDispatcher::new(store.clone(), Arc::new(database.repairs()));
         let handler = handler_for(&database, Arc::new(FakeStorageFactory::new()));
         let report = dispatcher.dispatch_once(now(), &handler).await.unwrap();
 

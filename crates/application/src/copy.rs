@@ -24,8 +24,18 @@ pub struct CopyPair {
     pub target: String,
 }
 
+/// Whether an expanded pair copies or moves: moves verify the target and
+/// delete the source after the copy lands. The kind and the item's delete
+/// adapter are issued together by expansion, so a `Move` always carries one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ItemKind {
+    Copy,
+    Move,
+}
+
 #[derive(Clone)]
 pub(crate) struct Item {
+    pub(crate) kind: ItemKind,
     pub(crate) src: Arc<crate::batch_plan::Endpoint>,
     pub(crate) src_path: ObjectPath,
     pub(crate) dst: Arc<crate::batch_plan::Endpoint>,
@@ -33,8 +43,8 @@ pub(crate) struct Item {
     /// The guard-issued mutation adapter for the target bucket: the copy
     /// executes through it, so the guard travels with the item.
     pub(crate) dst_storage: Arc<dyn rstore_storage_api::Storage>,
-    /// The delete-guarded adapter for a move's source bucket; its presence
-    /// is the move flag.
+    /// The delete-guarded adapter for a move's source bucket; present
+    /// exactly when `kind` is [`ItemKind::Move`].
     pub(crate) src_delete: Option<Arc<dyn rstore_storage_api::Storage>>,
     source_label: String,
     target_label: String,
@@ -45,6 +55,7 @@ impl Item {
     /// Test-only direct assembly (labels are empty): settlement tests build
     /// items without the expansion pipeline.
     pub(crate) fn for_test(
+        kind: ItemKind,
         src: Arc<crate::batch_plan::Endpoint>,
         src_path: ObjectPath,
         dst: Arc<crate::batch_plan::Endpoint>,
@@ -52,7 +63,13 @@ impl Item {
         dst_storage: Arc<dyn rstore_storage_api::Storage>,
         src_delete: Option<Arc<dyn rstore_storage_api::Storage>>,
     ) -> Self {
+        debug_assert_eq!(
+            (kind == ItemKind::Move),
+            src_delete.is_some(),
+            "a move carries the delete-guarded adapter, a copy does not"
+        );
         Self {
+            kind,
             src,
             src_path,
             dst,
@@ -130,6 +147,24 @@ fn guarded_once(
     })
 }
 
+/// Settle hook for copy/move runs: hands each succeeded item to the
+/// copy/move settlement module.
+struct CopySettle {
+    settlement: crate::settlement::Settlement,
+    keep_tags: bool,
+}
+
+#[async_trait::async_trait]
+impl crate::job_run::SettleHook<Item> for CopySettle {
+    async fn settle(
+        &self,
+        item: Item,
+        verdict: crate::job_run::ItemVerdict,
+    ) -> crate::job_run::Step {
+        self.settlement.settle(&item, verdict, self.keep_tags).await
+    }
+}
+
 pub struct DefaultCopyService {
     gateway: crate::gateway::RemoteGateway,
     locator: crate::locator::CatalogLocator,
@@ -193,17 +228,21 @@ impl DefaultCopyService {
                 let dst_path = ObjectPath::new(dst_key)?;
                 let dst_storage =
                     guarded_once(&mut writers, &self.gateway, &dst, RemoteGateway::writer)?;
-                let src_delete = if delete_source {
-                    Some(guarded_once(
-                        &mut deleters,
-                        &self.gateway,
-                        &entry.endpoint,
-                        RemoteGateway::deleter,
-                    )?)
+                let (kind, src_delete) = if delete_source {
+                    (
+                        ItemKind::Move,
+                        Some(guarded_once(
+                            &mut deleters,
+                            &self.gateway,
+                            &entry.endpoint,
+                            RemoteGateway::deleter,
+                        )?),
+                    )
                 } else {
-                    None
+                    (ItemKind::Copy, None)
                 };
                 items.push(Item {
+                    kind,
                     source_label: entry.label.clone(),
                     target_label: dst.label(dst_path.as_str()),
                     src: entry.endpoint.clone(),
@@ -289,9 +328,9 @@ impl DefaultCopyService {
                     crate::job_run::ItemVerdict::from_engine_result(result)
                 }
             },
-            |item, verdict| {
-                let keep_tags = options.keep_tags;
-                async move { self.settlement.settle(&item, verdict, keep_tags).await }
+            &CopySettle {
+                settlement: self.settlement.clone(),
+                keep_tags: options.keep_tags,
             },
         )
         .await
@@ -335,7 +374,7 @@ impl DefaultCopyService {
             rstore_transfer::copy(source, target, &request, options.dry_run, &ctx).await?;
 
         // A move's preview names the delete that would follow it.
-        if outcome.disposition.is_not_run() && item.src_delete.is_some() {
+        if outcome.disposition.is_not_run() && item.kind == ItemKind::Move {
             if let Some(detail) = &mut outcome.detail {
                 detail.push_str(" (then delete source)");
             }

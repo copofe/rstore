@@ -6,7 +6,7 @@
 //! repair item that diagnostics can query.
 
 use async_trait::async_trait;
-use rstore_application_ports::{OutboxEvent, OutboxStore, RepairItem};
+use rstore_application_ports::{OutboxEvent, OutboxStore, RepairItem, RepairStore};
 use rstore_domain::Result;
 use std::sync::Arc;
 use time::OffsetDateTime;
@@ -33,14 +33,16 @@ pub trait OutboxHandler: Send + Sync {
 #[derive(Clone)]
 pub struct OutboxDispatcher {
     store: Arc<dyn OutboxStore>,
+    repairs: Arc<dyn RepairStore>,
     batch_size: u32,
 }
 
 impl OutboxDispatcher {
     /// A dispatcher with the default batch size of 64 events per cycle.
-    pub fn new(store: Arc<dyn OutboxStore>) -> Self {
+    pub fn new(store: Arc<dyn OutboxStore>, repairs: Arc<dyn RepairStore>) -> Self {
         Self {
             store,
+            repairs,
             batch_size: 64,
         }
     }
@@ -86,7 +88,7 @@ impl OutboxDispatcher {
                 }
             }
         }
-        let repair_required = self.store.repairs(self.batch_size).await?.len() as u32;
+        let repair_required = self.repairs.list(self.batch_size).await?.len() as u32;
         Ok(DispatchReport {
             claimed,
             published,
@@ -97,7 +99,7 @@ impl OutboxDispatcher {
 
     /// List pending repair items, most pressing first, up to `limit`.
     pub async fn repairs(&self, limit: u32) -> Result<Vec<RepairItem>> {
-        self.store.repairs(limit).await
+        self.repairs.list(limit).await
     }
 }
 
@@ -137,8 +139,9 @@ mod tests {
     async fn successful_dispatch_acknowledges_the_event() {
         let db = Database::open_in_memory().await.unwrap();
         let store = Arc::new(db.outbox());
+        let repairs: Arc<dyn rstore_application_ports::RepairStore> = Arc::new(db.repairs());
         store.append(&event()).await.unwrap();
-        let dispatcher = OutboxDispatcher::new(store.clone());
+        let dispatcher = OutboxDispatcher::new(store.clone(), repairs);
         let report = dispatcher
             .dispatch_once(OffsetDateTime::UNIX_EPOCH, &NoopOutboxHandler)
             .await

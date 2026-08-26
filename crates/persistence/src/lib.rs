@@ -21,6 +21,7 @@ pub use repo::multipart::SqliteMultipartStore;
 pub use repo::outbox::OutboxRepository;
 pub use repo::receipt::SqliteRemoteMutationRepository;
 pub use repo::remote_object::SqliteRemoteObjectRepository;
+pub use repo::repair::RepairRepository;
 pub use repo::settings::SettingsRepository;
 pub use repo::tag::TagRepository;
 pub use repo::workspace::WorkspaceRepository;
@@ -276,9 +277,14 @@ impl Database {
         SqliteMultipartStore::new(self.gate(), self.read_pool.clone(), self.clock.clone())
     }
 
-    /// The domain-event outbox and repair queue.
+    /// The domain-event outbox and its delivery lifecycle.
     pub fn outbox(&self) -> OutboxRepository {
-        OutboxRepository::new(self.gate(), self.read_pool.clone(), self.clock.clone())
+        OutboxRepository::new(self.gate())
+    }
+
+    /// The repair queue for failed follow-ups.
+    pub fn repairs(&self) -> RepairRepository {
+        RepairRepository::new(self.gate(), self.read_pool.clone(), self.clock.clone())
     }
 
     /// Read access to completed remote-mutation receipts.
@@ -496,7 +502,7 @@ pub fn assemble(
             clock: db.clock(),
             storage_factory,
             unit_of_work: Arc::new(db.clone()),
-            repairs: Arc::new(db.outbox()),
+            repairs: Arc::new(db.repairs()),
             outbox: Arc::new(db.outbox()),
         },
     )

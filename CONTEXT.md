@@ -76,16 +76,20 @@ terms map to crates. Entries are grouped by concern.
   catalog, including its tombstone lifecycle.
 - **Job** — the persisted intent and state machine of one batch run
   (pending → running → …); no job survives its process.
-- **Outbox / Repair** — durable recording of remote-change facts, and the
-  queryable record of follow-up failures. Repair identity is deterministic:
-  event-driven repairs (delivery dead-letters, verification divergences)
-  derive their `RepairId` from the outbox event, receipt-driven repairs
-  (settlement/projection failures) from the mutation receipt, so
-  re-recording the same cause upserts one row. One write path
-  (`RepairRepository::insert`) serves every producer; the delivery policy —
-  backoff schedule, attempt ceiling, dead-letter decision — lives entirely
-  in `OutboxStore::retry`, as the pure `delivery_decision` function plus
-  its transactional write.
+- **Outbox / Repair** — two separate durable lifecycles: the outbox records
+  remote-change facts for delivery, while the repair store records queryable
+  follow-up failures. `OutboxStore` owns append, ordering, claiming,
+  acknowledgement, retry, and dead-lettering; `RepairStore` owns repair
+  insert, list, and resolve, backed by the SQLite `RepairRepository` adapter.
+  Repair identity is deterministic: event-driven repairs (delivery
+  dead-letters, verification divergences) derive their `RepairId` from the
+  outbox event, receipt-driven repairs (settlement/projection failures) from
+  the mutation receipt, so re-recording the same cause upserts one row. One
+  write path (`RepairStore::insert`) serves every producer; the delivery
+  policy — backoff schedule, attempt ceiling, dead-letter decision — lives
+  entirely in `OutboxStore::retry`, as the pure `delivery_decision` function
+  plus its transactional write. Dead-letter status and repair insertion stay
+  atomic through the shared `upsert_repair` statement.
 - **Shared SQL statements** — cross-repository writes share free functions,
   not repository methods: `upsert_object_on` (remote-object upsert, used by
   the catalog repo and the index run's page commit) and
@@ -122,21 +126,25 @@ terms map to crates. Entries are grouped by concern.
 - **Run loop (`job_run::run_items`)** — the one batch execution harness for
   upload, download, copy, move, and removal jobs. It owns the verdict
   vocabulary (`ItemVerdict` → `Step` → report item), the settle-on-success
-  hook (every successful remote mutation is settled exactly here, before it
-  is counted; a settlement may revise the verdict, as a failed move
-  verification does), the one cancellation interpretation (`Cancelled`
-  interrupts the run), and the single terminal-state commit. Services supply
-  per-item execution and settlement; they no longer call settlements
-  inline.
+  seam (`SettleHook<T>`: every successful remote mutation is settled
+  exactly here, before it is counted; a settlement may revise the verdict,
+  as a failed move verification does), the one cancellation interpretation
+  (`Cancelled` interrupts the run), and the single terminal-state commit.
+  Services supply per-item execution plus one `SettleHook` implementation
+  each — upload/download, copy/move, and removal are three adapters over
+  the same seam; they no longer call settlements inline.
 - **Copy/move settlement (`settlement`)** — the module that owns everything
   between a succeeded copy item and its final step: rederives the landed
-  target key from the adapter metadata, commits the receipt/outbox unit
-  through the mutation coordinator, projects the catalog (tag mirroring
-  included), and — for moves, recognized by the item's delete-guarded
-  source adapter — verifies the target then deletes the source through the
+  target key from the adapter metadata, settles through the mutation
+  coordinator's shared primitive (receipt/outbox unit plus catalog
+  projection), mirrors tags, and — for moves, marked by the item's
+  `ItemKind` — verifies the target then deletes the source through the
   item's guard-issued adapters, revising the verdict on failure. The run
-  loop's settle hook is a one-line handoff; the mutation coordinator keeps
-  only the shared upload/delete settlement machinery and repair recording.
+  loop's settle hook is a one-line handoff; the mutation coordinator is the
+  shared settlement machine: one settlement primitive
+  (`settle_confirmed`) behind every confirmed remote mutation — upload,
+  delete, and copy alike — plus the single follow-up failure entry
+  (`note_failure`) that copy-specific steps use to record repairs.
 
 ## Multipart sessions
 

@@ -150,6 +150,32 @@ impl RemovalPlan {
     }
 }
 
+/// Settle hook for removal runs: settles each succeeded removal's delete;
+/// delete settlement needs no engine metadata.
+struct DeleteSettle {
+    mutations: Arc<crate::mutation::MutationCoordinator>,
+    clock: Arc<dyn Clock>,
+}
+
+#[async_trait]
+impl crate::job_run::SettleHook<crate::batch_plan::RemoteItem> for DeleteSettle {
+    async fn settle(
+        &self,
+        item: crate::batch_plan::RemoteItem,
+        verdict: crate::job_run::ItemVerdict,
+    ) -> crate::job_run::Step {
+        self.mutations
+            .settle_delete(
+                item.endpoint.bucket.connection_id,
+                item.endpoint.bucket.id,
+                &item.path,
+                self.clock.now(),
+            )
+            .await;
+        verdict.step
+    }
+}
+
 pub struct DefaultRemoteService {
     gateway: crate::gateway::RemoteGateway,
     locator: crate::locator::CatalogLocator,
@@ -318,17 +344,9 @@ impl RemoteService for DefaultRemoteService {
                     crate::job_run::ItemVerdict::from_step,
                 )
             },
-            |item, verdict| async move {
-                // Delete settlement needs no engine metadata.
-                self.mutations
-                    .settle_delete(
-                        item.endpoint.bucket.connection_id,
-                        item.endpoint.bucket.id,
-                        &item.path,
-                        self.clock.now(),
-                    )
-                    .await;
-                verdict.step
+            &DeleteSettle {
+                mutations: self.mutations.clone(),
+                clock: self.clock.clone(),
             },
         )
         .await?;

@@ -25,6 +25,8 @@ pub mod outbox;
 pub mod receipt;
 /// Indexed remote objects and deletion tombstones.
 pub mod remote_object;
+/// Repair items: the queryable record of follow-up failures.
+pub mod repair;
 /// Key/value app settings such as the capability cache.
 pub mod settings;
 /// Tag definitions and object associations.

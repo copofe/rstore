@@ -93,7 +93,10 @@ impl Application {
             dependencies.runtime.repairs.clone(),
             dependencies.runtime.clock.clone(),
         ));
-        let dispatcher = crate::outbox::OutboxDispatcher::new(dependencies.runtime.outbox.clone());
+        let dispatcher = crate::outbox::OutboxDispatcher::new(
+            dependencies.runtime.outbox.clone(),
+            dependencies.runtime.repairs.clone(),
+        );
         let buckets: Arc<dyn crate::bucket::BucketService> = Arc::new(DefaultBucketService::new(
             dependencies.registry.buckets.clone(),
             gateway.clone(),

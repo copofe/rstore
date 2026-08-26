@@ -13,6 +13,8 @@
 
 use std::future::Future;
 
+use async_trait::async_trait;
+
 use crate::batch_outcome::{Disposition, Failure, SkipReason};
 use crate::transfer_report::{TransferReport, TransferReportItem};
 use rstore_application_ports::JobRepository;
@@ -182,22 +184,36 @@ async fn create_job<T>(
     Ok(job)
 }
 
-#[allow(clippy::too_many_arguments)]
-/// Runs every item through `per_item`, settles every success through
-/// `settle`, persists per-item state, and commits a single terminal state:
-/// `Succeeded`, `PartialSuccess` (some failed/blocked), or `Failed` (none
-/// succeeded). Returns the resulting [`TransferReport`].
+/// The settlement hook at the run loop's seam: every batch operation
+/// supplies one implementation that settles a succeeded item and may revise
+/// its verdict — a move whose post-copy verification fails comes back as a
+/// failure. Runs only for items `per_item` reported as succeeded, with the
+/// engine metadata included when the flow carries one.
 ///
-/// `settle` is the enforcement point for the settlement rule: it runs only
-/// for items `per_item` reported as succeeded, receives the item and its
-/// verdict (engine metadata included), and may revise the verdict — a move
-/// whose post-copy verification fails comes back as a failure. Flows without
-/// a settlement pass the verdict through unchanged.
+/// Implementations today: upload/download (upload settlement), copy/move
+/// (copy settlement), and removal (delete settlement) — three adapters over
+/// one seam.
+#[async_trait]
+pub trait SettleHook<T>: Send + Sync {
+    /// Settles one succeeded item and returns its final step.
+    async fn settle(&self, work: T, verdict: ItemVerdict) -> Step;
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Runs every item through `per_item`, settles every success through the
+/// `settle` hook, persists per-item state, and commits a single terminal
+/// state: `Succeeded`, `PartialSuccess` (some failed/blocked), or `Failed`
+/// (none succeeded). Returns the resulting [`TransferReport`].
+///
+/// The settle hook is the enforcement point for the settlement rule: it
+/// runs only for items `per_item` reported as succeeded, receives the item
+/// and its verdict (engine metadata included), and may revise the verdict.
+/// Flows without a settlement pass the verdict through unchanged.
 ///
 /// # Errors
 /// Propagates repository failures; a failing terminal commit leaves the job
 /// record in `Running` so a later sweep can mark stale runs interrupted.
-pub async fn run_items<T, F, Fut, S, SFut>(
+pub async fn run_items<T, F, Fut>(
     jobs: &dyn JobRepository,
     clock: &dyn Clock,
     kind: JobKind,
@@ -206,14 +222,12 @@ pub async fn run_items<T, F, Fut, S, SFut>(
     progress: &dyn ProgressSink,
     cancel: &CancellationToken,
     mut per_item: F,
-    mut settle: S,
+    settle: &dyn SettleHook<T>,
 ) -> Result<TransferReport>
 where
     T: Clone,
     F: FnMut(T) -> Fut,
     Fut: Future<Output = ItemVerdict>,
-    S: FnMut(T, ItemVerdict) -> SFut,
-    SFut: Future<Output = Step>,
 {
     let mut job = create_job(jobs, clock, kind, &items).await?;
     let mut report = TransferReport {
@@ -245,7 +259,7 @@ where
         );
         let settled = match verdict.step {
             Step::Interrupted => return interrupt(jobs, clock, job, index, report).await,
-            _ if succeeded => settle(item.work.clone(), verdict).await,
+            _ if succeeded => settle.settle(item.work.clone(), verdict).await,
             done => done,
         };
         let (disposition, detail, bytes) = match settled {
@@ -457,6 +471,44 @@ mod tests {
         }
     }
 
+    /// Pass-through settle hook standing in for flows without a settlement
+    /// pass.
+    struct PassThrough;
+
+    #[async_trait]
+    impl<T: Send + 'static> SettleHook<T> for PassThrough {
+        async fn settle(&self, _work: T, verdict: ItemVerdict) -> Step {
+            verdict.step
+        }
+    }
+
+    /// Settle hook standing in for a move whose post-copy verification
+    /// failed: revises the verdict when the item's payload flags it.
+    struct ReviseOnFlag;
+
+    #[async_trait]
+    impl SettleHook<bool> for ReviseOnFlag {
+        async fn settle(&self, revise: bool, verdict: ItemVerdict) -> Step {
+            if revise {
+                Step::failed_msg("verify failed after copy")
+            } else {
+                verdict.step
+            }
+        }
+    }
+
+    /// Settle hook that counts invocations to assert the settle-on-success
+    /// rule.
+    struct CountingSettle<'a>(&'a std::sync::atomic::AtomicUsize);
+
+    #[async_trait]
+    impl<T: Send + 'static> SettleHook<T> for CountingSettle<'_> {
+        async fn settle(&self, _work: T, verdict: ItemVerdict) -> Step {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            verdict.step
+        }
+    }
+
     #[tokio::test]
     async fn one_item_identity_drives_persistence_and_report() {
         let jobs = MemoryJobs::default();
@@ -475,7 +527,7 @@ mod tests {
                     bytes,
                 })
             },
-            |_, verdict| async move { verdict.step },
+            &PassThrough,
         )
         .await
         .unwrap();
@@ -517,7 +569,7 @@ mod tests {
                     bytes: 0,
                 })
             },
-            |_, verdict| async move { verdict.step },
+            &PassThrough,
         )
         .await
         .unwrap();
@@ -545,7 +597,7 @@ mod tests {
             &NullProgressSink,
             &CancellationToken::new(),
             |_| async { ItemVerdict::from_step(Step::succeeded()) },
-            |_, verdict| async move { verdict.step },
+            &PassThrough,
         )
         .await
         .unwrap_err();
@@ -578,7 +630,7 @@ mod tests {
                     ItemVerdict::from_step(Step::succeeded())
                 }
             },
-            |_, verdict| async move { verdict.step },
+            &PassThrough,
         )
         .await
         .unwrap();
@@ -607,15 +659,7 @@ mod tests {
             &NullProgressSink,
             &CancellationToken::new(),
             |_revise| async { ItemVerdict::from_step(Step::succeeded()) },
-            |revise, verdict| async move {
-                if revise {
-                    // A failed move verification revises the verdict before
-                    // counting.
-                    Step::failed_msg("verify failed after copy")
-                } else {
-                    verdict.step
-                }
-            },
+            &ReviseOnFlag,
         )
         .await
         .unwrap();
@@ -654,10 +698,7 @@ mod tests {
             &NullProgressSink,
             &CancellationToken::new(),
             |disposition| async move { ItemVerdict::from_step(Step::done(disposition, None)) },
-            |_, verdict| {
-                settled.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                async move { verdict.step }
-            },
+            &CountingSettle(&settled),
         )
         .await
         .unwrap();
@@ -687,7 +728,7 @@ mod tests {
             &NullProgressSink,
             &CancellationToken::new(),
             |_| async { ItemVerdict::from_engine_result(Err(Error::cancelled())) },
-            |_, verdict| async move { verdict.step },
+            &PassThrough,
         )
         .await
         .unwrap();
@@ -714,7 +755,7 @@ mod tests {
                     "would copy to bucket/key".into(),
                 ))
             },
-            |_, verdict| async move { verdict.step },
+            &PassThrough,
         )
         .await
         .unwrap();

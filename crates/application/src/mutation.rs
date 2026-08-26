@@ -7,9 +7,12 @@
 //! item so it can be retried, never lost and never re-executed against the
 //! remote side.
 //!
-//! The coordinator is the shared machine (receipt unit, upload/delete
-//! settlement, repair recording); copy- and move-specific settlement lives
-//! in [`crate::settlement`].
+//! The coordinator is the shared machine: one settlement primitive
+//! ([`MutationCoordinator::settle_confirmed`]) behind every confirmed
+//! remote mutation — upload, delete, and copy alike — plus the single
+//! failure-recording entry ([`MutationCoordinator::note_failure`]) that
+//! operation-specific follow-ups (tag mirroring, move verification) use;
+//! copy- and move-specific orchestration lives in [`crate::settlement`].
 
 use std::sync::Arc;
 
@@ -134,9 +137,10 @@ impl MutationCoordinator {
         self.catalog.clone()
     }
 
-    /// Settles a confirmed remote upload: records the receipt, then upserts
-    /// the confirmed object into the catalog. Never fails the caller;
-    /// projection problems land in the repair queue instead.
+    /// Settles a confirmed remote upload through the shared primitive:
+    /// records the receipt, then upserts the confirmed object into the
+    /// catalog. Never fails the caller; projection problems land in the
+    /// repair queue instead.
     pub(crate) async fn settle_upload(
         &self,
         connection: ConnectionId,
@@ -152,31 +156,13 @@ impl MutationCoordinator {
             }
         };
         let locator = RemoteLocator::new(connection, bucket, path);
-        let settlement = self
-            .record_remote_success(MutationOperation::Upload, &locator, Some(metadata), None)
+        self.settle_confirmed(MutationOperation::Upload, &locator, Some(metadata), at)
             .await;
-        if let Err(error) = crate::catalog_follow::upsert_confirmed(
-            self.catalog.as_ref(),
-            connection,
-            bucket,
-            metadata,
-            at,
-        )
-        .await
-        {
-            self.projection_failure(
-                settlement.receipt_id(),
-                MutationOperation::Upload,
-                ProjectionStage::ObjectUpsert,
-                &locator,
-                &error,
-            )
-            .await;
-        }
     }
 
-    /// Settles a confirmed remote delete: records the receipt, then tombstones
-    /// the catalog row. Tombstone failures are queued as repairs.
+    /// Settles a confirmed remote delete through the shared primitive:
+    /// records the receipt, then tombstones the catalog row. Tombstone
+    /// failures are queued as repairs.
     pub(crate) async fn settle_delete(
         &self,
         connection: ConnectionId,
@@ -185,37 +171,83 @@ impl MutationCoordinator {
         at: OffsetDateTime,
     ) {
         let locator = RemoteLocator::new(connection, bucket, path.clone());
-        let settlement = self
-            .record_remote_success(MutationOperation::Delete, &locator, None, None)
+        self.settle_confirmed(MutationOperation::Delete, &locator, None, at)
             .await;
-        if let Err(error) = self.catalog.tombstone(connection, bucket, path, at).await {
-            self.projection_failure(
-                settlement.receipt_id(),
-                MutationOperation::Delete,
-                ProjectionStage::Tombstone,
-                &locator,
-                &error,
-            )
-            .await;
-        }
     }
 
-    /// Persists a projection failure as a repair and logs a warning.
-    pub(crate) async fn projection_failure(
+    /// The one settlement primitive for every confirmed remote mutation:
+    /// commits the receipt/outbox unit, then projects the confirmation into
+    /// the catalog. The projection follows the operation — uploads and
+    /// copies upsert the confirmed object, deletes tombstone the row. Never
+    /// fails the caller; a failed projection lands in the repair queue
+    /// keyed to the receipt, leaving the remote side untouched.
+    pub(crate) async fn settle_confirmed(
         &self,
-        receipt_id: ReceiptId,
+        operation: MutationOperation,
+        locator: &RemoteLocator,
+        metadata: Option<&ObjectMetadata>,
+        at: OffsetDateTime,
+    ) -> RemoteSettlement {
+        let settlement = self
+            .record_remote_success(operation, locator, metadata, None)
+            .await;
+        let stage = match operation {
+            MutationOperation::Delete => ProjectionStage::Tombstone,
+            MutationOperation::Upload | MutationOperation::Copy => ProjectionStage::ObjectUpsert,
+        };
+        let projection = match operation {
+            MutationOperation::Delete => {
+                self.catalog
+                    .tombstone(locator.connection_id, locator.bucket_id, &locator.path, at)
+                    .await
+            }
+            MutationOperation::Upload | MutationOperation::Copy => {
+                // Upsert projections need the confirmed object's metadata;
+                // upload and copy settlements always carry it.
+                let Some(metadata) = metadata else {
+                    tracing::error!(
+                        operation = operation.as_str(),
+                        locator = %locator,
+                        "upsert settlement missing object metadata"
+                    );
+                    return settlement;
+                };
+                crate::catalog_follow::upsert_confirmed(
+                    self.catalog.as_ref(),
+                    locator.connection_id,
+                    locator.bucket_id,
+                    metadata,
+                    at,
+                )
+                .await
+            }
+        };
+        if let Err(error) = projection {
+            self.note_failure(&settlement, operation, stage, locator, &error)
+                .await;
+        }
+        settlement
+    }
+
+    /// Records a settlement follow-up failure as a repair keyed to the
+    /// receipt and logs a warning. The single entry for every producer: the
+    /// shared primitive's projection step and operation-specific follow-ups
+    /// (tag mirroring, move verification) alike.
+    pub(crate) async fn note_failure(
+        &self,
+        settlement: &RemoteSettlement,
         operation: MutationOperation,
         stage: ProjectionStage,
         locator: &RemoteLocator,
         error: &Error,
     ) {
-        self.record_projection_failure(receipt_id, operation, stage, locator, error)
+        self.record_projection_failure(settlement.receipt_id(), operation, stage, locator, error)
             .await;
         tracing::warn!(
             %error,
             operation = operation.as_str(),
             stage = stage.as_str(),
-            "catalog follow-up failed"
+            "settlement follow-up failed"
         );
     }
 
@@ -352,7 +384,7 @@ impl MutationCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rstore_application_ports::{OutboxStore, RemoteMutationRepository};
+    use rstore_application_ports::{OutboxStore, RemoteMutationRepository, RepairStore as _};
     use rstore_catalog::{InMemoryCatalog, RemoteObjectRepository};
     use rstore_domain::remote::ObjectPath;
     use rstore_domain::remote::RemoteObject;
@@ -365,7 +397,7 @@ mod tests {
         let db = Database::open_in_memory().await.unwrap();
         MutationCoordinator::new(
             Arc::new(db.clone()),
-            Arc::new(db.outbox()),
+            Arc::new(db.repairs()),
             catalog,
             Arc::new(SystemClock),
         )
@@ -448,9 +480,10 @@ mod tests {
     async fn remote_receipt_and_outbox_are_committed_as_one_local_unit() {
         let db = Database::open_in_memory().await.unwrap();
         let outbox = Arc::new(db.outbox());
+        let repairs = Arc::new(db.repairs());
         let coordinator = MutationCoordinator::new(
             Arc::new(db.clone()),
-            outbox.clone(),
+            repairs,
             Arc::new(InMemoryCatalog::new()),
             Arc::new(SystemClock),
         );
@@ -487,12 +520,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn copy_settlement_projects_through_the_shared_primitive() {
+        let catalog = Arc::new(InMemoryCatalog::new());
+        let coordinator = coordinator(catalog.clone()).await;
+        let locator = RemoteLocator::new(
+            rstore_domain::ConnectionId::new_random(),
+            rstore_domain::BucketId::new_random(),
+            ObjectPath::new("docs/copied.txt").unwrap(),
+        );
+        let metadata = metadata("docs/copied.txt");
+
+        let settlement = coordinator
+            .settle_confirmed(
+                MutationOperation::Copy,
+                &locator,
+                Some(&metadata),
+                OffsetDateTime::UNIX_EPOCH,
+            )
+            .await;
+
+        assert!(
+            matches!(settlement, RemoteSettlement::Durable { .. }),
+            "the copy receipt/outbox unit commits"
+        );
+        let object = catalog
+            .find_by_locator(locator.connection_id, locator.bucket_id, &locator.path)
+            .await
+            .unwrap()
+            .expect("copy was projected");
+        assert_eq!(object.size, 7);
+        assert_eq!(object.state, rstore_domain::ObjectState::Confirmed);
+    }
+
+    #[tokio::test]
     async fn projection_failure_is_queryable_repair_state() {
         let db = Database::open_in_memory().await.unwrap();
-        let outbox = Arc::new(db.outbox());
+        let repairs = Arc::new(db.repairs());
         let coordinator = MutationCoordinator::new(
             Arc::new(db.clone()),
-            outbox.clone(),
+            repairs,
             Arc::new(InMemoryCatalog::new()),
             Arc::new(SystemClock),
         );
@@ -515,7 +581,7 @@ mod tests {
             )
             .await;
 
-        let repairs = outbox.repairs(10).await.unwrap();
+        let repairs = db.repairs().list(10).await.unwrap();
         assert_eq!(repairs.len(), 1);
         assert_eq!(repairs[0].receipt_id, Some(receipt_id));
         assert_eq!(repairs[0].kind, RepairKind::CatalogProjection);

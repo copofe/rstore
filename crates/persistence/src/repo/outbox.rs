@@ -1,25 +1,22 @@
-//! SQLite outbox and repair repository.
+//! SQLite outbox repository: the event-delivery lifecycle.
 //!
 //! Per-aggregate event ordering is allocated inside the append transaction;
 //! exhausted delivery dead-letters the event and opens a repair item in the
-//! same unit of work.
-use std::sync::Arc;
-
+//! same unit of work, written through the repair module's shared statement.
 use async_trait::async_trait;
 use rstore_application_ports::{
-    OutboxEvent, OutboxStore, RemoteMutationReceipt, RepairItem, RepairKind, RepairRepository,
-    RepairStatus,
+    OutboxEvent, OutboxStore, RemoteMutationReceipt, RepairItem, RepairKind, RepairStatus,
 };
-use rstore_domain::id::{ReceiptId, RepairId};
+use rstore_domain::id::RepairId;
 use rstore_domain::{BoundedContext, Error, Result};
-use sqlx::sqlite::{SqlitePool, SqliteRow};
+use sqlx::sqlite::SqliteRow;
 use time::OffsetDateTime;
 
 use crate::codec::{unix_secs, RowReader};
 use crate::error::map_sqlx;
 use crate::tx::WriteGate;
 
-use rstore_domain::Clock;
+use super::repair::upsert_repair;
 
 const MAX_ATTEMPTS: i64 = 8;
 
@@ -48,17 +45,11 @@ enum DeliveryDecision {
 #[derive(Clone)]
 pub struct OutboxRepository {
     gate: WriteGate,
-    read_pool: SqlitePool,
-    clock: Arc<dyn Clock>,
 }
 
 impl OutboxRepository {
-    pub(crate) fn new(gate: WriteGate, read_pool: SqlitePool, clock: Arc<dyn Clock>) -> Self {
-        Self {
-            gate,
-            read_pool,
-            clock,
-        }
+    pub(crate) fn new(gate: WriteGate) -> Self {
+        Self { gate }
     }
 
     async fn append_event(
@@ -166,31 +157,6 @@ impl OutboxRepository {
                 })
             })
             .await
-    }
-}
-
-#[async_trait]
-impl RepairRepository for OutboxRepository {
-    async fn insert(&self, item: &RepairItem) -> Result<()> {
-        let _write = self.gate.permit().await?;
-        upsert_repair(self.gate.pool(), item, self.clock.now()).await
-    }
-
-    async fn list(&self, limit: u32) -> Result<Vec<RepairItem>> {
-        OutboxStore::repairs(self, limit).await
-    }
-
-    async fn resolve(&self, id: RepairId, at: OffsetDateTime) -> Result<bool> {
-        let _write = self.gate.permit().await?;
-        let affected =
-            sqlx::query("UPDATE repair_items SET status = 'resolved', updated_at = ? WHERE id = ?")
-                .bind(unix_secs(at))
-                .bind(id.to_string())
-                .execute(self.gate.pool())
-                .await
-                .map_err(map_sqlx)?
-                .rows_affected();
-        Ok(affected > 0)
     }
 }
 
@@ -368,78 +334,6 @@ impl OutboxStore for OutboxRepository {
             })
             .await
     }
-
-    async fn repairs(&self, limit: u32) -> Result<Vec<RepairItem>> {
-        let rows = sqlx::query(
-            "SELECT id, event_id, receipt_id, kind, status, attempts, last_error, next_attempt_at, locator_json, operation \
-             FROM repair_items WHERE status != 'resolved' \
-             ORDER BY next_attempt_at, updated_at, id LIMIT ?",
-        )
-        .bind(i64::from(limit))
-        .fetch_all(&self.read_pool)
-        .await
-        .map_err(map_sqlx)?;
-        rows.into_iter()
-            .map(|row| {
-                let reader = RowReader::new(row);
-                Ok(RepairItem {
-                    id: reader.text("id")?.parse()?,
-                    event_id: reader
-                        .opt_text("event_id")?
-                        .map(|token| token.parse())
-                        .transpose()
-                        .map_err(|e| Error::database("decode repair event id").with_source(e))?,
-                    receipt_id: reader
-                        .opt_text("receipt_id")?
-                        .map(|token| token.parse())
-                        .transpose()?,
-                    kind: RepairKind::parse(&reader.text("kind")?)?,
-                    status: RepairStatus::parse(&reader.text("status")?)?,
-                    attempts: reader.integer("attempts")? as u32,
-                    last_error: reader.opt_text("last_error")?,
-                    locator: reader.opt_text("locator_json")?,
-                    next_attempt_at: reader.timestamp("next_attempt_at")?,
-                    operation: reader.opt_text("operation")?,
-                })
-            })
-            .collect()
-    }
-}
-
-/// The single repair write path: an upsert keyed by the deterministic
-/// identity, so every producer (including the store's own dead-letter)
-/// shares one statement, one column set, and one attempts rule — the
-/// writer's value wins.
-async fn upsert_repair<'e, E>(executor: E, item: &RepairItem, now: OffsetDateTime) -> Result<()>
-where
-    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
-{
-    sqlx::query(
-        "INSERT INTO repair_items \
-         (id, event_id, receipt_id, kind, status, locator_json, operation, attempts, last_error, \
-          next_attempt_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-         ON CONFLICT(id) DO UPDATE SET status = excluded.status, \
-             event_id = excluded.event_id, receipt_id = excluded.receipt_id, \
-             locator_json = excluded.locator_json, operation = excluded.operation, \
-             attempts = excluded.attempts, last_error = excluded.last_error, \
-             next_attempt_at = excluded.next_attempt_at, updated_at = excluded.updated_at",
-    )
-    .bind(item.id.to_string())
-    .bind(item.event_id.map(|id| id.to_string()))
-    .bind(item.receipt_id.as_ref().map(ReceiptId::to_string))
-    .bind(item.kind.as_str())
-    .bind(item.status.as_str())
-    .bind(&item.locator)
-    .bind(&item.operation)
-    .bind(i64::from(item.attempts))
-    .bind(&item.last_error)
-    .bind(unix_secs(item.next_attempt_at))
-    .bind(unix_secs(now))
-    .bind(unix_secs(now))
-    .execute(executor)
-    .await
-    .map_err(map_sqlx)?;
-    Ok(())
 }
 
 fn row_to_event(row: SqliteRow) -> Result<OutboxEvent> {
@@ -465,6 +359,7 @@ fn row_to_event(row: SqliteRow) -> Result<OutboxEvent> {
 mod tests {
     use super::*;
     use crate::Database;
+    use rstore_application_ports::RepairStore as _;
 
     use uuid::Uuid;
 
@@ -520,6 +415,7 @@ mod tests {
     async fn append_claim_and_acknowledge_are_idempotent() {
         let db = Database::open_in_memory().await.unwrap();
         let outbox = db.outbox();
+        let repairs = db.repairs();
         let item = event(EVT1);
 
         outbox.append(&item).await.unwrap();
@@ -541,7 +437,7 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
-        assert!(outbox.repairs(10).await.unwrap().is_empty());
+        assert!(repairs.list(10).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -615,6 +511,7 @@ mod tests {
     async fn exhausted_delivery_becomes_repair_required() {
         let db = Database::open_in_memory().await.unwrap();
         let outbox = db.outbox();
+        let repairs = db.repairs();
         outbox.append(&event(EVT_DEAD)).await.unwrap();
 
         // Drive the delivery attempts through the store's own backoff
@@ -631,11 +528,11 @@ mod tests {
             now += time::Duration::seconds(2_i64.pow(u32::try_from(attempt).unwrap()));
         }
 
-        let repairs = outbox.repairs(10).await.unwrap();
-        assert_eq!(repairs.len(), 1);
-        assert_eq!(repairs[0].kind, RepairKind::OutboxDelivery);
-        assert_eq!(repairs[0].event_id, Some(EVT_DEAD));
-        assert_eq!(repairs[0].id, RepairId::from_event(EVT_DEAD));
+        let listed = repairs.list(10).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].kind, RepairKind::OutboxDelivery);
+        assert_eq!(listed[0].event_id, Some(EVT_DEAD));
+        assert_eq!(listed[0].id, RepairId::from_event(EVT_DEAD));
         let status: String =
             sqlx::query_scalar("SELECT status FROM outbox_events WHERE event_id = ?")
                 .bind(EVT_DEAD.to_string())
@@ -650,37 +547,8 @@ mod tests {
             .retry(EVT_DEAD, "consumer failed again", now)
             .await
             .unwrap();
-        let repairs = outbox.repairs(10).await.unwrap();
-        assert_eq!(repairs.len(), 1);
-        assert!(repairs[0].last_error.as_deref().unwrap().contains("again"));
-    }
-
-    #[tokio::test]
-    async fn repair_insert_upserts_on_the_deterministic_identity() {
-        let db = Database::open_in_memory().await.unwrap();
-        let outbox = db.outbox();
-        let receipt = ReceiptId::new_random();
-        let base = RepairItem {
-            id: RepairId::from_receipt(receipt),
-            event_id: None,
-            receipt_id: Some(receipt),
-            kind: RepairKind::CatalogProjection,
-            status: RepairStatus::Required,
-            attempts: 0,
-            last_error: Some("first failure".into()),
-            next_attempt_at: OffsetDateTime::UNIX_EPOCH,
-            locator: None,
-            operation: Some("copy".into()),
-        };
-
-        outbox.insert(&base).await.unwrap();
-        let mut again = base.clone();
-        again.last_error = Some("second failure".into());
-        outbox.insert(&again).await.unwrap();
-
-        let repairs = outbox.repairs(10).await.unwrap();
-        assert_eq!(repairs.len(), 1, "same receipt, one row");
-        assert_eq!(repairs[0].receipt_id, Some(receipt));
-        assert!(repairs[0].last_error.as_deref().unwrap().contains("second"));
+        let listed = repairs.list(10).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].last_error.as_deref().unwrap().contains("again"));
     }
 }

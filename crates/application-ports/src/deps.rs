@@ -14,8 +14,7 @@ use rstore_storage_api::{MultipartStore, StorageFactory};
 
 use crate::{
     BucketStore, ConnectionStore, IgnoreRuleStore, IndexRunStore, JobRepository, LinkProfileStore,
-    OutboxStore, RepairRepository, RuntimeStats, SettingsStore, TagStore, UnitOfWork,
-    WorkspaceStore,
+    OutboxStore, RepairStore, RuntimeStats, SettingsStore, TagStore, UnitOfWork, WorkspaceStore,
 };
 
 /// Shared handle to the [`ConnectionStore`] port.
@@ -41,8 +40,8 @@ pub type CatalogTagPort = Arc<dyn CatalogTagStore>;
 pub type StatsPort = Arc<dyn RuntimeStats>;
 /// Shared handle to the [`UnitOfWork`] port.
 pub type UnitOfWorkPort = Arc<dyn UnitOfWork>;
-/// Shared handle to the [`RepairRepository`] port.
-pub type RepairPort = Arc<dyn RepairRepository>;
+/// Shared handle to the [`RepairStore`] port.
+pub type RepairPort = Arc<dyn RepairStore>;
 /// Shared handle to the [`OutboxStore`] port.
 pub type OutboxPort = Arc<dyn OutboxStore>;
 /// Shared handle to the catalog write port (`rstore_catalog::RemoteObjectRepository`).

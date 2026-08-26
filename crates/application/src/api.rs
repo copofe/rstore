@@ -23,7 +23,7 @@ use crate::remote::RemoteService;
 use crate::tag::TagService;
 use crate::transfer::DefaultTransferService;
 use crate::workspace::WorkspaceService;
-use rstore_application_ports::RepairRepository;
+use rstore_application_ports::RepairStore;
 use rstore_domain::Result;
 
 /// Every wired service handle in one bundle.
@@ -47,7 +47,7 @@ pub(crate) struct Services {
     pub(crate) indexer: Arc<dyn IndexService>,
     pub(crate) files: Arc<dyn FilesService>,
     pub(crate) health: Arc<HealthService>,
-    pub(crate) repairs: Arc<dyn RepairRepository>,
+    pub(crate) repairs: Arc<dyn RepairStore>,
 }
 
 /// Upper bound on repair items [`JobApi::pending_repairs`] surfaces per query.
@@ -347,7 +347,7 @@ impl DiagnosticsApi {
 #[derive(Clone)]
 pub struct JobApi {
     jobs: Arc<dyn JobService>,
-    repairs: Arc<dyn RepairRepository>,
+    repairs: Arc<dyn RepairStore>,
 }
 
 impl JobApi {

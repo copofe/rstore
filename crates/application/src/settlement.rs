@@ -3,12 +3,12 @@
 //!
 //! The run loop hands a succeeded item's verdict here; this module owns the
 //! whole chain: rederive the landed target key from the adapter's metadata,
-//! commit the receipt/outbox unit through the mutation coordinator, project
-//! the catalog (tag mirroring included), and — for moves, whose item carries
-//! the delete-guarded source adapter — verify the target then delete the
-//! source, revising the verdict on failure. Failures map to repair rows,
-//! never to lost follow-ups; [`Step`](crate::job_run::Step) is the only
-//! thing that comes back.
+//! settle through the mutation coordinator's shared primitive (receipt/outbox
+//! unit plus catalog projection), then mirror tags — and for moves, marked
+//! by the item's `ItemKind`, verify the target and delete the source,
+//! revising the verdict on failure. Failures map to repair rows, never to
+//! lost follow-ups; [`Step`](crate::job_run::Step) is the only thing that
+//! comes back.
 
 use std::sync::Arc;
 
@@ -22,11 +22,12 @@ use rstore_storage_api::model::ObjectMetadata;
 use rstore_storage_api::Storage;
 use time::OffsetDateTime;
 
-use crate::copy::Item;
+use crate::copy::{Item, ItemKind};
 use crate::job_run::{ItemVerdict, Step};
 use crate::mutation::{MutationCoordinator, MutationOperation, ProjectionStage, RemoteSettlement};
 
 /// Settles confirmed copies (and their move follow-through).
+#[derive(Clone)]
 pub(crate) struct Settlement {
     mutations: Arc<MutationCoordinator>,
     catalog: Arc<dyn RemoteObjectRepository>,
@@ -52,9 +53,9 @@ impl Settlement {
 
     /// Settles one succeeded copy item and returns its final step.
     ///
-    /// Moves are recognized by the item's delete-guarded source adapter;
-    /// a failed move verification or source deletion revises the verdict to
-    /// a failure, exactly as the run loop's settle hook expects.
+    /// Moves are recognized by the item's `ItemKind`; a failed move
+    /// verification or source deletion revises the verdict to a failure,
+    /// exactly as the run loop's settle hook expects.
     pub(crate) async fn settle(&self, item: &Item, verdict: ItemVerdict, keep_tags: bool) -> Step {
         // The loop settles only succeeded items, so the verdict is a Done.
         let bytes = match verdict.step {
@@ -80,41 +81,47 @@ impl Settlement {
             .settle_copy(&source, &target, copied, keep_tags, now)
             .await;
 
-        // A move carries its delete-guarded source adapter; presence is the
-        // move flag.
-        if let Some(delete_storage) = item.src_delete.as_ref() {
-            return match self
-                .finish_move(
-                    &settlement,
-                    &source,
-                    &target,
-                    copied,
-                    now,
-                    delete_storage.as_ref(),
-                    item.dst_storage.as_ref(),
-                )
-                .await
-            {
-                MoveFinish::Completed => Step::Done {
-                    disposition: crate::batch_outcome::Disposition::Succeeded,
-                    detail: None,
-                    bytes,
-                },
-                MoveFinish::Failed(message) => Step::failed_msg(message),
-            };
-        }
-
-        Step::Done {
-            disposition: crate::batch_outcome::Disposition::Succeeded,
-            detail: None,
-            bytes,
+        match item.kind {
+            ItemKind::Copy => Step::Done {
+                disposition: crate::batch_outcome::Disposition::Succeeded,
+                detail: None,
+                bytes,
+            },
+            ItemKind::Move => {
+                // The kind and the delete adapter are issued together by
+                // expansion; absence is internal corruption, surfaced
+                // explicitly rather than silently ignored.
+                let Some(delete_storage) = item.src_delete.as_ref() else {
+                    return Step::failed_msg("move item carries no delete-guarded adapter");
+                };
+                match self
+                    .finish_move(MoveFinishContext {
+                        copy: &settlement,
+                        source: &source,
+                        target: &target,
+                        metadata: copied,
+                        at: now,
+                        delete_storage: delete_storage.as_ref(),
+                        target_storage: item.dst_storage.as_ref(),
+                    })
+                    .await
+                {
+                    MoveFinish::Completed => Step::Done {
+                        disposition: crate::batch_outcome::Disposition::Succeeded,
+                        detail: None,
+                        bytes,
+                    },
+                    MoveFinish::Failed(message) => Step::failed_msg(message),
+                }
+            }
         }
     }
 
-    /// Settles a confirmed remote copy: records the receipt, upserts the
-    /// target object, and when tag preservation is requested mirrors the
-    /// source's tag associations onto the target. Each failed stage is
-    /// repaired independently; earlier successes are never rolled back.
+    /// Settles a confirmed remote copy through the shared primitive (receipt
+    /// unit plus object projection), then — when tag preservation is
+    /// requested — mirrors the source's tag associations onto the target.
+    /// Each failed stage is repaired independently; earlier successes are
+    /// never rolled back.
     async fn settle_copy(
         &self,
         source: &CatalogObjectRef<'_>,
@@ -126,33 +133,8 @@ impl Settlement {
         let target_locator = target.locator();
         let settlement = self
             .mutations
-            .record_remote_success(
-                MutationOperation::Copy,
-                &target_locator,
-                Some(metadata),
-                None,
-            )
+            .settle_confirmed(MutationOperation::Copy, &target_locator, Some(metadata), at)
             .await;
-
-        if let Err(error) = crate::catalog_follow::upsert_confirmed(
-            self.catalog.as_ref(),
-            target.connection,
-            target.bucket,
-            metadata,
-            at,
-        )
-        .await
-        {
-            self.mutations
-                .projection_failure(
-                    settlement.receipt_id(),
-                    MutationOperation::Copy,
-                    ProjectionStage::ObjectUpsert,
-                    &target_locator,
-                    &error,
-                )
-                .await;
-        }
 
         if !preserve_tags {
             return settlement;
@@ -168,15 +150,13 @@ impl Settlement {
             Ok(Some(source_object)) => source_object,
             Ok(None) => return settlement,
             Err(error) => {
-                self.mutations
-                    .projection_failure(
-                        settlement.receipt_id(),
-                        MutationOperation::Copy,
-                        ProjectionStage::SourceLookup,
-                        &target_locator,
-                        &error,
-                    )
-                    .await;
+                self.fail_stage(
+                    &settlement,
+                    ProjectionStage::SourceLookup,
+                    &target_locator,
+                    &error,
+                )
+                .await;
                 return settlement;
             }
         };
@@ -188,92 +168,121 @@ impl Settlement {
             Ok(Some(target_object)) => target_object,
             Ok(None) => return settlement,
             Err(error) => {
-                self.mutations
-                    .projection_failure(
-                        settlement.receipt_id(),
-                        MutationOperation::Copy,
-                        ProjectionStage::TargetLookup,
-                        &target_locator,
-                        &error,
-                    )
-                    .await;
+                self.fail_stage(
+                    &settlement,
+                    ProjectionStage::TargetLookup,
+                    &target_locator,
+                    &error,
+                )
+                .await;
                 return settlement;
             }
         };
         let associations = match self.tags.associations_for_object(source_object.id).await {
             Ok(associations) => associations,
             Err(error) => {
-                self.mutations
-                    .projection_failure(
-                        settlement.receipt_id(),
-                        MutationOperation::Copy,
-                        ProjectionStage::TagRead,
-                        &target_locator,
-                        &error,
-                    )
-                    .await;
+                self.fail_stage(
+                    &settlement,
+                    ProjectionStage::TagRead,
+                    &target_locator,
+                    &error,
+                )
+                .await;
                 return settlement;
             }
         };
         for (workspace, tag) in associations {
             if let Err(error) = self.tags.attach(workspace, target_object.id, tag, at).await {
-                self.mutations
-                    .projection_failure(
-                        settlement.receipt_id(),
-                        MutationOperation::Copy,
-                        ProjectionStage::TagWrite,
-                        &target_locator,
-                        &error,
-                    )
-                    .await;
+                self.fail_stage(
+                    &settlement,
+                    ProjectionStage::TagWrite,
+                    &target_locator,
+                    &error,
+                )
+                .await;
             }
         }
         settlement
+    }
+
+    /// Records one failed tag-mirroring stage through the coordinator's
+    /// single failure entry, keyed to the copy receipt.
+    async fn fail_stage(
+        &self,
+        settlement: &RemoteSettlement,
+        stage: ProjectionStage,
+        target_locator: &RemoteLocator,
+        error: &rstore_domain::Error,
+    ) {
+        self.mutations
+            .note_failure(
+                settlement,
+                MutationOperation::Copy,
+                stage,
+                target_locator,
+                error,
+            )
+            .await;
     }
 
     /// Finishes a move whose copy already settled: verifies the target size,
     /// deletes the source, and settles the source delete in the catalog. A
     /// verification or deletion failure keeps the source intact and records a
     /// `MoveFollowup` repair instead of losing the copied data.
-    #[allow(clippy::too_many_arguments)]
-    async fn finish_move(
-        &self,
-        copy: &RemoteSettlement,
-        source: &CatalogObjectRef<'_>,
-        target: &CatalogObjectRef<'_>,
-        metadata: &ObjectMetadata,
-        at: OffsetDateTime,
-        delete_storage: &dyn Storage,
-        target_storage: &dyn Storage,
-    ) -> MoveFinish {
+    async fn finish_move(&self, ctx: MoveFinishContext<'_>) -> MoveFinish {
         // Size check is the integrity gate: only delete the source once the
         // target provably holds the expected bytes.
-        match target_storage.stat(&target.bucket_name, target.path).await {
-            Ok(verified) if verified.size == metadata.size => {}
+        match ctx
+            .target_storage
+            .stat(&ctx.target.bucket_name, ctx.target.path)
+            .await
+        {
+            Ok(verified) if verified.size == ctx.metadata.size => {}
             Ok(_) => {
                 let message = "target size mismatch after copy; source kept".to_owned();
-                self.move_failure(copy, ProjectionStage::TargetVerify, source, &message)
-                    .await;
+                self.move_failure(
+                    ctx.copy,
+                    ProjectionStage::TargetVerify,
+                    ctx.source,
+                    &message,
+                )
+                .await;
                 return MoveFinish::Failed(message);
             }
             Err(error) => {
                 let message = format!("target verification failed; source kept: {error}");
-                self.move_failure(copy, ProjectionStage::TargetVerify, source, &message)
-                    .await;
+                self.move_failure(
+                    ctx.copy,
+                    ProjectionStage::TargetVerify,
+                    ctx.source,
+                    &message,
+                )
+                .await;
                 return MoveFinish::Failed(message);
             }
         }
-        if let Err(error) = delete_storage
-            .delete(&source.bucket_name, source.path)
+        if let Err(error) = ctx
+            .delete_storage
+            .delete(&ctx.source.bucket_name, ctx.source.path)
             .await
         {
             let message = format!("copied, but delete failed: {error}");
-            self.move_failure(copy, ProjectionStage::SourceDelete, source, &message)
-                .await;
+            self.move_failure(
+                ctx.copy,
+                ProjectionStage::SourceDelete,
+                ctx.source,
+                &message,
+            )
+            .await;
             return MoveFinish::Failed(message);
         }
         self.mutations
-            .settle_delete(source.connection, source.bucket, source.path, at)
+            .settle_delete(
+                ctx.source.connection,
+                ctx.source.bucket,
+                ctx.source.path,
+                ctx.at,
+            )
             .await;
         MoveFinish::Completed
     }
@@ -328,6 +337,17 @@ impl<'a> CatalogObjectRef<'a> {
     }
 }
 
+/// Everything a move's follow-through needs once its copy settled.
+struct MoveFinishContext<'a> {
+    copy: &'a RemoteSettlement,
+    source: &'a CatalogObjectRef<'a>,
+    target: &'a CatalogObjectRef<'a>,
+    metadata: &'a ObjectMetadata,
+    at: OffsetDateTime,
+    delete_storage: &'a dyn Storage,
+    target_storage: &'a dyn Storage,
+}
+
 /// Terminal state of a move's follow-through after its copy settled.
 enum MoveFinish {
     Completed,
@@ -339,7 +359,7 @@ mod tests {
     use super::*;
     use crate::batch_outcome::Disposition;
     use crate::batch_plan::Endpoint;
-    use rstore_application_ports::{OutboxStore, RepairStatus};
+    use rstore_application_ports::{RepairStatus, RepairStore as _};
     use rstore_catalog::InMemoryCatalog;
     use rstore_domain::bucket::{Bucket, BucketConfig};
     use rstore_domain::remote::RemoteObject;
@@ -386,7 +406,7 @@ mod tests {
         fn settlement(&self) -> Settlement {
             let mutations = Arc::new(MutationCoordinator::new(
                 Arc::new(Database::clone(&self.db)),
-                Arc::new(self.db.outbox()),
+                Arc::new(self.db.repairs()),
                 self.catalog.clone(),
                 Arc::new(SystemClock),
             ));
@@ -407,12 +427,31 @@ mod tests {
                 base: String::new(),
             });
             Item::for_test(
+                ItemKind::Move,
                 endpoint.clone(),
                 ObjectPath::new("docs/source.txt").unwrap(),
                 endpoint,
                 ObjectPath::new("docs/target.txt").unwrap(),
                 self.storage.clone(),
                 Some(self.storage.clone()),
+            )
+        }
+
+        /// A plain copy item: same endpoints, no delete adapter.
+        fn copy_item(&self) -> Item {
+            let endpoint = Arc::new(Endpoint {
+                bucket: clone_bucket(&self.bucket),
+                storage: self.storage.clone(),
+                base: String::new(),
+            });
+            Item::for_test(
+                ItemKind::Copy,
+                endpoint.clone(),
+                ObjectPath::new("docs/source.txt").unwrap(),
+                endpoint,
+                ObjectPath::new("docs/target.txt").unwrap(),
+                self.storage.clone(),
+                None,
             )
         }
     }
@@ -479,8 +518,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut item = fixture.move_item();
-        item.src_delete = None; // a plain copy, not a move
+        let item = fixture.copy_item();
         let step = settle
             .settle(&item, done_verdict(metadata("docs/target.txt")), true)
             .await;
@@ -524,7 +562,7 @@ mod tests {
             .stat("media", &ObjectPath::new("docs/source.txt").unwrap())
             .await
             .is_err());
-        assert!(fixture.db.outbox().repairs(10).await.unwrap().is_empty());
+        assert!(fixture.db.repairs().list(10).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -559,7 +597,7 @@ mod tests {
             .stat("media", &ObjectPath::new("docs/source.txt").unwrap())
             .await
             .is_ok());
-        let repairs = fixture.db.outbox().repairs(10).await.unwrap();
+        let repairs = fixture.db.repairs().list(10).await.unwrap();
         assert_eq!(repairs.len(), 1);
         assert_eq!(repairs[0].kind, RepairKind::MoveFollowup);
         assert_eq!(repairs[0].status, RepairStatus::Required);
@@ -598,7 +636,7 @@ mod tests {
             .stat("media", &ObjectPath::new("docs/source.txt").unwrap())
             .await
             .is_ok());
-        let repairs = fixture.db.outbox().repairs(10).await.unwrap();
+        let repairs = fixture.db.repairs().list(10).await.unwrap();
         assert_eq!(repairs.len(), 1);
         assert_eq!(repairs[0].kind, RepairKind::MoveFollowup);
         assert!(repairs[0]

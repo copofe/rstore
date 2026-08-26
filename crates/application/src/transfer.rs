@@ -106,6 +106,36 @@ pub struct RunOptions {
     pub retry: rstore_transfer::RetryPolicy,
 }
 
+/// Settle hook for upload/download runs: only successful uploads carry
+/// engine metadata and index it; downloads have no catalog follow-up of
+/// their own.
+struct UploadSettle {
+    mutations: Arc<crate::mutation::MutationCoordinator>,
+    bucket: rstore_domain::Bucket,
+    clock: Arc<dyn Clock>,
+}
+
+#[async_trait::async_trait]
+impl crate::job_run::SettleHook<EngineItem> for UploadSettle {
+    async fn settle(
+        &self,
+        item: EngineItem,
+        verdict: crate::job_run::ItemVerdict,
+    ) -> crate::job_run::Step {
+        if let (EngineItem::Upload(_), Some(metadata)) = (&item, verdict.metadata) {
+            self.mutations
+                .settle_upload(
+                    self.bucket.connection_id,
+                    self.bucket.id,
+                    &metadata,
+                    self.clock.now(),
+                )
+                .await;
+        }
+        verdict.step
+    }
+}
+
 pub struct DefaultTransferService {
     gateway: crate::gateway::RemoteGateway,
     locator: crate::locator::CatalogLocator,
@@ -318,23 +348,10 @@ impl DefaultTransferService {
                 };
                 crate::job_run::ItemVerdict::from_engine_result(result)
             },
-            |item, verdict| {
-                let bucket = bucket.clone();
-                async move {
-                    // Only successful uploads index metadata; downloads carry
-                    // no catalog follow-up of their own.
-                    if let (EngineItem::Upload(_), Some(metadata)) = (&item, verdict.metadata) {
-                        self.mutations
-                            .settle_upload(
-                                bucket.connection_id,
-                                bucket.id,
-                                &metadata,
-                                self.clock.now(),
-                            )
-                            .await;
-                    }
-                    verdict.step
-                }
+            &UploadSettle {
+                mutations: self.mutations.clone(),
+                bucket,
+                clock: self.clock.clone(),
             },
         )
         .await
