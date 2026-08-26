@@ -55,16 +55,21 @@ pub trait Storage: Send + Sync {
         opts: &PutOptions,
     ) -> Result<ObjectMetadata>;
 
-    /// Copy an object. `source` is the caller's stat of the source —
-    /// adapters with server-side copy need its size to pick a strategy and
-    /// derive the target's metadata from it.
+    /// Copy an object within the provider. The adapter stats the source
+    /// itself and derives the target's metadata from it; callers pass only
+    /// the source and target locators.
+    ///
+    /// Reachability contract: adapters are built per connection, so the
+    /// request's source bucket must be reachable through this adapter —
+    /// same-connection copies address any bucket the connection can see,
+    /// cross-connection copies go through the host relay instead.
     ///
     /// Deliberately no default implementation: the obvious fallback
     /// (`read(None)` into memory, then `put`) silently buffers whole objects
     /// and is an OOM trap on real sizes. Every adapter picks a strategy —
     /// server-side copy, single-shot vs part-copy by size, or an explicit
     /// in-memory shortcut for test doubles.
-    async fn copy(&self, req: &CopyRequest, source: &ObjectMetadata) -> Result<ObjectMetadata>;
+    async fn copy(&self, req: &CopyRequest) -> Result<ObjectMetadata>;
 
     /// Delete a single object; a missing object is an outcome, not an error.
     async fn delete(&self, bucket: &str, key: &ObjectPath) -> Result<DeleteOutcome>;

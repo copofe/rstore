@@ -16,33 +16,17 @@ use rstore_domain::{Error, Result};
 use rstore_storage_api::model::{ObjectMetadata, PutOptions};
 use rstore_storage_api::{guess_content_type, FileFingerprint, MultipartStore, Storage};
 
+#[cfg(test)]
 use crate::cancel::CancellationToken;
 use crate::conflict::{decide_target, path_probe, stat_probe, TargetDecision};
 use crate::multipart;
-use crate::progress::{Progress, ProgressSink};
+use crate::progress::Progress;
 use crate::pump::{pump, ChunkPlan, ChunkSink, RangedSource};
+#[cfg(test)]
+use crate::run::TransferConfig;
+use crate::run::{ItemOutcome, RunContext};
 
 /// Tuning knobs for transfer sizes and thresholds.
-#[derive(Debug, Clone, Copy)]
-pub struct TransferConfig {
-    /// Files at or above this size use multipart (default 8 MiB).
-    pub multipart_threshold: u64,
-    /// Part size for multipart uploads (default 8 MiB, S3 minimum 5 MiB).
-    pub part_size: u64,
-    /// Download chunk size for ranged reads (default 1 MiB).
-    pub download_chunk: u64,
-}
-
-impl Default for TransferConfig {
-    fn default() -> Self {
-        Self {
-            multipart_threshold: 8 * 1024 * 1024,
-            part_size: 8 * 1024 * 1024,
-            download_chunk: 1024 * 1024,
-        }
-    }
-}
-
 /// One upload request (local file → remote object).
 #[derive(Debug, Clone)]
 pub struct UploadRequest {
@@ -64,94 +48,28 @@ pub struct DownloadRequest {
     pub conflict: ConflictPolicy,
 }
 
-/// Outcome of one item.
-#[derive(Debug, Clone, Default)]
-pub struct ItemOutcome {
-    pub bytes: u64,
-    /// Metadata returned by the adapter for the object that was transferred.
-    /// Skipped/blocked items carry none.
-    pub metadata: Option<ObjectMetadata>,
-    pub skipped: bool,
-    /// The item was deliberately not executed (dry run); the detail carries
-    /// the preview. Implies `skipped`.
-    pub dry_run: bool,
-    /// The conflict policy left this item undone (unresolved `ask`, or rename
-    /// found no free name) — a per-item outcome, not an error.
-    pub blocked: bool,
-    /// Human detail for skipped/blocked items (the conflicting target or the
-    /// block reason).
-    pub detail: Option<String>,
-}
-
-impl ItemOutcome {
-    /// A completed transfer of `bytes`, with the adapter's metadata.
-    pub fn transferred(bytes: u64, metadata: Option<ObjectMetadata>) -> Self {
-        Self {
-            bytes,
-            metadata,
-            ..Self::default()
-        }
-    }
-
-    /// The conflict policy left the existing target alone.
-    pub fn skipped(detail: String) -> Self {
-        Self {
-            skipped: true,
-            detail: Some(detail),
-            ..Self::default()
-        }
-    }
-
-    /// A dry-run preview: fully resolved, deliberately not executed.
-    pub fn preview(detail: String) -> Self {
-        Self {
-            skipped: true,
-            dry_run: true,
-            detail: Some(detail),
-            ..Self::default()
-        }
-    }
-
-    /// The conflict policy could not resolve (unresolved `ask`, or rename
-    /// found no free name).
-    pub fn blocked(detail: String) -> Self {
-        Self {
-            blocked: true,
-            detail: Some(detail),
-            ..Self::default()
-        }
-    }
-}
-
 /// The engine: stateless between calls except the checkpoint store.
 pub struct TransferEngine {
     storage: std::sync::Arc<dyn Storage>,
     checkpoints: std::sync::Arc<dyn rstore_storage_api::MultipartStore>,
-    config: TransferConfig,
 }
 
 impl TransferEngine {
-    /// Creates an engine bound to one storage adapter, its checkpoint store
-    /// and its sizing configuration.
+    /// Creates an engine bound to one storage adapter and its checkpoint
+    /// store; tuning rides the per-run [`RunContext`](crate::run::RunContext).
     pub fn new(
         storage: std::sync::Arc<dyn Storage>,
         checkpoints: std::sync::Arc<dyn MultipartStore>,
-        config: TransferConfig,
     ) -> Self {
         Self {
             storage,
             checkpoints,
-            config,
         }
     }
 
     /// Upload one file, honouring conflict policy, resume and cancellation.
-    pub async fn upload(
-        &self,
-        req: &UploadRequest,
-        progress: &dyn ProgressSink,
-        cancel: &CancellationToken,
-    ) -> Result<ItemOutcome> {
+    pub async fn upload(&self, req: &UploadRequest, ctx: &RunContext<'_>) -> Result<ItemOutcome> {
+        let cancel = ctx.cancel();
         cancel.check()?;
         let source_metadata = std::fs::metadata(&req.source).map_err(|e| {
             Error::not_found(format!("local file `{}`", req.source.display())).with_source(e)
@@ -170,7 +88,7 @@ impl TransferEngine {
         )
         .await?
         {
-            TargetDecision::Finish(outcome) => return Ok(outcome),
+            TargetDecision::Finish(outcome) => return Ok(*outcome),
             TargetDecision::Write(key) => key,
         };
 
@@ -183,10 +101,10 @@ impl TransferEngine {
             ..Default::default()
         };
 
-        let metadata = if size < self.config.multipart_threshold {
-            self.upload_small(req, &key, size, &opts, progress).await?
+        let metadata = if size < ctx.config().multipart_threshold {
+            self.upload_small(req, &key, size, &opts, ctx).await?
         } else {
-            self.upload_multipart(req, &key, fingerprint, &opts, progress, cancel)
+            self.upload_multipart(req, &key, fingerprint, &opts, ctx)
                 .await?
         };
         Ok(ItemOutcome::transferred(
@@ -201,8 +119,9 @@ impl TransferEngine {
         key: &ObjectPath,
         size: u64,
         opts: &PutOptions,
-        progress: &dyn ProgressSink,
+        ctx: &RunContext<'_>,
     ) -> Result<ObjectMetadata> {
+        let progress = ctx.progress();
         let body = bytes::Bytes::from(
             tokio::fs::read(&req.source)
                 .await
@@ -222,15 +141,15 @@ impl TransferEngine {
         key: &ObjectPath,
         fingerprint: FileFingerprint,
         opts: &PutOptions,
-        progress: &dyn ProgressSink,
-        cancel: &CancellationToken,
+        ctx: &RunContext<'_>,
     ) -> Result<ObjectMetadata> {
+        let (cancel, progress) = (ctx.cancel(), ctx.progress());
         let size = fingerprint.size;
         let (connection, bucket) = (req.connection, req.bucket.as_str());
         let file = tokio::fs::File::open(&req.source)
             .await
             .map_err(|e| Error::io("open upload source").with_source(e))?;
-        let mut reader = tokio::io::BufReader::with_capacity(self.config.part_size as usize, file);
+        let mut reader = tokio::io::BufReader::with_capacity(ctx.config().part_size as usize, file);
 
         // The one resume policy: adopt a matching checkpoint, strictly retire
         // a stale one, or begin fresh.
@@ -252,7 +171,7 @@ impl TransferEngine {
         // never drift from the plan positions.
         let mut progress_bytes = done_bytes;
         for (part_number, range) in
-            ChunkPlan::new(size, self.config.part_size).pending(&done_numbers)
+            ChunkPlan::new(size, ctx.config().part_size).pending(&done_numbers)
         {
             let want = (range.end.unwrap_or(range.start) - range.start) as usize;
             cancel.check()?;
@@ -320,9 +239,9 @@ impl TransferEngine {
     pub async fn download(
         &self,
         req: &DownloadRequest,
-        progress: &dyn ProgressSink,
-        cancel: &CancellationToken,
+        ctx: &RunContext<'_>,
     ) -> Result<ItemOutcome> {
+        let (cancel, progress) = (ctx.cancel(), ctx.progress());
         cancel.check()?;
         let meta = self.storage.stat(&req.bucket, &req.key).await?;
 
@@ -336,7 +255,7 @@ impl TransferEngine {
         )
         .await?
         {
-            TargetDecision::Finish(outcome) => return Ok(outcome),
+            TargetDecision::Finish(outcome) => return Ok(*outcome),
             TargetDecision::Write(target) => target,
         };
 
@@ -359,9 +278,8 @@ impl TransferEngine {
         }
         pump(
             &RangedSource::new(self.storage.as_ref(), &req.bucket, &req.key),
-            ChunkPlan::resumed(meta.size, self.config.download_chunk, staged.offset),
-            cancel,
-            progress,
+            ChunkPlan::resumed(meta.size, ctx.config().download_chunk, staged.offset),
+            ctx,
             &mut StagedSink(&mut staged),
         )
         .await?;
@@ -400,12 +318,11 @@ mod tests {
     /// FakeStorage completion check enforces.
     const PART: u64 = 5 * 1024 * 1024;
 
-    fn engine(storage: Arc<FakeStorage>) -> TransferEngine {
-        TransferEngine::new(
-            storage,
-            Arc::new(NoopMultipartStore),
+    /// (engine, its default config): single-put tests stay small and fast.
+    fn engine(storage: Arc<FakeStorage>) -> (TransferEngine, TransferConfig) {
+        (
+            TransferEngine::new(storage, Arc::new(NoopMultipartStore)),
             TransferConfig {
-                // Never multipart: single-put tests stay small and fast.
                 multipart_threshold: u64::MAX,
                 part_size: PART,
                 download_chunk: 4,
@@ -416,10 +333,9 @@ mod tests {
     fn multipart_engine(
         storage: Arc<FakeStorage>,
         checkpoints: Arc<dyn MultipartStore>,
-    ) -> TransferEngine {
-        TransferEngine::new(
-            storage,
-            checkpoints,
+    ) -> (TransferEngine, TransferConfig) {
+        (
+            TransferEngine::new(storage, checkpoints),
             TransferConfig {
                 multipart_threshold: PART,
                 part_size: PART,
@@ -442,7 +358,7 @@ mod tests {
     #[tokio::test]
     async fn small_upload_and_download_round_trip() {
         let storage = Arc::new(FakeStorage::new());
-        let engine = engine(storage.clone());
+        let (engine, config) = engine(storage.clone());
         let source = temp_file("small.txt", b"hello rstore");
         let cancel = CancellationToken::new();
 
@@ -455,11 +371,11 @@ mod tests {
             connection: conn(),
         };
         let out = engine
-            .upload(&req, &rstore_transfer_sink(), &cancel)
+            .upload(&req, &ctx(&cancel, config, &rstore_transfer_sink()))
             .await
             .unwrap();
         assert_eq!(out.bytes, 12);
-        assert!(!out.skipped);
+        assert!(out.disposition.is_success());
         let metadata = out.metadata.expect("successful upload metadata");
         assert_eq!(metadata.key, "docs/small.txt");
         assert_eq!(metadata.size, 12);
@@ -472,7 +388,7 @@ mod tests {
             conflict: ConflictPolicy::Overwrite,
         };
         engine
-            .download(&dl, &rstore_transfer_sink(), &cancel)
+            .download(&dl, &ctx(&cancel, config, &rstore_transfer_sink()))
             .await
             .unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"hello rstore");
@@ -485,7 +401,7 @@ mod tests {
     #[tokio::test]
     async fn unattributed_stale_part_restarts_cleanly() {
         let storage = Arc::new(FakeStorage::new());
-        let engine = engine(storage.clone());
+        let (engine, config) = engine(storage.clone());
         storage.seed("media", "doc.bin", b"abcdef", None);
         let target = std::env::temp_dir().join(format!(
             "rstore-transfer-test-{}-stale/doc.bin",
@@ -505,7 +421,10 @@ mod tests {
             conflict: ConflictPolicy::Overwrite,
         };
         engine
-            .download(&dl, &rstore_transfer_sink(), &CancellationToken::new())
+            .download(
+                &dl,
+                &ctx(&CancellationToken::new(), config, &rstore_transfer_sink()),
+            )
             .await
             .unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"abcdef");
@@ -516,7 +435,7 @@ mod tests {
     #[tokio::test]
     async fn interrupted_download_resumes_byte_exact() {
         let storage = Arc::new(FakeStorage::new());
-        let engine = engine(storage.clone());
+        let (engine, config) = engine(storage.clone());
         let payload: Vec<u8> = (0..24u8).collect();
         storage.seed("media", "doc.bin", &payload, None);
         let target = std::env::temp_dir().join(format!(
@@ -541,7 +460,10 @@ mod tests {
             conflict: ConflictPolicy::Overwrite,
         };
         engine
-            .download(&dl, &rstore_transfer_sink(), &CancellationToken::new())
+            .download(
+                &dl,
+                &ctx(&CancellationToken::new(), config, &rstore_transfer_sink()),
+            )
             .await
             .unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), payload);
@@ -553,7 +475,7 @@ mod tests {
     #[tokio::test]
     async fn unresolved_ask_blocks_instead_of_overwriting() {
         let storage = Arc::new(FakeStorage::new());
-        let engine = engine(storage.clone());
+        let (engine, config) = engine(storage.clone());
         storage.seed("media", "doc.txt", b"original", None);
         let source = temp_file("doc.txt", b"new");
         let cancel = CancellationToken::new();
@@ -566,10 +488,13 @@ mod tests {
             connection: conn(),
         };
         let out = engine
-            .upload(&req, &rstore_transfer_sink(), &cancel)
+            .upload(&req, &ctx(&cancel, config, &rstore_transfer_sink()))
             .await
             .unwrap();
-        assert!(out.blocked);
+        assert!(matches!(
+            out.disposition,
+            rstore_domain::outcome::Disposition::Blocked(_)
+        ));
         assert!(out.detail.as_deref().unwrap().contains("ask"));
         assert_eq!(out.bytes, 0);
         // The existing target is untouched.
@@ -580,7 +505,7 @@ mod tests {
     #[tokio::test]
     async fn multipart_upload_assembles_object() {
         let storage = Arc::new(FakeStorage::new());
-        let engine = multipart_engine(storage.clone(), Arc::new(NoopMultipartStore));
+        let (engine, config) = multipart_engine(storage.clone(), Arc::new(NoopMultipartStore));
         let payload: Vec<u8> = (0..(PART * 2 + 5) as usize)
             .map(|i| (i % 251) as u8)
             .collect();
@@ -596,7 +521,7 @@ mod tests {
             connection: conn(),
         };
         let out = engine
-            .upload(&req, &rstore_transfer_sink(), &cancel)
+            .upload(&req, &ctx(&cancel, config, &rstore_transfer_sink()))
             .await
             .unwrap();
         assert_eq!(out.bytes as usize, payload.len());
@@ -710,9 +635,8 @@ mod tests {
             &payload[PART as usize..(2 * PART) as usize],
         );
 
-        let engine = TransferEngine::new(
-            storage.clone(),
-            Arc::new(store.clone()),
+        let (engine, config) = (
+            TransferEngine::new(storage.clone(), Arc::new(store.clone())),
             TransferConfig {
                 multipart_threshold: PART,
                 part_size: PART,
@@ -728,7 +652,7 @@ mod tests {
             connection: conn(),
         };
         engine
-            .upload(&req, &rstore_transfer_sink(), &cancel)
+            .upload(&req, &ctx(&cancel, config, &rstore_transfer_sink()))
             .await
             .unwrap();
 
@@ -823,9 +747,8 @@ mod tests {
                 .map(|i| (i % 13) as u8)
                 .collect::<Vec<u8>>(),
         );
-        let engine = TransferEngine::new(
-            storage.clone(),
-            Arc::new(checkpoint),
+        let (engine, config) = (
+            TransferEngine::new(storage.clone(), Arc::new(checkpoint)),
             TransferConfig {
                 multipart_threshold: PART,
                 part_size: PART,
@@ -842,7 +765,10 @@ mod tests {
         };
 
         engine
-            .upload(&request, &rstore_transfer_sink(), &CancellationToken::new())
+            .upload(
+                &request,
+                &ctx(&CancellationToken::new(), config, &rstore_transfer_sink()),
+            )
             .await
             .unwrap();
 
@@ -903,9 +829,8 @@ mod tests {
         }
 
         let storage = Arc::new(FakeStorage::new());
-        let engine = TransferEngine::new(
-            storage.clone(),
-            Arc::new(FailingCheckpoint),
+        let (engine, config) = (
+            TransferEngine::new(storage.clone(), Arc::new(FailingCheckpoint)),
             TransferConfig {
                 multipart_threshold: 10,
                 part_size: 10,
@@ -922,7 +847,10 @@ mod tests {
         };
 
         let error = engine
-            .upload(&request, &rstore_transfer_sink(), &CancellationToken::new())
+            .upload(
+                &request,
+                &ctx(&CancellationToken::new(), config, &rstore_transfer_sink()),
+            )
             .await
             .unwrap_err();
 
@@ -933,7 +861,7 @@ mod tests {
     #[tokio::test]
     async fn skip_conflict_leaves_target_untouched() {
         let storage = Arc::new(FakeStorage::new());
-        let engine = engine(storage.clone());
+        let (engine, config) = engine(storage.clone());
         let source = temp_file("s.txt", b"one");
         let cancel = CancellationToken::new();
 
@@ -956,10 +884,10 @@ mod tests {
             connection: conn(),
         };
         let out = engine
-            .upload(&req, &rstore_transfer_sink(), &cancel)
+            .upload(&req, &ctx(&cancel, config, &rstore_transfer_sink()))
             .await
             .unwrap();
-        assert!(out.skipped);
+        assert!(out.disposition.is_not_run());
         assert_eq!(
             storage.stat("media", &key("s.txt")).await.unwrap().size,
             8,
@@ -972,7 +900,7 @@ mod tests {
     #[tokio::test]
     async fn stat_outage_blocks_conflict_decision_instead_of_overwriting() {
         let storage = Arc::new(FakeStorage::new());
-        let engine = engine(storage.clone());
+        let (engine, config) = engine(storage.clone());
         let source = temp_file("s.txt", b"new");
         let cancel = CancellationToken::new();
 
@@ -999,12 +927,18 @@ mod tests {
             connection: conn(),
         };
         let out = engine
-            .upload(&req, &rstore_transfer_sink(), &cancel)
+            .upload(&req, &ctx(&cancel, config, &rstore_transfer_sink()))
             .await
             .unwrap();
         storage.clear_fault(StorageMethod::Stat);
 
-        assert!(out.blocked, "unverifiable target blocks, got {out:?}");
+        assert!(
+            matches!(
+                out.disposition,
+                rstore_domain::outcome::Disposition::Blocked(_)
+            ),
+            "unverifiable target blocks, got {out:?}"
+        );
         assert!(out
             .detail
             .as_deref()
@@ -1020,7 +954,7 @@ mod tests {
     #[tokio::test]
     async fn cancellation_before_start_fails_cancelled() {
         let storage = Arc::new(FakeStorage::new());
-        let engine = engine(storage);
+        let (engine, config) = engine(storage);
         let source = temp_file("c.txt", b"x");
         let cancel = CancellationToken::new();
         cancel.cancel();
@@ -1033,7 +967,7 @@ mod tests {
             connection: conn(),
         };
         let err = engine
-            .upload(&req, &rstore_transfer_sink(), &cancel)
+            .upload(&req, &ctx(&cancel, config, &rstore_transfer_sink()))
             .await
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::Cancelled);
@@ -1092,7 +1026,7 @@ mod tests {
 
         let cancel = CancellationToken::new();
         let storage = Arc::new(FakeStorage::new());
-        let engine = multipart_engine(
+        let (engine, config) = multipart_engine(
             storage.clone(),
             Arc::new(CancelAfterPart {
                 parts_done: Mutex::new(0),
@@ -1113,7 +1047,7 @@ mod tests {
         };
 
         let error = engine
-            .upload(&req, &rstore_transfer_sink(), &cancel)
+            .upload(&req, &ctx(&cancel, config, &rstore_transfer_sink()))
             .await
             .unwrap_err();
 
@@ -1130,7 +1064,7 @@ mod tests {
     #[tokio::test]
     async fn midflight_download_cancellation_keeps_the_staged_part() {
         let storage = Arc::new(FakeStorage::new());
-        let engine = engine(storage.clone());
+        let (engine, config) = engine(storage.clone());
         let payload: Vec<u8> = (0..64u8).collect();
         storage.seed("media", "doc.bin", &payload, None);
 
@@ -1153,7 +1087,7 @@ mod tests {
             conflict: ConflictPolicy::Overwrite,
         };
         let error = engine
-            .download(&dl, &rstore_transfer_sink(), &cancel)
+            .download(&dl, &ctx(&cancel, config, &rstore_transfer_sink()))
             .await
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::Cancelled);
@@ -1163,7 +1097,10 @@ mod tests {
         );
 
         let resumed = engine
-            .download(&dl, &rstore_transfer_sink(), &CancellationToken::new())
+            .download(
+                &dl,
+                &ctx(&CancellationToken::new(), config, &rstore_transfer_sink()),
+            )
             .await
             .unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), payload);
@@ -1171,7 +1108,18 @@ mod tests {
         let _ = resumed;
     }
 
+    use crate::progress::ProgressSink;
+
     fn rstore_transfer_sink() -> crate::progress::NullProgressSink {
         crate::progress::NullProgressSink
+    }
+
+    /// A per-call context over the fixture config.
+    fn ctx<'a>(
+        cancel: &'a CancellationToken,
+        config: TransferConfig,
+        progress: &'a impl ProgressSink,
+    ) -> crate::run::RunContext<'a> {
+        crate::run::RunContext::new(cancel, config, progress)
     }
 }

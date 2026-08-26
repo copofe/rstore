@@ -140,11 +140,11 @@ impl Storage for GuardedStorage {
         self.storage.put(bucket, key, body, opts).await
     }
 
-    async fn copy(&self, req: &CopyRequest, source: &ObjectMetadata) -> Result<ObjectMetadata> {
+    async fn copy(&self, req: &CopyRequest) -> Result<ObjectMetadata> {
         if self.read_only {
             return Err(self.refuse_mutation());
         }
-        self.storage.copy(req, source).await
+        self.storage.copy(req).await
     }
 
     async fn delete(&self, bucket: &str, key: &ObjectPath) -> Result<DeleteOutcome> {
@@ -280,17 +280,13 @@ mod tests {
             .await;
         assert_eq!(put.unwrap_err().code, rstore_domain::ErrorCode::Forbidden);
 
-        let source = storage.stat("media", &key("src.txt")).await.unwrap();
         let copy = storage
-            .copy(
-                &CopyRequest {
-                    source_bucket: "media".into(),
-                    source_key: key("src.txt"),
-                    target_bucket: "media".into(),
-                    target_key: key("b.txt"),
-                },
-                &source,
-            )
+            .copy(&CopyRequest {
+                source_bucket: "media".into(),
+                source_key: key("src.txt"),
+                target_bucket: "media".into(),
+                target_key: key("b.txt"),
+            })
             .await;
         assert_eq!(copy.unwrap_err().code, rstore_domain::ErrorCode::Forbidden);
 

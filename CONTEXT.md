@@ -43,6 +43,15 @@ terms map to crates. Entries are grouped by concern.
 
 - **Registry / Catalog / Transfer / AccessDiagnostics** — the four bounded
   contexts of the domain model.
+- **Outcome vocabulary (`domain::outcome`)** — the one classification
+  vocabulary for batch results, owned by the lowest shared layer:
+  `Disposition` (succeeded / skipped / blocked / failed, with typed
+  `SkipReason` and `BlockReason`), the `Failure` projection, `Severity`,
+  and the single aggregation rule `severity_of`. The transfer engine's
+  `ItemOutcome`, the run loop's verdicts, non-transfer batches (links,
+  tags, removal), and renderers all speak it — no layer re-translates
+  booleans into reasons, and no module keeps a private copy of the
+  severity rule.
 - **Connection** — one S3-compatible endpoint's configuration plus
   credentials. Credentials are stored in the connection row and held in
   memory as `Secret<T>`.
@@ -75,19 +84,38 @@ terms map to crates. Entries are grouped by concern.
   re-recording the same cause upserts one row. One write path
   (`RepairRepository::insert`) serves every producer; the delivery policy —
   backoff schedule, attempt ceiling, dead-letter decision — lives entirely
-  in `OutboxStore::retry`.
+  in `OutboxStore::retry`, as the pure `delivery_decision` function plus
+  its transactional write.
+- **Shared SQL statements** — cross-repository writes share free functions,
+  not repository methods: `upsert_object_on` (remote-object upsert, used by
+  the catalog repo and the index run's page commit) and
+  `upsert_checkpoint_on` (index-checkpoint upsert, used by
+  `save_checkpoint` and the page commit). The shared thing at the seam is
+  the SQL statement, not a repository identity — an aggregate's
+  transaction borrows statements, never another repository's interface.
 - **RemoteMutationReceipt** — the durable fact that a remote operation
   succeeded, committed in the same transaction as its outbox fact.
 - **Storage / StorageFactory** — the provider-neutral storage port and its
-  factory port (`crates/storage-api`).
+  factory port (`crates/storage-api`). `Storage::copy` takes locators only:
+  the adapter stats the source itself and owns its copy strategy; the
+  source bucket must be reachable through the adapter (adapters are built
+  per connection, so same-connection copies address any bucket the
+  connection sees; cross-connection copies relay through the host).
 - **Remote copy entry (`transfer::copy`)** — the one entry that executes a
   remote-to-remote copy: stat the source, apply the conflict decision (the
   probe and rename re-entry live here and nowhere else), route
   same-connection copies to provider-side `Storage::copy` and
   cross-connection copies to the internal relay, and report through
   `ItemOutcome`, including dry-run previews. Guarded adapters from the
-  gateway remain the write-guard proof; settlement stays with the mutation
-  coordinator.
+  gateway remain the write-guard proof; settlement lives with the
+  copy/move settlement module.
+- **Run context (`transfer::run`)** — the vocabulary of one transfer run,
+  owned by no single entry: `TransferConfig` (tuning), `RunContext`
+  (cancel + config + progress, constructed once per run and carried through
+  engine, copy entry, relay, and pump — no layer re-assembles the trio),
+  and `ItemOutcome` (the per-item conclusion). The module is the home for
+  run-level types so the copy entry does not depend on the upload/download
+  engine module for its vocabulary.
 
 ## Batch execution
 
@@ -100,6 +128,15 @@ terms map to crates. Entries are grouped by concern.
   interrupts the run), and the single terminal-state commit. Services supply
   per-item execution and settlement; they no longer call settlements
   inline.
+- **Copy/move settlement (`settlement`)** — the module that owns everything
+  between a succeeded copy item and its final step: rederives the landed
+  target key from the adapter metadata, commits the receipt/outbox unit
+  through the mutation coordinator, projects the catalog (tag mirroring
+  included), and — for moves, recognized by the item's delete-guarded
+  source adapter — verifies the target then deletes the source through the
+  item's guard-issued adapters, revising the verdict on failure. The run
+  loop's settle hook is a one-line handoff; the mutation coordinator keeps
+  only the shared upload/delete settlement machinery and repair recording.
 
 ## Multipart sessions
 
@@ -107,7 +144,10 @@ terms map to crates. Entries are grouped by concern.
   on `storage-api`: `Storage::create_multipart` / `adopt_multipart` return a
   handle owning part upload (`upload_part`), server-side part copy
   (`copy_part`, default `CapabilityUnsupported`; S3 overrides with
-  UploadPartCopy), `complete`, and `abort`. Three failure dispositions ride
+  UploadPartCopy; its production consumer is the S3 adapter's
+  oversized-copy walk, `copy_parts_loop`, which drives it through the
+  session trait object once a copy exceeds the single-shot limit),
+  `complete`, and `abort`. Three failure dispositions ride
   the type and exist exactly once: `complete` never aborts (a checkpointed
   caller resumes), `abort` is strict (failure surfaces),
   `abandon(self)` is warn-only teardown for callers without a resume path.

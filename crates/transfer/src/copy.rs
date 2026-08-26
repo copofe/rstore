@@ -17,24 +17,24 @@ use rstore_domain::Result;
 use rstore_storage_api::model::{CopyRequest as StorageCopyRequest, ObjectMetadata};
 use rstore_storage_api::Storage;
 
-use crate::cancel::CancellationToken;
 use crate::conflict::{decide_target, stat_probe, TargetDecision};
-use crate::engine::ItemOutcome;
-use crate::progress::{Progress, ProgressSink};
+use crate::progress::Progress;
 use crate::relay::{relay, RelayRequest};
-use crate::TransferConfig;
+use crate::run::{ItemOutcome, RunContext};
 
 /// One end of a remote copy: the connected adapter, the connection it
 /// belongs to, and the bucket name the keys resolve against.
 pub struct CopyEndpoint<'a> {
-    storage: &'a Arc<dyn Storage>,
+    storage: Arc<dyn Storage>,
     connection: ConnectionId,
     bucket: &'a str,
 }
 
 impl<'a> CopyEndpoint<'a> {
     /// Binds an endpoint to its adapter, connection, and bucket name.
-    pub fn new(storage: &'a Arc<dyn Storage>, connection: ConnectionId, bucket: &'a str) -> Self {
+    /// Owns the adapter: the conflict probe clones it, and the relay borrow
+    /// dies with the call.
+    pub fn new(storage: Arc<dyn Storage>, connection: ConnectionId, bucket: &'a str) -> Self {
         Self {
             storage,
             connection,
@@ -82,10 +82,9 @@ pub async fn copy(
     target: CopyEndpoint<'_>,
     request: &CopyRequest<'_>,
     dry_run: bool,
-    cancel: &CancellationToken,
-    config: &TransferConfig,
-    progress: &dyn ProgressSink,
+    ctx: &RunContext<'_>,
 ) -> Result<ItemOutcome> {
+    let (cancel, progress) = (ctx.cancel(), ctx.progress());
     cancel.check()?;
     let source_meta: ObjectMetadata = source
         .storage
@@ -95,13 +94,13 @@ pub async fn copy(
     let key = match decide_target(
         request.target_key.as_str(),
         request.conflict,
-        stat_probe(target.storage, target.bucket).as_ref(),
+        stat_probe(&target.storage, target.bucket).as_ref(),
         |name| ObjectPath::new(name.to_owned()),
     )
     .await?
     {
         TargetDecision::Write(key) => key,
-        TargetDecision::Finish(outcome) => return Ok(outcome),
+        TargetDecision::Finish(outcome) => return Ok(*outcome),
     };
 
     if dry_run {
@@ -115,15 +114,12 @@ pub async fn copy(
     let copied = if source.connection == target.connection {
         let copied = target
             .storage
-            .copy(
-                &StorageCopyRequest {
-                    source_bucket: source.bucket.to_string(),
-                    source_key: request.source_key.clone(),
-                    target_bucket: target.bucket.to_string(),
-                    target_key: key.clone(),
-                },
-                &source_meta,
-            )
+            .copy(&StorageCopyRequest {
+                source_bucket: source.bucket.to_string(),
+                source_key: request.source_key.clone(),
+                target_bucket: target.bucket.to_string(),
+                target_key: key.clone(),
+            })
             .await?;
         // The provider-side route never crosses the wire to this host, so
         // batch progress reports the moved size once, here.
@@ -144,9 +140,7 @@ pub async fn copy(
             source.storage.as_ref(),
             target.storage.as_ref(),
             &relay_request,
-            cancel,
-            config,
-            progress,
+            ctx,
         )
         .await?
     };
@@ -167,7 +161,9 @@ mod tests {
     use rstore_test_support::FakeStorage;
 
     use super::*;
-    use crate::progress::NullProgressSink;
+    use crate::cancel::CancellationToken;
+    use crate::progress::{NullProgressSink, ProgressSink};
+    use crate::run::TransferConfig;
 
     fn conn() -> ConnectionId {
         ConnectionId::new_random()
@@ -178,12 +174,12 @@ mod tests {
     }
 
     fn endpoints<'a>(
-        source: &'a Arc<dyn Storage>,
-        target: &'a Arc<dyn Storage>,
+        source: &Arc<dyn Storage>,
+        target: &Arc<dyn Storage>,
     ) -> (CopyEndpoint<'a>, CopyEndpoint<'a>) {
         (
-            CopyEndpoint::new(source, conn(), "src"),
-            CopyEndpoint::new(target, conn(), "dst"),
+            CopyEndpoint::new(source.clone(), conn(), "src"),
+            CopyEndpoint::new(target.clone(), conn(), "dst"),
         )
     }
 
@@ -203,9 +199,11 @@ mod tests {
             dst,
             &CopyRequest::new(src_key, dst_key, conflict),
             dry_run,
-            &CancellationToken::new(),
-            &TransferConfig::default(),
-            &NullProgressSink,
+            &RunContext::new(
+                &CancellationToken::new(),
+                TransferConfig::default(),
+                &NullProgressSink,
+            ),
         )
         .await
     }
@@ -216,22 +214,24 @@ mod tests {
         storage.seed("src", "a.txt", b"alpha", None);
         let endpoint: Arc<dyn Storage> = storage.clone();
         let conn = conn();
-        let src = CopyEndpoint::new(&endpoint, conn, "src");
-        let dst = CopyEndpoint::new(&endpoint, conn, "dst");
+        let src = CopyEndpoint::new(endpoint.clone(), conn, "src");
+        let dst = CopyEndpoint::new(endpoint.clone(), conn, "dst");
 
         let outcome = copy(
             src,
             dst,
             &CopyRequest::new(&key("a.txt"), &key("b.txt"), ConflictPolicy::Overwrite),
             false,
-            &CancellationToken::new(),
-            &TransferConfig::default(),
-            &NullProgressSink,
+            &RunContext::new(
+                &CancellationToken::new(),
+                TransferConfig::default(),
+                &NullProgressSink,
+            ),
         )
         .await
         .unwrap();
 
-        assert!(!outcome.skipped && !outcome.blocked);
+        assert!(outcome.disposition.is_success());
         assert_eq!(outcome.bytes, 5);
         assert!(outcome.metadata.is_some());
         storage.stat("dst", &key("b.txt")).await.unwrap();
@@ -294,7 +294,12 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(outcome.skipped && outcome.dry_run && !outcome.blocked);
+        assert_eq!(
+            outcome.disposition,
+            rstore_domain::outcome::Disposition::Skipped(
+                rstore_domain::outcome::SkipReason::DryRun
+            )
+        );
         assert_eq!(
             outcome.detail.as_deref(),
             Some("would copy to dst/b.txt"),
@@ -321,7 +326,12 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(outcome.skipped && !outcome.dry_run);
+        assert_eq!(
+            outcome.disposition,
+            rstore_domain::outcome::Disposition::Skipped(
+                rstore_domain::outcome::SkipReason::Conflict
+            )
+        );
         let kept = target.stat("dst", &key("b.txt")).await.unwrap();
         assert_eq!(kept.size, 8);
     }
@@ -344,7 +354,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(!outcome.skipped && !outcome.blocked);
+        assert!(outcome.disposition.is_success());
         let page = target
             .list(
                 "dst",
@@ -386,7 +396,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(outcome.blocked);
+        assert!(matches!(
+            outcome.disposition,
+            rstore_domain::outcome::Disposition::Blocked(_)
+        ));
         let kept = target.stat("dst", &key("b.txt")).await.unwrap();
         assert_eq!(kept.size, 8);
     }
@@ -412,16 +425,14 @@ mod tests {
 
         let endpoint: Arc<dyn Storage> = storage.clone();
         let conn = conn();
-        let src = CopyEndpoint::new(&endpoint, conn, "src");
-        let dst = CopyEndpoint::new(&endpoint, conn, "dst");
+        let src = CopyEndpoint::new(endpoint.clone(), conn, "src");
+        let dst = CopyEndpoint::new(endpoint.clone(), conn, "dst");
         copy(
             src,
             dst,
             &CopyRequest::new(&key("a.txt"), &key("b.txt"), ConflictPolicy::Overwrite),
             false,
-            &CancellationToken::new(),
-            &TransferConfig::default(),
-            &sink,
+            &RunContext::new(&CancellationToken::new(), TransferConfig::default(), &sink),
         )
         .await
         .unwrap();

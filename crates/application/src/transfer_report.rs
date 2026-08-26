@@ -3,7 +3,7 @@
 //! [`Disposition`] vocabulary, and the report aggregates into a [`Severity`]
 //! so entry layers never re-derive "did this batch succeed" from counts.
 
-use crate::batch_outcome::{Disposition, Severity};
+use crate::batch_outcome::{severity_of, Disposition, Severity};
 use rstore_domain::job::JobState;
 use rstore_domain::JobId;
 
@@ -45,20 +45,9 @@ impl TransferReport {
     }
 
     /// The aggregate verdict over all items — the single input for exit
-    /// policies in the entry layers.
+    /// policies in the entry layers. The aggregation rule itself is the
+    /// shared [`severity_of`](crate::batch_outcome::severity_of).
     pub fn severity(&self) -> Severity {
-        let mut partial = false;
-        for item in &self.items {
-            match &item.disposition {
-                Disposition::Failed(_) => return Severity::Failed,
-                Disposition::Skipped(_) | Disposition::Blocked(_) => partial = true,
-                Disposition::Succeeded => {}
-            }
-        }
-        if partial {
-            Severity::Partial
-        } else {
-            Severity::AllOk
-        }
+        severity_of(self.items.iter().map(|i| &i.disposition))
     }
 }

@@ -105,7 +105,6 @@ impl Application {
             dependencies.runtime.unit_of_work.clone(),
             dependencies.runtime.repairs.clone(),
             catalog.clone(),
-            dependencies.catalog.catalog_tags.clone(),
             dependencies.runtime.clock.clone(),
         ));
         let locator = crate::locator::CatalogLocator::new(
@@ -152,7 +151,12 @@ impl Application {
             locator.clone(),
             job_repo.clone(),
             dependencies.runtime.clock.clone(),
-            mutations,
+            crate::settlement::Settlement::new(
+                mutations.clone(),
+                catalog.clone(),
+                dependencies.catalog.catalog_tags.clone(),
+                dependencies.runtime.clock.clone(),
+            ),
         ));
         let workspaces = Arc::new(crate::workspace::DefaultWorkspaceService::new(
             dependencies.registry.workspaces.clone(),

@@ -16,6 +16,7 @@ pub mod id;
 pub mod job;
 pub mod link;
 pub mod locator;
+pub mod outcome;
 pub mod policy;
 pub mod remote;
 pub mod secret;

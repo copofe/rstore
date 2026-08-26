@@ -423,17 +423,14 @@ async fn probe_copy(storage: &dyn rstore_storage_api::Storage, bucket: &str) -> 
         )
         .await
     {
-        Ok(meta) => {
+        Ok(_) => {
             storage
-                .copy(
-                    &rstore_storage_api::model::CopyRequest {
-                        source_bucket: bucket.to_string(),
-                        source_key: source.clone(),
-                        target_bucket: bucket.to_string(),
-                        target_key: target.clone(),
-                    },
-                    &meta,
-                )
+                .copy(&rstore_storage_api::model::CopyRequest {
+                    source_bucket: bucket.to_string(),
+                    source_key: source.clone(),
+                    target_bucket: bucket.to_string(),
+                    target_key: target.clone(),
+                })
                 .await
         }
         Err(e) => Err(e),

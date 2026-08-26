@@ -70,11 +70,10 @@ pub(super) async fn connection(
                 ],
             );
             for c in &list {
-                let status = match c.last_test_status {
-                    Some(rstore_domain::connection::ConnectionTestStatus::Ok) => "ok",
-                    Some(rstore_domain::connection::ConnectionTestStatus::Failed) => "failed",
-                    None => "untested",
-                };
+                let status = c
+                    .last_test_status
+                    .map(|status| status.as_str())
+                    .unwrap_or("untested");
                 table
                     .row(vec![c.name.clone(), status.into(), c.endpoint.clone()])
                     .detail(format!("id: {}", c.id));
@@ -184,7 +183,10 @@ pub(super) async fn connection(
             let mut human = format!(
                 "Testing connection `{}` — {}\n",
                 report.connection,
-                if report.status.as_str() == "ok" {
+                if matches!(
+                    report.status,
+                    rstore_domain::connection::ConnectionTestStatus::Ok
+                ) {
                     "OK"
                 } else {
                     "FAILED"
@@ -204,7 +206,7 @@ pub(super) async fn connection(
                 // A failed probe is a failed check: scripts chaining on
                 // `connection test &&` must see it. Same partial-failure
                 // code the batch vocabulary uses.
-                out = out.with_exit_code(13);
+                out = out.with_exit_code(crate::output::EXIT_ITEMS_FAILED);
             }
             Ok(out)
         }

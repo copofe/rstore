@@ -127,8 +127,8 @@ impl Storage for RetryingStorage {
             .await
     }
 
-    async fn copy(&self, req: &CopyRequest, source: &ObjectMetadata) -> Result<ObjectMetadata> {
-        self.retry("copy", || self.inner.copy(req, source)).await
+    async fn copy(&self, req: &CopyRequest) -> Result<ObjectMetadata> {
+        self.retry("copy", || self.inner.copy(req)).await
     }
 
     async fn delete(&self, bucket: &str, key: &ObjectPath) -> Result<DeleteOutcome> {

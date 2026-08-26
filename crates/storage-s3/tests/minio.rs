@@ -139,20 +139,13 @@ async fn minio_satisfies_storage_contract() {
         )
         .await
         .expect("parted-copy source put");
-    let source_meta = small_limit
-        .stat(&bucket, &source)
-        .await
-        .expect("parted-copy source stat");
     let copied = small_limit
-        .copy(
-            &CopyRequest {
-                source_bucket: bucket.clone(),
-                source_key: source.clone(),
-                target_bucket: bucket.clone(),
-                target_key: target.clone(),
-            },
-            &source_meta,
-        )
+        .copy(&CopyRequest {
+            source_bucket: bucket.clone(),
+            source_key: source.clone(),
+            target_bucket: bucket.clone(),
+            target_key: target.clone(),
+        })
         .await
         .expect("parted copy");
     assert_eq!(
@@ -236,15 +229,12 @@ async fn minio_engine_resumes_an_interrupted_upload_byte_exact() {
     // only cloned pools).
     let checkpoints_db = Database::open_in_memory().await.unwrap();
     let checkpoints = Arc::new(checkpoints_db.multipart());
-    let engine = TransferEngine::new(
-        storage.clone(),
-        checkpoints.clone(),
-        TransferConfig {
-            multipart_threshold: PART,
-            part_size: PART,
-            download_chunk: 1024 * 1024,
-        },
-    );
+    let engine = TransferEngine::new(storage.clone(), checkpoints.clone());
+    let config = TransferConfig {
+        multipart_threshold: PART,
+        part_size: PART,
+        download_chunk: 1024 * 1024,
+    };
 
     // Source: two full parts plus a tail so completion needs all three.
     let payload: Vec<u8> = (0..(PART * 2 + 1024) as usize)
@@ -271,7 +261,10 @@ async fn minio_engine_resumes_an_interrupted_upload_byte_exact() {
         token: token.clone(),
     };
     let error = engine
-        .upload(&make_request(), &sink, &token)
+        .upload(
+            &make_request(),
+            &rstore_transfer::RunContext::new(&token, config, &sink),
+        )
         .await
         .expect_err("run must be interrupted by the injected cancel");
     assert_eq!(error.code, rstore_domain::ErrorCode::Cancelled);
@@ -285,8 +278,11 @@ async fn minio_engine_resumes_an_interrupted_upload_byte_exact() {
     let outcome = engine
         .upload(
             &make_request(),
-            &rstore_transfer::NullProgressSink,
-            &CancellationToken::new(),
+            &rstore_transfer::RunContext::new(
+                &CancellationToken::new(),
+                config,
+                &rstore_transfer::NullProgressSink,
+            ),
         )
         .await
         .expect("resumed run must complete");

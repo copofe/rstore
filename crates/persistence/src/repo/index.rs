@@ -117,18 +117,7 @@ impl IndexRunStore for IndexRunRepository {
         at: OffsetDateTime,
     ) -> Result<()> {
         let _write = self.gate.permit().await?;
-        Insert::into("index_checkpoints")
-            .column("bucket_id", uuid_to_text(&bucket))
-            .column("continuation_token", token)
-            .column("updated_at", unix_secs(at))
-            .suffix(
-                "ON CONFLICT(bucket_id) DO UPDATE SET \
-                 continuation_token = excluded.continuation_token, \
-                 updated_at = excluded.updated_at",
-            )
-            .execute(self.gate.pool())
-            .await?;
-        Ok(())
+        upsert_checkpoint_on(self.gate.pool(), bucket, token, at).await
     }
 
     async fn publish_page(&self, commit: &IndexPageCommit) -> Result<()> {
@@ -143,23 +132,10 @@ impl IndexRunStore for IndexRunRepository {
             .write_unit("index page", |tx| {
                 Box::pin(async move {
                     for object in &objects {
-                        super::remote_object::SqliteRemoteObjectRepository::upsert_with_executor(
-                            &mut **tx, object,
-                        )
-                        .await?;
+                        super::remote_object::upsert_object_on(&mut **tx, object).await?;
                     }
                     if let Some(token) = token {
-                        Insert::into("index_checkpoints")
-                            .column("bucket_id", uuid_to_text(&bucket))
-                            .column("continuation_token", token)
-                            .column("updated_at", unix_secs(at))
-                            .suffix(
-                                "ON CONFLICT(bucket_id) DO UPDATE SET \
-                                 continuation_token = excluded.continuation_token, \
-                                 updated_at = excluded.updated_at",
-                            )
-                            .execute(&mut **tx)
-                            .await?;
+                        upsert_checkpoint_on(&mut **tx, bucket, Some(token.as_str()), at).await?;
                     } else {
                         sqlx::query("DELETE FROM index_checkpoints WHERE bucket_id = ?")
                             .bind(uuid_to_text(&bucket))
@@ -272,4 +248,26 @@ pub(crate) fn row_to_run(row: RowReader) -> Result<IndexRun> {
         objects_seen: row.integer("objects_seen")? as u64,
         error_count: row.integer("error_count")? as u64,
     })
+}
+
+/// The index-checkpoint upsert: one statement shared by `save_checkpoint`
+/// and the index run's page commit so the ON CONFLICT shape cannot drift.
+async fn upsert_checkpoint_on(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Sqlite>,
+    bucket: BucketId,
+    token: Option<&str>,
+    at: OffsetDateTime,
+) -> Result<()> {
+    Insert::into("index_checkpoints")
+        .column("bucket_id", uuid_to_text(&bucket))
+        .column("continuation_token", token)
+        .column("updated_at", unix_secs(at))
+        .suffix(
+            "ON CONFLICT(bucket_id) DO UPDATE SET \
+             continuation_token = excluded.continuation_token, \
+             updated_at = excluded.updated_at",
+        )
+        .execute(executor)
+        .await?;
+    Ok(())
 }

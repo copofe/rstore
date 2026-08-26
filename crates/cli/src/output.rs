@@ -105,6 +105,13 @@ pub fn version_output() -> HandlerOutput {
     HandlerOutput::human(human).with_data(data)
 }
 
+/// A batch (or probe) in which any item failed — partial-failure semantics
+/// shared by every batch-shaped command; documented in `docs/cli-guide.md`.
+pub const EXIT_ITEMS_FAILED: i32 = 13;
+
+/// Interrupted by Ctrl+C; the full envelope is still printed before exit.
+pub const EXIT_INTERRUPTED: i32 = 130;
+
 /// Map a domain error code to a stable process exit code.
 pub fn exit_code_for(error: &Error) -> i32 {
     match error.code {

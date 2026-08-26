@@ -13,7 +13,7 @@
 
 use std::future::Future;
 
-use crate::batch_outcome::{BlockReason, Disposition, Failure, SkipReason};
+use crate::batch_outcome::{Disposition, Failure, SkipReason};
 use crate::transfer_report::{TransferReport, TransferReportItem};
 use rstore_application_ports::JobRepository;
 use rstore_domain::job::{ItemState, Job, JobItem, JobKind, JobState};
@@ -132,22 +132,13 @@ impl ItemVerdict {
         Self::from_step(Step::preview(detail))
     }
 
-    /// Maps one engine outcome onto the run vocabulary: previews, conflict
-    /// skips, and blocks keep their detail; transfers carry bytes and the
-    /// adapter's metadata for the settlement hook.
+    /// Maps one engine outcome onto the run vocabulary: the disposition
+    /// rides over as-is (one vocabulary, no re-translation); transfers
+    /// carry bytes and the adapter's metadata for the settlement hook.
     pub fn from_outcome(outcome: &ItemOutcome) -> Self {
-        let disposition = if outcome.dry_run {
-            Disposition::Skipped(SkipReason::DryRun)
-        } else if outcome.skipped {
-            Disposition::Skipped(SkipReason::Conflict)
-        } else if outcome.blocked {
-            Disposition::Blocked(BlockReason::Unresolved)
-        } else {
-            Disposition::Succeeded
-        };
         Self {
             step: Step::Done {
-                disposition,
+                disposition: outcome.disposition.clone(),
                 detail: outcome.detail.clone(),
                 bytes: outcome.bytes,
             },

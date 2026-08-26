@@ -404,6 +404,48 @@ impl Database {
     }
 }
 
+/// Runtime statistics implemented right beside their SQL — the port and its
+/// adapter in one place; adding a statistic touches the trait and this impl
+/// only.
+#[async_trait::async_trait]
+impl rstore_application_ports::RuntimeStats for Database {
+    async fn count_remote_objects(&self) -> Result<u64> {
+        self.count_remote_objects().await
+    }
+
+    async fn count_stale_objects(&self) -> Result<u64> {
+        self.count_stale_objects().await
+    }
+
+    async fn count_tombstones(&self) -> Result<u64> {
+        self.count_tombstones().await
+    }
+
+    async fn count_pending_outbox(&self) -> Result<u64> {
+        self.count_pending_outbox().await
+    }
+
+    async fn count_pending_repairs(&self) -> Result<u64> {
+        self.count_pending_repairs().await
+    }
+
+    async fn count_connections(&self) -> Result<u64> {
+        self.count_connections().await
+    }
+
+    async fn count_untested_connections(&self) -> Result<u64> {
+        self.count_untested_connections().await
+    }
+
+    async fn count_interrupted_jobs(&self) -> Result<u64> {
+        self.count_interrupted_jobs().await
+    }
+
+    async fn size_bytes(&self) -> Result<u64> {
+        self.size_bytes().await
+    }
+}
+
 fn read_options(db_path: &Path) -> SqliteConnectOptions {
     SqliteConnectOptions::new()
         .filename(db_path)

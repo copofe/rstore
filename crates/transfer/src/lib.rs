@@ -16,14 +16,16 @@ mod pump;
 mod relay;
 pub mod retry;
 pub mod retrying_storage;
+pub mod run;
 
 pub use cancel::CancellationToken;
 pub use conflict::{decide_target, stat_probe, TargetDecision};
 pub use copy::{copy, CopyEndpoint, CopyRequest};
-pub use engine::{DownloadRequest, ItemOutcome, TransferConfig, TransferEngine, UploadRequest};
+pub use engine::{DownloadRequest, TransferEngine, UploadRequest};
 pub use progress::{NullProgressSink, Progress, ProgressSink};
 pub use retry::RetryPolicy;
 pub use retrying_storage::RetryingStorage;
+pub use run::{ItemOutcome, RunContext, TransferConfig};
 
 // The checkpoint port (`MultipartStore`, `PendingUpload`, `FileFingerprint`)
 // lives at the storage seam (`rstore_storage_api::multipart`) so persistence

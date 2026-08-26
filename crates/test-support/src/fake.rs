@@ -448,11 +448,10 @@ impl Storage for FakeStorage {
     /// In-memory copy: read the stored body and re-put it through the
     /// normal path so metadata rules, bucket registration and fault
     /// injection (`Read`, then `Put`) stay identical to a real round-trip.
-    async fn copy(
-        &self,
-        req: &rstore_storage_api::model::CopyRequest,
-        source: &ObjectMetadata,
-    ) -> Result<ObjectMetadata> {
+    async fn copy(&self, req: &rstore_storage_api::model::CopyRequest) -> Result<ObjectMetadata> {
+        // The adapter owns the source stat: content type rides from the
+        // stored object, and a missing source fails as NotFound.
+        let source = self.stat(&req.source_bucket, &req.source_key).await?;
         let body = self.read(&req.source_bucket, &req.source_key, None).await?;
         self.put(
             &req.target_bucket,

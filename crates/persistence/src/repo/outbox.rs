@@ -23,6 +23,28 @@ use rstore_domain::Clock;
 
 const MAX_ATTEMPTS: i64 = 8;
 
+/// The delivery decision for one failed delivery: retry after the backoff
+/// schedule, or dead-letter at the attempt ceiling. A pure function so the
+/// schedule and the ceiling have a direct test surface; `retry` owns the
+/// transactional write around it.
+fn delivery_decision(attempts: u32, now: OffsetDateTime) -> DeliveryDecision {
+    if i64::from(attempts) >= MAX_ATTEMPTS {
+        DeliveryDecision::DeadLetter
+    } else {
+        // Backoff schedule: 2^attempts seconds, clamped so the delay never
+        // overflows a Duration.
+        let backoff_seconds = 2_i64.pow(attempts.clamp(1, 8));
+        DeliveryDecision::Retry {
+            next_attempt_at: now + time::Duration::seconds(backoff_seconds),
+        }
+    }
+}
+
+enum DeliveryDecision {
+    Retry { next_attempt_at: OffsetDateTime },
+    DeadLetter,
+}
+
 #[derive(Clone)]
 pub struct OutboxRepository {
     gate: WriteGate,
@@ -284,7 +306,7 @@ impl OutboxStore for OutboxRepository {
                     })?;
                     let event = row_to_event(row)?;
                     let attempts = i64::from(event.attempts);
-                    if attempts >= MAX_ATTEMPTS {
+                    if matches!(delivery_decision(event.attempts, now), DeliveryDecision::DeadLetter) {
                         Self::append_event(tx, &event).await?;
                         sqlx::query(
                             "UPDATE outbox_events SET status = 'repair_required', last_error = ? \
@@ -314,10 +336,12 @@ impl OutboxStore for OutboxRepository {
                         return Ok(());
                     }
 
-                    // Backoff schedule: 2^attempts seconds, bounded so the
-                    // delay never overflows.
-                    let backoff_seconds = 2_i64.pow(event.attempts.clamp(1, 8));
-                    let next_attempt_at = now + time::Duration::seconds(backoff_seconds);
+                    // The schedule lives in `delivery_decision`.
+                    let DeliveryDecision::Retry { next_attempt_at } =
+                        delivery_decision(event.attempts, now)
+                    else {
+                        unreachable!("dead-letter handled above")
+                    };
 
                     sqlx::query(
                         "UPDATE outbox_events SET status = 'pending', available_at = ?, last_error = ? \
@@ -457,6 +481,34 @@ mod tests {
             payload: serde_json::json!({"object_id": "obj-1"}),
             attempts: 0,
         }
+    }
+
+    #[test]
+    fn backoff_schedule_is_exponential_and_bounded() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        for attempts in 1..8u32 {
+            let DeliveryDecision::Retry { next_attempt_at } = delivery_decision(attempts, now)
+            else {
+                panic!("attempt {attempts} must retry")
+            };
+            assert_eq!(
+                next_attempt_at - now,
+                time::Duration::seconds(2_i64.pow(attempts.clamp(1, 8)))
+            );
+        }
+    }
+
+    #[test]
+    fn attempt_ceiling_dead_letters() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        assert!(matches!(
+            delivery_decision(8, now),
+            DeliveryDecision::DeadLetter
+        ));
+        assert!(matches!(
+            delivery_decision(20, now),
+            DeliveryDecision::DeadLetter
+        ));
     }
 
     const EVT1: Uuid = Uuid::from_u128(1);

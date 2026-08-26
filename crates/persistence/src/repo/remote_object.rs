@@ -61,44 +61,6 @@ impl SqliteRemoteObjectRepository {
         })
         .transpose()
     }
-
-    pub(crate) async fn upsert_with_executor<'e, E>(
-        executor: E,
-        object: &RemoteObject,
-    ) -> Result<()>
-    where
-        E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
-    {
-        Insert::into("remote_objects")
-            .column("id", uuid_to_text(&object.id))
-            .column("connection_id", uuid_to_text(&object.connection_id))
-            .column("bucket_id", uuid_to_text(&object.bucket_id))
-            .column("object_path", object.path.as_str())
-            .column("size", object.size as i64)
-            .column("etag", &object.etag)
-            .column("content_type", &object.content_type)
-            .column("last_modified", unix_secs(object.last_modified))
-            .column("storage_class", &object.storage_class)
-            .column("version_id", &object.version_id)
-            .column("confirmed_at", unix_secs(object.confirmed_at))
-            .column("state", object.state.as_str())
-            .column("file_type", object.type_hint().as_str())
-            .suffix(
-                "ON CONFLICT(connection_id, bucket_id, object_path) DO UPDATE SET \
-                 size = excluded.size, \
-                 etag = excluded.etag, \
-                 content_type = excluded.content_type, \
-                 last_modified = excluded.last_modified, \
-                 storage_class = excluded.storage_class, \
-                 version_id = excluded.version_id, \
-                 confirmed_at = excluded.confirmed_at, \
-                 state = excluded.state, \
-                 file_type = excluded.file_type",
-            )
-            .execute(executor)
-            .await?;
-        Ok(())
-    }
 }
 
 #[async_trait]
@@ -141,7 +103,7 @@ impl RemoteObjectRepository for SqliteRemoteObjectRepository {
 
     async fn upsert(&self, object: &RemoteObject) -> Result<()> {
         let _write = self.gate.permit().await?;
-        Self::upsert_with_executor(self.gate.pool(), object).await
+        upsert_object_on(self.gate.pool(), object).await
     }
 
     async fn upsert_many(&self, objects: &[RemoteObject]) -> Result<()> {
@@ -150,7 +112,7 @@ impl RemoteObjectRepository for SqliteRemoteObjectRepository {
             .write_unit("catalog page", |tx| {
                 Box::pin(async move {
                     for object in &objects {
-                        Self::upsert_with_executor(&mut **tx, object).await?;
+                        upsert_object_on(&mut **tx, object).await?;
                     }
                     Ok(())
                 })
@@ -401,4 +363,42 @@ fn row_to_catalog_page_item(row: RowReader) -> Result<rstore_catalog::CatalogPag
         connection_name: row.text("connection_name")?,
         tags,
     })
+}
+
+/// The shared remote-object upsert statement. A free function on purpose:
+/// the index run's page commit calls it inside its own transaction — the
+/// shared thing is the SQL, not a repository identity.
+pub(crate) async fn upsert_object_on<'e, E>(executor: E, object: &RemoteObject) -> Result<()>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    Insert::into("remote_objects")
+        .column("id", uuid_to_text(&object.id))
+        .column("connection_id", uuid_to_text(&object.connection_id))
+        .column("bucket_id", uuid_to_text(&object.bucket_id))
+        .column("object_path", object.path.as_str())
+        .column("size", object.size as i64)
+        .column("etag", &object.etag)
+        .column("content_type", &object.content_type)
+        .column("last_modified", unix_secs(object.last_modified))
+        .column("storage_class", &object.storage_class)
+        .column("version_id", &object.version_id)
+        .column("confirmed_at", unix_secs(object.confirmed_at))
+        .column("state", object.state.as_str())
+        .column("file_type", object.type_hint().as_str())
+        .suffix(
+            "ON CONFLICT(connection_id, bucket_id, object_path) DO UPDATE SET \
+             size = excluded.size, \
+             etag = excluded.etag, \
+             content_type = excluded.content_type, \
+             last_modified = excluded.last_modified, \
+             storage_class = excluded.storage_class, \
+             version_id = excluded.version_id, \
+             confirmed_at = excluded.confirmed_at, \
+             state = excluded.state, \
+             file_type = excluded.file_type",
+        )
+        .execute(executor)
+        .await?;
+    Ok(())
 }

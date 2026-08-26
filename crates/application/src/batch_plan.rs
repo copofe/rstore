@@ -21,7 +21,8 @@ pub struct Endpoint {
     pub storage: Arc<dyn Storage>,
 
     /// `<connection>/<bucket>` prefix used to render per-item labels.
-    base: String,
+    /// Label prefix `<connection>/<bucket>` used to render per-item labels.
+    pub(crate) base: String,
 }
 
 impl Endpoint {

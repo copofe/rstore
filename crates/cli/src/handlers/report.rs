@@ -85,7 +85,7 @@ impl BatchLines {
 /// layer — CLI exit codes here, desktop semantics from the same value.
 pub(super) fn with_severity(mut out: HandlerOutput, severity: Severity) -> HandlerOutput {
     if severity == Severity::Failed {
-        out = out.with_exit_code(13);
+        out = out.with_exit_code(crate::output::EXIT_ITEMS_FAILED);
     }
     out
 }
@@ -140,7 +140,7 @@ pub(super) fn render_entries(
         out = out
             .with_warning(format!("interrupted (Ctrl+C) — {interrupt_hint}"))
             // SIGINT still prints the full envelope before exiting.
-            .with_exit_code(130);
+            .with_exit_code(crate::output::EXIT_INTERRUPTED);
     } else {
         out = with_severity(out, facts.severity);
     }

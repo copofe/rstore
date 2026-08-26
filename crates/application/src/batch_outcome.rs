@@ -1,90 +1,20 @@
 //! One vocabulary for per-item batch results and their aggregate severity.
 //!
-//! Every batch-shaped operation classifies each item with the same
-//! [`Disposition`] — succeeded, skipped with a typed reason, blocked by a
-//! guard or an unresolved policy, or failed — and aggregates the run into a
-//! [`Severity`]. Severity is the single home of the question "did this batch
-//! succeed": renderers map dispositions to display, and entry layers map
-//! severity onto their own exit semantics, without re-deriving policy from
-//! raw counts.
+//! The classification words themselves ([`Disposition`], [`SkipReason`],
+//! [`BlockReason`], [`Severity`]) live in `rstore_domain::outcome` so every
+//! layer shares them; this module adds the reportable shapes on top: the
+//! cloneable [`Failure`] projection of a domain error, and the generic
+//! per-item [`ItemOutcome`] plus [`BatchOutcome`] aggregates used by
+//! non-transfer batches (links, tags, removal).
 //!
 //! [`Failure`] is a cloneable, serializable projection of a domain error —
 //! reports outlive the error values that produced them.
 
-use rstore_domain::{Error, ErrorCode};
+pub use rstore_domain::outcome::{
+    severity_of, BlockReason, Disposition, Failure, Severity, SkipReason,
+};
+
 use serde::ser::{Serialize, SerializeStruct, Serializer};
-
-/// Why an item was intentionally not executed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SkipReason {
-    /// Dry run: the operation was fully resolved but deliberately not
-    /// executed.
-    DryRun,
-    /// The conflict policy declined the planned target (e.g. it exists and
-    /// the policy says skip).
-    Conflict,
-}
-
-/// Why a guard or policy refused the item before it could run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BlockReason {
-    /// The bucket forbids mutations.
-    ReadOnly,
-    /// The bucket forbids deletions.
-    DeleteForbidden,
-    /// The conflict policy could not resolve a target (unresolved `ask`, or
-    /// rename found no free name).
-    Unresolved,
-}
-
-/// Cloneable projection of one item's error: what a report can carry after
-/// the live [`Error`] is gone.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct Failure {
-    pub code: ErrorCode,
-    pub message: String,
-}
-
-impl Failure {
-    /// Projects a live domain error into its reportable form.
-    pub fn from_error(e: &Error) -> Self {
-        Self {
-            code: e.code,
-            message: e.to_string(),
-        }
-    }
-}
-
-/// Terminal classification of one batch item.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Disposition {
-    /// The item completed as requested.
-    Succeeded,
-    /// The item was intentionally not executed.
-    Skipped(SkipReason),
-    /// A guard or an unresolvable policy refused the item.
-    Blocked(BlockReason),
-    /// The item failed.
-    Failed(Failure),
-}
-
-impl Disposition {
-    /// Stable machine tag for serialization and rendering (`"succeeded"`,
-    /// `"skipped"`, `"blocked"`, `"failed"`).
-    pub fn tag(&self) -> &'static str {
-        match self {
-            Self::Succeeded => "succeeded",
-            Self::Skipped(_) => "skipped",
-            Self::Blocked(_) => "blocked",
-            Self::Failed(_) => "failed",
-        }
-    }
-
-    /// Whether the item completed as requested.
-    pub fn is_success(&self) -> bool {
-        matches!(self, Self::Succeeded)
-    }
-}
 
 /// One item's result: its display target, the [`Disposition`], optional free
 /// detail text (guard message, conflict detail, dry-run preview), and the
@@ -129,7 +59,7 @@ impl<T> ItemOutcome<T> {
     }
 
     /// A failed item projected from a live domain error.
-    pub fn failed(target: impl Into<String>, e: &Error) -> Self {
+    pub fn failed(target: impl Into<String>, e: &rstore_domain::Error) -> Self {
         Self {
             target: target.into(),
             disposition: Disposition::Failed(Failure::from_error(e)),
@@ -199,29 +129,17 @@ impl<T> BatchOutcome<T> {
 
     /// Items skipped or blocked.
     pub fn not_run(&self) -> usize {
-        self.count(|d| matches!(d, Disposition::Skipped(_) | Disposition::Blocked(_)))
+        self.count(|d| d.is_not_run())
     }
 
     fn count(&self, f: impl Fn(&Disposition) -> bool) -> usize {
         self.items.iter().filter(|i| f(&i.disposition)).count()
     }
 
-    /// The aggregate verdict. `Failed` dominates, then `Partial` (something
-    /// did not run), else `AllOk`. An empty batch is `AllOk`.
+    /// The aggregate verdict — the single rule, shared with every other
+    /// batch shape via [`severity_of`].
     pub fn severity(&self) -> Severity {
-        let mut partial = false;
-        for item in &self.items {
-            match &item.disposition {
-                Disposition::Failed(_) => return Severity::Failed,
-                Disposition::Skipped(_) | Disposition::Blocked(_) => partial = true,
-                Disposition::Succeeded => {}
-            }
-        }
-        if partial {
-            Severity::Partial
-        } else {
-            Severity::AllOk
-        }
+        severity_of(self.items.iter().map(|i| &i.disposition))
     }
 }
 
@@ -237,24 +155,10 @@ impl<T> FromIterator<ItemOutcome<T>> for BatchOutcome<T> {
     }
 }
 
-/// The aggregate verdict for a batch. Ordered from best to worst so runs of
-/// batches combine with `max`.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum Severity {
-    /// Every item succeeded (vacuously for an empty batch).
-    AllOk,
-    /// Nothing failed, but at least one item was skipped or blocked.
-    Partial,
-    /// At least one item failed.
-    Failed,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstore_domain::Error;
 
     fn ok(target: &str) -> ItemOutcome<()> {
         ItemOutcome::succeeded(target, None)
@@ -262,53 +166,69 @@ mod tests {
 
     #[test]
     fn severity_all_ok_when_everything_succeeds() {
-        let batch: BatchOutcome<()> = [ok("a"), ok("b")].into_iter().collect();
+        let batch = BatchOutcome::<()>::new(vec![ok("a"), ok("b")]);
         assert_eq!(batch.severity(), Severity::AllOk);
         assert_eq!(batch.succeeded(), 2);
     }
 
     #[test]
     fn empty_batch_is_all_ok() {
-        let batch: BatchOutcome<()> = BatchOutcome::new(Vec::new());
+        let batch = BatchOutcome::<()>::new(vec![]);
         assert_eq!(batch.severity(), Severity::AllOk);
         assert!(batch.is_empty());
     }
 
     #[test]
     fn skipped_without_failure_is_partial() {
-        let batch: BatchOutcome<()> = [
+        let batch = BatchOutcome::<()>::new(vec![
             ok("a"),
-            ItemOutcome::skipped("b", SkipReason::DryRun, Some("would copy".into())),
-        ]
-        .into_iter()
-        .collect();
+            ItemOutcome::skipped("b", SkipReason::Conflict, None),
+        ]);
         assert_eq!(batch.severity(), Severity::Partial);
         assert_eq!(batch.not_run(), 1);
     }
 
     #[test]
     fn failure_dominates_partial() {
-        let e = Error::unknown("boom");
-        let batch: BatchOutcome<()> = [
+        let batch = BatchOutcome::<()>::new(vec![
             ok("a"),
-            ItemOutcome::blocked("b", BlockReason::ReadOnly, None),
-            ItemOutcome::failed("c", &e),
-        ]
-        .into_iter()
-        .collect();
+            ItemOutcome::skipped("b", SkipReason::Conflict, None),
+            ItemOutcome::failed("c", &Error::not_found("x")),
+        ]);
         assert_eq!(batch.severity(), Severity::Failed);
-        assert_eq!(batch.failed(), 1);
         assert_eq!(batch.succeeded(), 1);
+        assert_eq!(batch.failed(), 1);
         assert_eq!(batch.not_run(), 1);
     }
 
     #[test]
     fn failure_message_projects_display_text() {
-        let e = Error::unknown("boom");
-        let item: ItemOutcome<()> = ItemOutcome::failed("a", &e);
+        let e = Error::not_found("thing missing");
+        let item = ItemOutcome::<()>::failed("a", &e);
         match item.disposition {
             Disposition::Failed(f) => assert_eq!(f.message, e.to_string()),
-            other => panic!("expected failed, got {other:?}"),
+            other => panic!("expected failure, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn failed_items_dominate_the_aggregate() {
+        let batch = BatchOutcome::<()>::new(vec![
+            ok("a"),
+            ItemOutcome::failed("b", &Error::not_found("x")),
+        ]);
+        assert_eq!(batch.severity(), Severity::Failed);
+        assert_eq!(batch.failed(), 1);
+        assert_eq!(batch.not_run(), 0);
+    }
+
+    #[test]
+    fn serialized_shape_keeps_flat_fields() {
+        let item = ItemOutcome::<()>::succeeded("a", None);
+        let json = serde_json::to_string(&item).unwrap();
+        assert_eq!(
+            json,
+            r#"{"target":"a","disposition":"succeeded","detail":null}"#
+        );
     }
 }

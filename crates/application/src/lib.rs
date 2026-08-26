@@ -32,6 +32,7 @@ pub mod outbox;
 pub mod ports;
 pub mod reference;
 pub mod remote;
+pub(crate) mod settlement;
 pub mod tag;
 pub mod transfer;
 mod transfer_plan;

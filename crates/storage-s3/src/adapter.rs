@@ -309,15 +309,17 @@ impl Storage for S3Storage {
 
     /// Server-side copy: one `CopyObject` action up to S3's 5 GiB atomic
     /// limit, a part-copy session beyond it — no object bytes transit the
-    /// local device either way. The target's metadata is derived from the
-    /// caller's source stat plus the provider's copy result (which carries
-    /// the new ETag and modification time but no size).
-    async fn copy(&self, req: &CopyRequest, source: &ObjectMetadata) -> Result<ObjectMetadata> {
+    /// local device either way. The source is stated here (the port's
+    /// callers pass locators only) and the target's metadata is derived
+    /// from that stat plus the provider's copy result (which carries the
+    /// new ETag and modification time but no size).
+    async fn copy(&self, req: &CopyRequest) -> Result<ObjectMetadata> {
+        let source = self.stat(&req.source_bucket, &req.source_key).await?;
         let copy_source = copy_source_header(&req.source_bucket, req.source_key.as_str());
         if source.size <= self.single_copy_limit {
-            self.copy_single(req, &copy_source, source).await
+            self.copy_single(req, &copy_source, &source).await
         } else {
-            self.copy_by_parts(req, source).await
+            self.copy_by_parts(req, &source).await
         }
     }
 

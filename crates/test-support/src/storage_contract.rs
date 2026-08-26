@@ -203,15 +203,12 @@ pub async fn storage_contract(storage: &dyn Storage, bucket: &str) {
     // content type), and the source is untouched.
     let copy_target = key("contract/round-trip.copy.txt");
     let copied = storage
-        .copy(
-            &CopyRequest {
-                source_bucket: bucket.to_string(),
-                source_key: object.clone(),
-                target_bucket: bucket.to_string(),
-                target_key: copy_target.clone(),
-            },
-            &stat,
-        )
+        .copy(&CopyRequest {
+            source_bucket: bucket.to_string(),
+            source_key: object.clone(),
+            target_bucket: bucket.to_string(),
+            target_key: copy_target.clone(),
+        })
         .await
         .expect("contract copy");
     assert_eq!(copied.key, copy_target.as_str());

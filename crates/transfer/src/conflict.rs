@@ -13,7 +13,7 @@ use rstore_domain::remote::ObjectPath;
 use rstore_domain::{ErrorCode, Result};
 use rstore_storage_api::Storage;
 
-use crate::engine::ItemOutcome;
+use crate::run::ItemOutcome;
 
 /// A storage-backed existence probe: a name is taken when the target bucket
 /// holds an object with that key. A missing object reads `Free`; anything
@@ -62,7 +62,7 @@ pub enum TargetDecision<T> {
     /// renamed it).
     Write(T),
     /// The item is done without a transfer (skipped or blocked).
-    Finish(ItemOutcome),
+    Finish(Box<ItemOutcome>),
 }
 
 /// Interpret `policy` at `name`, mapping the final name through `rename`.
@@ -81,10 +81,14 @@ pub async fn decide_target<T>(
             .interpret()
         {
             Resolved::Skipped(detail) => {
-                return Ok(TargetDecision::Finish(ItemOutcome::skipped(detail)))
+                return Ok(TargetDecision::Finish(Box::new(ItemOutcome::skipped(
+                    detail,
+                ))))
             }
             Resolved::Blocked(detail) => {
-                return Ok(TargetDecision::Finish(ItemOutcome::blocked(detail)))
+                return Ok(TargetDecision::Finish(Box::new(ItemOutcome::blocked(
+                    detail,
+                ))))
             }
             Resolved::Write(final_name) => {
                 let target = rename(&final_name)?;

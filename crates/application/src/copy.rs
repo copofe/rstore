@@ -25,19 +25,44 @@ pub struct CopyPair {
 }
 
 #[derive(Clone)]
-struct Item {
-    src: Arc<crate::batch_plan::Endpoint>,
-    src_path: ObjectPath,
-    dst: Arc<crate::batch_plan::Endpoint>,
-    dst_path: ObjectPath,
+pub(crate) struct Item {
+    pub(crate) src: Arc<crate::batch_plan::Endpoint>,
+    pub(crate) src_path: ObjectPath,
+    pub(crate) dst: Arc<crate::batch_plan::Endpoint>,
+    pub(crate) dst_path: ObjectPath,
     /// The guard-issued mutation adapter for the target bucket: the copy
     /// executes through it, so the guard travels with the item.
-    dst_storage: Arc<dyn rstore_storage_api::Storage>,
+    pub(crate) dst_storage: Arc<dyn rstore_storage_api::Storage>,
     /// The delete-guarded adapter for a move's source bucket; its presence
     /// is the move flag.
-    src_delete: Option<Arc<dyn rstore_storage_api::Storage>>,
+    pub(crate) src_delete: Option<Arc<dyn rstore_storage_api::Storage>>,
     source_label: String,
     target_label: String,
+}
+
+#[cfg(test)]
+impl Item {
+    /// Test-only direct assembly (labels are empty): settlement tests build
+    /// items without the expansion pipeline.
+    pub(crate) fn for_test(
+        src: Arc<crate::batch_plan::Endpoint>,
+        src_path: ObjectPath,
+        dst: Arc<crate::batch_plan::Endpoint>,
+        dst_path: ObjectPath,
+        dst_storage: Arc<dyn rstore_storage_api::Storage>,
+        src_delete: Option<Arc<dyn rstore_storage_api::Storage>>,
+    ) -> Self {
+        Self {
+            src,
+            src_path,
+            dst,
+            dst_path,
+            dst_storage,
+            src_delete,
+            source_label: String::new(),
+            target_label: String::new(),
+        }
+    }
 }
 
 /// Options for copy and move runs.
@@ -110,7 +135,7 @@ pub struct DefaultCopyService {
     locator: crate::locator::CatalogLocator,
     jobs: Arc<dyn JobRepository>,
     clock: Arc<dyn Clock>,
-    mutations: Arc<crate::mutation::MutationCoordinator>,
+    settlement: crate::settlement::Settlement,
 }
 
 impl DefaultCopyService {
@@ -120,14 +145,14 @@ impl DefaultCopyService {
         locator: crate::locator::CatalogLocator,
         jobs: Arc<dyn JobRepository>,
         clock: Arc<dyn Clock>,
-        mutations: Arc<crate::mutation::MutationCoordinator>,
+        settlement: crate::settlement::Settlement,
     ) -> Self {
         Self {
             gateway,
             locator,
             jobs,
             clock,
-            mutations,
+            settlement,
         }
     }
 
@@ -264,11 +289,9 @@ impl DefaultCopyService {
                     crate::job_run::ItemVerdict::from_engine_result(result)
                 }
             },
-            |item, verdict| async move {
-                match self.settle_item(&item, verdict, options).await {
-                    Ok(step) => step,
-                    Err(e) => crate::job_run::Step::failed(&e),
-                }
+            |item, verdict| {
+                let keep_tags = options.keep_tags;
+                async move { self.settlement.settle(&item, verdict, keep_tags).await }
             },
         )
         .await
@@ -296,119 +319,28 @@ impl DefaultCopyService {
         // The target runs through the guard-issued adapter; the source
         // stays raw because a copy only reads from it.
         let source = rstore_transfer::CopyEndpoint::new(
-            &src.storage,
+            src.storage.clone(),
             src.bucket.connection_id,
             &src.bucket.name,
         );
         let target = rstore_transfer::CopyEndpoint::new(
-            dst_storage,
+            dst_storage.clone(),
             dst.bucket.connection_id,
             &dst.bucket.name,
         );
         let request = rstore_transfer::CopyRequest::new(src_path, dst_path, options.conflict);
 
-        let mut outcome = rstore_transfer::copy(
-            source,
-            target,
-            &request,
-            options.dry_run,
-            cancel,
-            &options.config,
-            progress,
-        )
-        .await?;
+        let ctx = rstore_transfer::RunContext::new(cancel, options.config, progress);
+        let mut outcome =
+            rstore_transfer::copy(source, target, &request, options.dry_run, &ctx).await?;
 
         // A move's preview names the delete that would follow it.
-        if outcome.dry_run && item.src_delete.is_some() {
+        if outcome.disposition.is_not_run() && item.src_delete.is_some() {
             if let Some(detail) = &mut outcome.detail {
                 detail.push_str(" (then delete source)");
             }
         }
         Ok(outcome)
-    }
-
-    /// Settles one succeeded copy: receipt plus outbox fact, catalog
-    /// projection, and — for moves — verification and source deletion. A
-    /// failed move verification revises the item to a failure.
-    async fn settle_item(
-        &self,
-        item: &Item,
-        verdict: crate::job_run::ItemVerdict,
-        options: &CopyOptions,
-    ) -> Result<crate::job_run::Step> {
-        // The loop settles only succeeded items, so the verdict is a Done.
-        let bytes = match verdict.step {
-            crate::job_run::Step::Done { bytes, .. } => bytes,
-            crate::job_run::Step::Interrupted => 0,
-        };
-        let Some(copied) = verdict.metadata.as_ref() else {
-            // Settling runs only for succeeded items; those always carry the
-            // adapter's metadata.
-            return Ok(crate::job_run::Step::succeeded());
-        };
-        let Item {
-            src, dst, src_path, ..
-        } = item;
-        // The conflict policy may have renamed the target; the adapter's
-        // metadata reports the key that actually landed.
-        let dst_path = ObjectPath::new(copied.key.clone())?;
-
-        let now = self.clock.now();
-        let source = crate::mutation::CatalogObjectRef::new(
-            src.bucket.connection_id,
-            src.bucket.id,
-            src_path,
-        );
-        let target = crate::mutation::CatalogObjectRef::new(
-            dst.bucket.connection_id,
-            dst.bucket.id,
-            &dst_path,
-        );
-        let follow_up =
-            crate::mutation::CopyFollowUp::new(source, target, copied, options.keep_tags, now);
-        let settlement = self.mutations.settle_copy(&follow_up).await;
-
-        // Moves carry the delete-guarded source adapter on the item; its
-        // presence is the move flag.
-        if let Some(delete_storage) = item.src_delete.as_ref() {
-            let source = crate::mutation::MoveEndpoint {
-                storage: delete_storage.as_ref(),
-                connection: src.bucket.connection_id,
-                bucket_id: src.bucket.id,
-                bucket_name: &src.bucket.name,
-                path: src_path,
-            };
-            let target = crate::mutation::MoveEndpoint {
-                storage: item.dst_storage.as_ref(),
-                connection: dst.bucket.connection_id,
-                bucket_id: dst.bucket.id,
-                bucket_name: &dst.bucket.name,
-                path: &dst_path,
-            };
-            return Ok(
-                match self
-                    .mutations
-                    .finish_move(&settlement, &follow_up, &source, &target)
-                    .await
-                {
-                    crate::mutation::MoveFinish::Completed => crate::job_run::Step::Done {
-                        disposition: crate::batch_outcome::Disposition::Succeeded,
-                        detail: None,
-                        bytes,
-                    },
-                    crate::mutation::MoveFinish::VerifyFailed(message)
-                    | crate::mutation::MoveFinish::DeleteFailed(message) => {
-                        crate::job_run::Step::failed_msg(message)
-                    }
-                },
-            );
-        }
-
-        Ok(crate::job_run::Step::Done {
-            disposition: crate::batch_outcome::Disposition::Succeeded,
-            detail: None,
-            bytes,
-        })
     }
 }
 

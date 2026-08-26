@@ -9,9 +9,12 @@ use rstore_domain::remote::ObjectPath;
 use rstore_domain::Result;
 use rstore_storage_api::{MultipartSession, ObjectMetadata, PutOptions, Storage, UploadedPart};
 
-use crate::progress::{Progress, ProgressSink};
+use crate::progress::Progress;
 use crate::pump::{pump, ChunkPlan, ChunkSink, RangedSource};
-use crate::{CancellationToken, TransferConfig};
+#[cfg(test)]
+use crate::run::TransferConfig;
+#[cfg(test)]
+use crate::CancellationToken;
 
 /// The locators and source metadata for one cross-adapter relay.
 pub(crate) struct RelayRequest<'a> {
@@ -45,10 +48,9 @@ pub(crate) async fn relay(
     source: &dyn Storage,
     target: &dyn Storage,
     request: &RelayRequest<'_>,
-    cancel: &CancellationToken,
-    config: &TransferConfig,
-    progress: &dyn ProgressSink,
+    ctx: &crate::run::RunContext<'_>,
 ) -> Result<ObjectMetadata> {
+    let (cancel, config, progress) = (ctx.cancel(), ctx.config(), ctx.progress());
     cancel.check()?;
     let opts = PutOptions {
         content_type: request.metadata.content_type.clone(),
@@ -73,7 +75,7 @@ pub(crate) async fn relay(
     let session = target
         .create_multipart(request.target_bucket, request.target_key, &opts)
         .await?;
-    let result = relay_parts(source, session.as_ref(), request, cancel, config, progress).await;
+    let result = relay_parts(source, session.as_ref(), request, ctx).await;
     if result.is_err() {
         // No checkpoint exists to resume from — clean up the provider
         // upload, warn-only; the original error stays the answer.
@@ -103,10 +105,9 @@ async fn relay_parts(
     source: &dyn Storage,
     session: &dyn MultipartSession,
     request: &RelayRequest<'_>,
-    cancel: &CancellationToken,
-    config: &TransferConfig,
-    progress: &dyn ProgressSink,
+    ctx: &crate::run::RunContext<'_>,
 ) -> Result<ObjectMetadata> {
+    let (cancel, config) = (ctx.cancel(), ctx.config());
     let mut uploader = PartUploader {
         session,
         parts: Vec::new(),
@@ -114,8 +115,7 @@ async fn relay_parts(
     pump(
         &RangedSource::new(source, request.source_bucket, request.source_key),
         ChunkPlan::new(request.metadata.size, config.part_size),
-        cancel,
-        progress,
+        ctx,
         &mut uploader,
     )
     .await?;
@@ -168,9 +168,7 @@ mod tests {
             source,
             target,
             request,
-            cancel,
-            &part_config(),
-            &crate::NullProgressSink,
+            &crate::run::RunContext::new(cancel, part_config(), &crate::NullProgressSink),
         )
         .await
     }
@@ -209,9 +207,11 @@ mod tests {
                     &ObjectPath::new("obj.bin").unwrap(),
                     &metadata,
                 ),
-                &CancellationToken::new(),
-                &part_config(),
-                &crate::NullProgressSink,
+                &crate::run::RunContext::new(
+                    &CancellationToken::new(),
+                    part_config(),
+                    &crate::NullProgressSink,
+                ),
             )
             .await
             .unwrap_or_else(|e| panic!("size {size}: {e}"));
@@ -250,9 +250,7 @@ mod tests {
                 &ObjectPath::new("copy.bin").unwrap(),
                 &metadata,
             ),
-            &CancellationToken::new(),
-            &part_config(),
-            &sink,
+            &crate::run::RunContext::new(&CancellationToken::new(), part_config(), &sink),
         )
         .await
         .unwrap();

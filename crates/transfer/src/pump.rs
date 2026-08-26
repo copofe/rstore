@@ -11,8 +11,7 @@ use rstore_domain::remote::ObjectPath;
 use rstore_domain::Result;
 use rstore_storage_api::{ReadRange, Storage};
 
-use crate::cancel::CancellationToken;
-use crate::progress::{Progress, ProgressSink};
+use crate::progress::Progress;
 
 /// Successive exclusive ranges of at most `chunk` bytes covering a `[start,
 /// total)` window. `start` is where the walk resumes — a staged file's
@@ -111,10 +110,10 @@ pub trait ChunkSink {
 pub async fn pump(
     source: &RangedSource<'_>,
     plan: ChunkPlan,
-    cancel: &CancellationToken,
-    progress: &dyn ProgressSink,
+    ctx: &crate::run::RunContext<'_>,
     sink: &mut dyn ChunkSink,
 ) -> Result<()> {
+    let (cancel, progress) = (ctx.cancel(), ctx.progress());
     let mut done = plan.start();
     for (index, range) in plan.ranges().enumerate() {
         cancel.check()?;
