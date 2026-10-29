@@ -1,10 +1,10 @@
 //! Command dispatch and the per-domain handler modules.
 //!
-//! Each domain owns one module (`connection`, `bucket`, `remote`, `task`,
-//! `transfer`, `url`, plus `misc` for config/doctor and `files` for index /
-//! files / catalog maintenance); interactive TTY policy lives in the `tty`
-//! module and
-//! shared formatting in [`format`]. Handlers produce a
+//! Each domain owns one module (`connection`, `bucket`, `workspace`, `tag`,
+//! `task`, `url`; `remote` for `ls`/`stat`/`rm`, `transfer` for `cp`/`mv`,
+//! `files` for `find` and `index`, `misc` for config/doctor); interactive TTY
+//! policy lives in the `tty` module and shared formatting in [`format`].
+//! Every handler reads the per-run [`Ctx`] and produces a
 //! [`crate::output::HandlerOutput`] carrying both structured `data` and the
 //! pre-rendered human string — results go to stdout, diagnostics to stderr.
 
@@ -22,9 +22,11 @@ mod tty;
 mod url;
 mod workspace;
 
-use rstore_domain::Result;
+use std::collections::HashMap;
+
+use rstore_application::{ApplicationApi, CancellationToken, RemoteUri, WorkspaceRef};
+use rstore_domain::{BucketId, Result, Workspace};
 use rstore_platform::AppDirs;
-use rstore_transfer::CancellationToken;
 use serde::Serialize;
 
 use crate::args::{Cli, Command, ConfigCommand};
@@ -71,20 +73,64 @@ pub(super) fn merge_field(
     Ok(serde_json::Value::Object(map))
 }
 
+/// Per-run inputs every handler reads: the API handle, the run's
+/// cancellation token and prompt policy, and the global flags.
+struct Ctx<'a> {
+    app: &'a ApplicationApi,
+    cancel: &'a CancellationToken,
+    /// One prompt policy per run: every confirmation, credential prompt, and
+    /// conflict question reads it (`--json` closes the pipe).
+    session: tty::Session,
+    /// `-y`: destructive actions are confirmed up front.
+    yes: bool,
+    quiet: bool,
+    /// `-w`, when given.
+    explicit_workspace: Option<WorkspaceRef>,
+}
+
+impl Ctx<'_> {
+    /// The workspace a catalog command targets: `-w`, else the current one,
+    /// else the only one.
+    async fn workspace(&self) -> Result<Workspace> {
+        self.app
+            .catalog()
+            .workspaces()
+            .target(self.explicit_workspace.as_ref())
+            .await
+    }
+}
+
 /// Dispatch a parsed [`Cli`] invocation against the application API, sharing
-/// one TTY session across every handler in the run.
+/// one [`Ctx`] across every handler in the run.
 pub async fn run_api(
     cli: &Cli,
-    app: &rstore_application::ApplicationApi,
+    app: &ApplicationApi,
     dirs: &AppDirs,
     cancel: &CancellationToken,
 ) -> HandlerResult {
-    // One prompt policy per run: every confirmation, credential prompt, and
-    // conflict question reads it (`--json` closes the pipe).
-    let session = tty::Session::detect(cli.json);
+    let ctx = Ctx {
+        app,
+        cancel,
+        session: tty::Session::detect(cli.json),
+        yes: cli.yes,
+        quiet: cli.quiet,
+        explicit_workspace: cli.workspace.as_deref().map(WorkspaceRef::parse),
+    };
     match &cli.command {
         Command::Version => Ok(version_output()),
-        Command::Doctor => misc::doctor(app, dirs).await,
+        Command::Ls(args) => remote::ls(&ctx, args).await,
+        Command::Stat { reference, offline } => remote::stat(&ctx, reference, *offline).await,
+        Command::Cp(args) => transfer::cp(&ctx, args).await,
+        Command::Mv(args) => transfer::mv(&ctx, args).await,
+        Command::Rm(args) => remote::rm(&ctx, args).await,
+        Command::Url(args) => url::url(&ctx, args).await,
+        Command::Find(args) => files::find(&ctx, args).await,
+        Command::Tag { action } => tag::tag(&ctx, action).await,
+        Command::Connection { action } => connection::connection(&ctx, action).await,
+        Command::Bucket { action } => bucket::bucket(&ctx, action).await,
+        Command::Workspace { action } => workspace::workspace(&ctx, action).await,
+        Command::Index { action } => files::index(&ctx, action).await,
+        Command::Task { action } => task::task(&ctx, action).await,
         Command::Config { action } => match action {
             ConfigCommand::Show => misc::config_show(dirs),
             ConfigCommand::Export { out } => misc::config_export(out.as_deref(), app).await,
@@ -92,99 +138,66 @@ pub async fn run_api(
                 misc::config_import(path, *dry_run, app).await
             }
         },
-        Command::Connection { action } => connection::connection(action, app, &session).await,
-        Command::Bucket { action } => bucket::bucket(action, app, &session).await,
-        Command::Remote { action } => remote::remote(action, app, &session).await,
-        Command::Rm {
-            uris,
-            recursive,
-            dry_run,
-            yes,
-        } => remote::rm(app, uris, *recursive, *dry_run, *yes, cancel, &session).await,
-        Command::Task { action } => task::task(action, app).await,
-        Command::Upload(args) => {
-            transfer::transfer(
-                app,
-                args,
-                transfer::Direction::Upload,
-                cancel,
-                cli.quiet,
-                &session,
-            )
-            .await
-        }
-        Command::Download(args) => {
-            transfer::transfer(
-                app,
-                args,
-                transfer::Direction::Download,
-                cancel,
-                cli.quiet,
-                &session,
-            )
-            .await
-        }
-        Command::Workspace { action } => workspace::workspace(action, app, &session).await,
-        Command::Index { action } => files::index(action, app, cancel, &session).await,
-        Command::Files { action } => files::files(action, app, &session).await,
-        Command::Tag { action } => tag::tag(action, app, &session).await,
-        Command::Url(args) => url::url(args, app).await,
-        Command::Catalog { action } => files::catalog(action, app, &session).await,
-        Command::Cp(args) => {
-            transfer::copy_move(false, args, app, cancel, cli.quiet, &session).await
-        }
-        Command::Mv(args) => {
-            transfer::copy_move(true, args, app, cancel, cli.quiet, &session).await
-        }
+        Command::Doctor => misc::doctor(&ctx).await,
     }
 }
 
 /// Expand a user remote reference (short or canonical form) through the
 /// application's one grammar — the rule lives in
-/// `rstore_application::remote`, so other frontends expand identically.
-pub(super) async fn expand_remote(
-    app: &rstore_application::ApplicationApi,
-    reference: &str,
-) -> rstore_domain::Result<String> {
-    rstore_application::expand_reference(
-        app.registry().connections().as_ref(),
-        app.registry().buckets().as_ref(),
-        reference,
-    )
-    .await
+/// `rstore_application::References`, so other frontends expand identically.
+async fn expand_remote(app: &ApplicationApi, reference: &str) -> Result<RemoteUri> {
+    app.registry().references().expand(reference).await
 }
 
 /// Expand a batch of references through the same rule, preserving order.
-pub(super) async fn expand_remote_batch(
-    app: &rstore_application::ApplicationApi,
+async fn expand_remote_batch(
+    app: &ApplicationApi,
     references: &[String],
-) -> Result<Vec<String>> {
-    rstore_application::expand_references(
-        app.registry().connections().as_ref(),
-        app.registry().buckets().as_ref(),
-        references,
-    )
-    .await
+) -> Result<Vec<RemoteUri>> {
+    app.registry().references().expand_many(references).await
 }
 
-/// Resolve `--bucket` references (id / `<connection>/<name>` / bare name) to
+/// Resolve bucket references (id / `<connection>/<name>` / bare name) to
 /// bucket ids for file filters.
-pub(super) async fn resolve_bucket_ids(
-    app: &rstore_application::ApplicationApi,
-    refs: &[String],
-) -> Result<Vec<rstore_domain::BucketId>> {
+async fn resolve_bucket_ids(app: &ApplicationApi, refs: &[String]) -> Result<Vec<BucketId>> {
+    let buckets = app.registry().buckets();
     let mut ids = Vec::with_capacity(refs.len());
     for r in refs {
         ids.push(
-            rstore_application::BucketService::resolve(
-                app.registry().buckets().as_ref(),
-                &rstore_application::BucketRef::parse(r),
-            )
-            .await?
-            .id,
+            buckets
+                .resolve(&rstore_application::BucketRef::parse(r))
+                .await?
+                .id,
         );
     }
     Ok(ids)
+}
+
+/// `<connection>/<bucket>` labels for every registered bucket, for listings
+/// whose rows carry only bucket ids.
+async fn bucket_labels(app: &ApplicationApi) -> Result<HashMap<BucketId, String>> {
+    let connections: HashMap<_, _> = app
+        .registry()
+        .connections()
+        .list()
+        .await?
+        .into_iter()
+        .map(|c| (c.id, c.name))
+        .collect();
+    Ok(app
+        .registry()
+        .buckets()
+        .list()
+        .await?
+        .into_iter()
+        .map(|b| {
+            let connection = connections
+                .get(&b.connection_id)
+                .cloned()
+                .unwrap_or_else(|| b.connection_id.to_string());
+            (b.id, format!("{connection}/{}", b.name))
+        })
+        .collect())
 }
 
 /// Parse the top-level `--config` override into the resolved application

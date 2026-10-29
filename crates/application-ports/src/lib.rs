@@ -14,13 +14,13 @@ pub use deps::{
 };
 use rstore_domain::connection::{ConnectionConfig, ConnectionTestStatus};
 use rstore_domain::id::{
-    BucketId, ConnectionId, IndexRunId, JobId, ReceiptId, RemoteObjectId, RepairId, TagId,
+    BucketId, ConnectionId, EventId, IndexRunId, JobId, ReceiptId, RemoteObjectId, RepairId, TagId,
     WorkspaceId,
 };
 use rstore_domain::job::{Job, JobItem, JobState};
 use rstore_domain::remote::RemoteObject;
 use rstore_domain::workspace::{IgnoreRule, IndexRun, IndexRunState, Tag, Workspace};
-use rstore_domain::{BoundedContext, Bucket, Result};
+use rstore_domain::{BoundedContext, Bucket, MutationOperation, RemoteLocator, Result};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -238,6 +238,8 @@ pub trait RuntimeStats: Send + Sync {
     async fn count_untested_connections(&self) -> Result<u64>;
     async fn count_interrupted_jobs(&self) -> Result<u64>;
     async fn size_bytes(&self) -> Result<u64>;
+    /// Where the catalog is stored (a file path, or `:memory:`), for diagnostics.
+    fn location(&self) -> String;
 }
 
 /// Persists jobs and their item rows. Implemented over SQLite by
@@ -262,7 +264,7 @@ pub trait JobRepository: Send + Sync {
     /// Replace a job's item rows wholesale (checkpoints / interruptions).
     async fn replace_items(&self, id: JobId, items: &[JobItem]) -> Result<()>;
     async fn delete(&self, id: JobId) -> Result<bool>;
-    /// Jobs orphaned by a dead process (pending/running/retrying) transition
+    /// Jobs orphaned by a dead process (pending/running) transition
     /// to `Interrupted`; returns how many. Called once at startup
     /// (`Application::initialize`) — there is no daemon, no job survives its
     /// owner.
@@ -357,7 +359,7 @@ impl RepairStatus {
 pub struct RepairItem {
     pub id: RepairId,
     /// The outbox event this repair derives from, when event-driven.
-    pub event_id: Option<uuid::Uuid>,
+    pub event_id: Option<EventId>,
     /// The durable mutation receipt this repair follows, when
     /// receipt-driven.
     pub receipt_id: Option<ReceiptId>,
@@ -366,8 +368,10 @@ pub struct RepairItem {
     pub attempts: u32,
     pub last_error: Option<String>,
     pub next_attempt_at: OffsetDateTime,
-    pub locator: Option<String>,
-    pub operation: Option<String>,
+    /// The object the failed follow-up concerned, when known.
+    pub locator: Option<RemoteLocator>,
+    /// The remote mutation the follow-up belonged to, when known.
+    pub operation: Option<MutationOperation>,
 }
 
 /// Persistence port for repair records. [`RepairStore::insert`] is the
@@ -389,8 +393,8 @@ pub trait RepairStore: Send + Sync {
 pub struct RemoteMutationReceipt {
     pub receipt_id: ReceiptId,
     pub job_id: Option<JobId>,
-    pub operation: String,
-    pub locator_json: String,
+    pub operation: MutationOperation,
+    pub locator: RemoteLocator,
     pub remote_version: Option<String>,
     pub remote_etag: Option<String>,
     pub completed_at: OffsetDateTime,
@@ -409,17 +413,20 @@ pub trait OutboxStore: Send + Sync {
     async fn append(&self, event: &OutboxEvent) -> Result<()>;
     async fn claim_due(&self, now: OffsetDateTime, limit: u32) -> Result<Vec<OutboxEvent>>;
     async fn recover_processing(&self, now: OffsetDateTime) -> Result<u64>;
-    async fn acknowledge(&self, event_id: uuid::Uuid, at: OffsetDateTime) -> Result<()>;
+    /// Return claimed events that were never handed to a handler to the due
+    /// queue, undoing the attempt their claim counted.
+    async fn release(&self, event_ids: &[EventId]) -> Result<()>;
+    async fn acknowledge(&self, event_id: EventId, at: OffsetDateTime) -> Result<()>;
     /// Schedules the next delivery attempt under the store's backoff
     /// policy, or — once attempts are exhausted — dead-letters the event
     /// into a repair row derived from the event's identity.
-    async fn retry(&self, event_id: uuid::Uuid, error: &str, now: OffsetDateTime) -> Result<()>;
+    async fn retry(&self, event_id: EventId, error: &str, now: OffsetDateTime) -> Result<()>;
 }
 
 /// Versioned event envelope stored by the outbox.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutboxEvent {
-    pub event_id: uuid::Uuid,
+    pub event_id: EventId,
     pub context: BoundedContext,
     pub aggregate_type: String,
     pub aggregate_id: String,

@@ -1,42 +1,54 @@
-//! Handlers for the `tag` subcommands: workspace-scoped create/list/edit/
-//! remove/merge plus batched attach/detach over remote objects, with the
-//! batch arms rendered through the shared batch-report grammar.
+//! Handlers for the `tag` subcommands: batched add/remove over remote
+//! objects plus list/edit/delete/merge of tag definitions, all scoped to the
+//! workspace from `-w` or the current one. The batch arms render through the
+//! shared batch-report grammar.
 
-use rstore_application::{CreateTagInput, TagRef, UpdateTagInput, WorkspaceRef};
+use rstore_application::{TagRef, UpdateTagInput, WorkspaceRef};
 
-use super::HandlerResult;
+use super::{Ctx, HandlerResult};
 use crate::args::TagCommand;
 use crate::output::HandlerOutput;
 
-pub(super) async fn tag(
-    action: &TagCommand,
-    app: &rstore_application::ApplicationApi,
-    session: &super::tty::Session,
-) -> HandlerResult {
-    let svc = app.catalog().tags();
+pub(super) async fn tag(ctx: &Ctx<'_>, action: &TagCommand) -> HandlerResult {
+    let svc = ctx.app.catalog().tags();
+    let workspace = ctx.workspace().await?;
+    let reference = WorkspaceRef::Id(workspace.id);
+    let app = ctx.app;
     match action {
-        TagCommand::Create {
-            workspace,
-            name,
-            color,
-            description,
+        TagCommand::Add {
+            references,
+            tags,
+            replace,
         } => {
-            let tag = svc
-                .create(CreateTagInput {
-                    workspace: WorkspaceRef::parse(workspace),
-                    name: name.clone(),
-                    color: color.clone(),
-                    description: description.clone(),
-                })
-                .await?;
-            Ok(HandlerOutput::human(format!(
-                "tag `{}` created in `{workspace}` ({})\n",
-                tag.name, tag.id
-            ))
-            .with_data(super::json_value(&tag)?))
+            let (inputs, uris) = expand_uris(app, references).await?;
+            let report = svc.attach_many(&reference, &uris, tags, *replace).await?;
+            let created: Vec<&str> = report.created.iter().map(|t| t.name.as_str()).collect();
+            let data = serde_json::json!({
+                "workspace": workspace.name,
+                "outcomes": super::json_value(report.outcome.items())?,
+                "tags": tags,
+                "created": created,
+                "replace": replace,
+            });
+            // Surface created tags as warnings so a mistyped name is noticed.
+            let mut out = render_tag_batch(&inputs, &report.outcome, "tagged", data)?;
+            for name in created {
+                out = out.with_warning(format!("created tag `{name}` in `{}`", workspace.name));
+            }
+            Ok(out)
         }
-        TagCommand::List { workspace } => {
-            let list = svc.list(&WorkspaceRef::parse(workspace)).await?;
+        TagCommand::Remove { references, tags } => {
+            let (inputs, uris) = expand_uris(app, references).await?;
+            let outcomes = svc.detach_many(&reference, &uris, tags).await?;
+            let data = serde_json::json!({
+                "workspace": workspace.name,
+                "outcomes": super::json_value(outcomes.items())?,
+                "tags": tags,
+            });
+            render_tag_batch(&inputs, &outcomes, "untagged", data)
+        }
+        TagCommand::List => {
+            let list = svc.list(&reference).await?;
             let mut table = super::format::Table::new(
                 &["NAME", "COLOR", "FILES"],
                 &[
@@ -53,14 +65,13 @@ pub(super) async fn tag(
                 ]);
             }
             let human = super::format::listing(
-                &format!("Tags in `{workspace}`:"),
-                &format!("No tags in `{workspace}`."),
+                &format!("Tags in `{}`:", workspace.name),
+                &format!("No tags in `{}`.", workspace.name),
                 table,
             );
             Ok(HandlerOutput::human(human).with_data(super::json_value(&list)?))
         }
         TagCommand::Edit {
-            workspace,
             tag,
             name,
             color,
@@ -68,7 +79,7 @@ pub(super) async fn tag(
         } => {
             let updated = svc
                 .update(
-                    &WorkspaceRef::parse(workspace),
+                    &reference,
                     &TagRef::parse(tag),
                     UpdateTagInput {
                         name: name.clone(),
@@ -84,46 +95,41 @@ pub(super) async fn tag(
                     .with_data(super::json_value(&updated)?),
             )
         }
-        TagCommand::Remove {
-            workspace,
-            tag,
-            yes,
-        } => {
+        TagCommand::Delete { tag } => {
             // Resolve first so the confirmation names the exact target.
-            let reference = WorkspaceRef::parse(workspace);
             let tag_ref = TagRef::parse(tag);
             let existing = svc.resolve(&reference, &tag_ref).await?;
             super::tty::remove_flow(
-                format!("remove tag `{}` from `{}`", existing.name, workspace),
-                *yes,
-                session,
+                format!(
+                    "delete tag `{}` from `{}` (its associations go with it)",
+                    existing.name, workspace.name
+                ),
+                ctx.yes,
+                &ctx.session,
                 svc.remove(&reference, &tag_ref),
-                format!("tag `{}` removed from `{}`\n", existing.name, workspace),
+                format!(
+                    "tag `{}` deleted from `{}`\n",
+                    existing.name, workspace.name
+                ),
             )
             .await
             .map(|out| {
-                out.with_data(
-                    serde_json::json!({"workspace": workspace, "removed": existing.id.to_string()}),
-                )
+                out.with_data(serde_json::json!({
+                    "workspace": workspace.name,
+                    "deleted": existing.id.to_string(),
+                }))
             })
         }
-        TagCommand::Merge {
-            workspace,
-            source,
-            target,
-            yes,
-        } => {
-            // Merging removes the source tag, so the destructive
-            // --yes/prompt discipline applies.
+        TagCommand::Merge { source, target } => {
+            // Merging deletes the source tag, so the destructive
+            // -y/prompt discipline applies.
             super::tty::confirm_destructive(
-                &format!("merge `{source}` into `{target}` (source tag is removed)"),
-                *yes,
-                session,
+                &format!("merge `{source}` into `{target}` (the source tag is deleted)"),
+                ctx.yes,
+                &ctx.session,
             )?;
-            let source_ref = TagRef::parse(source);
-            let target_ref = TagRef::parse(target);
             let report = svc
-                .merge(&WorkspaceRef::parse(workspace), &source_ref, &target_ref)
+                .merge(&reference, &TagRef::parse(source), &TagRef::parse(target))
                 .await?;
             Ok(HandlerOutput::human(format!(
                 "merged `{}` into `{}` ({} association(s) moved)\n",
@@ -131,59 +137,30 @@ pub(super) async fn tag(
             ))
             .with_data(super::json_value(&report)?))
         }
-        TagCommand::Add {
-            workspace,
-            uris,
-            tags,
-            replace,
-        } => {
-            let uris = expand_uris(app, uris).await?;
-            let outcomes = svc
-                .attach_many(&WorkspaceRef::parse(workspace), &uris, tags, *replace)
-                .await?;
-            let data = serde_json::json!({
-                "outcomes": super::json_value(outcomes.items())?,
-                "tags": tags,
-                "replace": replace,
-            });
-            render_tag_batch(&outcomes, "tagged", data)
-        }
-        TagCommand::Detach {
-            workspace,
-            uris,
-            tags,
-        } => {
-            let uris = expand_uris(app, uris).await?;
-            let outcomes = svc
-                .detach_many(&WorkspaceRef::parse(workspace), &uris, tags)
-                .await?;
-            let data = serde_json::json!({
-                "outcomes": super::json_value(outcomes.items())?,
-                "tags": tags,
-            });
-            render_tag_batch(&outcomes, "detached", data)
-        }
     }
 }
 
 /// Renders an attach/detach batch through the shared grammar; failures carry
 /// their error as the detail line and drive the exit-13 policy.
 fn render_tag_batch(
+    inputs: &[String],
     outcomes: &rstore_application::BatchOutcome<()>,
     success_marker: &str,
     data: serde_json::Value,
 ) -> HandlerResult {
-    let entries = outcomes.items().iter().map(|item| {
+    // Outcomes come back in submission order; lines name the reference as
+    // the user wrote it.
+    let entries = inputs.iter().zip(outcomes.items()).map(|(input, item)| {
         if item.disposition.is_success() {
             super::report::BatchEntry {
                 marker: success_marker.to_string(),
-                label: item.target.clone(),
+                label: input.clone(),
                 detail: None,
             }
         } else {
             super::report::BatchEntry {
                 marker: "failed".to_string(),
-                label: item.target.clone(),
+                label: input.clone(),
                 detail: failure_message(item),
             }
         }
@@ -213,15 +190,16 @@ fn failure_message(item: &rstore_application::ItemOutcome<()>) -> Option<String>
     }
 }
 
-/// `-` expands to one URI per stdin line; anything else passes through
-/// untouched.
+/// `-` expands to one reference per stdin line; returns the references as
+/// written next to their expansions, in the same order.
 async fn expand_uris(
     app: &rstore_application::ApplicationApi,
     uris: &[String],
-) -> rstore_domain::Result<Vec<String>> {
-    let uris = super::tty::resolve_uris(
+) -> rstore_domain::Result<(Vec<String>, Vec<rstore_application::RemoteUri>)> {
+    let inputs = super::tty::resolve_uris(
         uris,
         "pass at least one remote URI (or `-` to read them from stdin)",
     )?;
-    super::expand_remote_batch(app, &uris).await
+    let expanded = super::expand_remote_batch(app, &inputs).await?;
+    Ok((inputs, expanded))
 }

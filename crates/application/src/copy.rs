@@ -20,8 +20,8 @@ use crate::transfer::TransferReport;
 /// One source/target remote reference pair.
 #[derive(Debug, Clone)]
 pub struct CopyPair {
-    pub source: String,
-    pub target: String,
+    pub source: RemoteUri,
+    pub target: RemoteUri,
 }
 
 /// Whether an expanded pair copies or moves: moves verify the target and
@@ -72,15 +72,10 @@ pub fn validate_copy_target(pairs: &[CopyPair], recursive: bool) -> Result<()> {
     if pairs.is_empty() {
         return Err(Error::invalid_input("nothing to copy"));
     }
-    let expands_directory = recursive
-        && pairs.iter().try_fold(false, |expanded, pair| {
-            Ok::<_, rstore_domain::Error>(
-                expanded || RemoteUri::parse(&pair.source)?.is_directory_ref(),
-            )
-        })?;
+    let expands_directory = recursive && pairs.iter().any(|pair| pair.source.is_directory_ref());
     if pairs.len() > 1 || expands_directory {
         for pair in pairs {
-            let target = RemoteUri::parse(&pair.target)?;
+            let target = &pair.target;
             if !target.key.is_empty() && !target.is_directory_ref() {
                 return Err(Error::invalid_input(
                     "multiple sources need a target bucket or prefix (end it with `/`)",
@@ -178,10 +173,10 @@ impl DefaultCopyService {
         let mut writers = HashMap::new();
         let mut deleters = HashMap::new();
         for pair in pairs {
-            let src_uri = RemoteUri::parse(&pair.source)?;
-            let dst_uri = RemoteUri::parse(&pair.target)?;
-            crate::expand::require_recursive(&pair.source, &src_uri.key, recursive)?;
-            let dst = endpoints.resolve(&self.locator, &dst_uri).await?;
+            let src_uri = &pair.source;
+            let dst_uri = &pair.target;
+            crate::expand::require_recursive(&src_uri.to_string(), &src_uri.key, recursive)?;
+            let dst = endpoints.resolve(&self.locator, dst_uri).await?;
             for entry in
                 crate::batch_plan::remote_items(&self.locator, endpoints, &pair.source, recursive)
                     .await?

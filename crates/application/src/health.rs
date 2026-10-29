@@ -2,10 +2,9 @@
 //!
 //! Split from connection diagnostics ([`crate::diagnostics`]) so each side is a deep module:
 //! diagnostics owns probing a connection; health owns the whole-catalog snapshot behind
-//! doctor. The narrow stats port keeps the service's interface as wide as its questions; the
-//! database path is passed in by the caller — the service does not own it.
+//! doctor. The narrow stats port keeps the service's interface as wide as its questions,
+//! including where the catalog is stored.
 
-use std::path::Path;
 use std::sync::Arc;
 
 use rstore_application_ports::RuntimeStats;
@@ -31,7 +30,7 @@ pub struct HealthReport {
 /// Collects the doctor health report.
 ///
 /// Counting-only by contract: its sole dependency is the [`RuntimeStats`] port, counts stay
-/// counts (no entity lists cross this seam), and the database path is supplied by the caller.
+/// counts (no entity lists cross this seam), and the catalog location comes from the same port.
 pub(crate) struct HealthService {
     stats: Arc<dyn RuntimeStats>,
 }
@@ -44,11 +43,7 @@ impl HealthService {
     /// Gather every health field. Individual probes degrade to zero-count defaults rather than
     /// failing the whole report — a broken probe is itself a finding, and the schema-mismatch
     /// check still renders.
-    pub(crate) async fn health(
-        &self,
-        db_path: &Path,
-        storage_adapter: Option<&'static str>,
-    ) -> HealthReport {
+    pub(crate) async fn health(&self, storage_adapter: Option<&'static str>) -> HealthReport {
         let storage_adapter = storage_adapter.unwrap_or("none");
         let pending_outbox = self.stats.count_pending_outbox().await.unwrap_or(0);
         let pending_repairs = self.stats.count_pending_repairs().await.unwrap_or(0);
@@ -60,7 +55,7 @@ impl HealthService {
         HealthReport {
             connection_count,
             untested_connections,
-            db_path: db_path.display().to_string(),
+            db_path: self.stats.location(),
             storage_adapter,
             tls_default: "on (SEC-003)",
             telemetry: "disabled (SEC-009)",

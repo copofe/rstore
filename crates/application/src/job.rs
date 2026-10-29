@@ -41,12 +41,6 @@ pub trait JobService: Send + Sync {
     async fn list(&self) -> Result<Vec<Job>>;
     /// Resolve a reference (`job_…` id or 1-based ordinal, newest first).
     async fn resolve(&self, reference: &JobRef) -> Result<Job>;
-    /// Pause a running job. Only `running` may pause.
-    async fn pause(&self, reference: &JobRef) -> Result<Job>;
-    /// Resume a paused or interrupted job.
-    async fn resume(&self, reference: &JobRef) -> Result<Job>;
-    /// Re-arm a failed or partially succeeded job for another run.
-    async fn retry(&self, reference: &JobRef) -> Result<Job>;
     /// Cancel a job in any non-terminal state.
     async fn cancel(&self, reference: &JobRef) -> Result<Job>;
     /// At startup, mark jobs orphaned by a dead process as `interrupted`.
@@ -94,45 +88,6 @@ impl JobService for DefaultJobService {
                     .ok_or_else(|| not_found(reference))
             }
         }
-    }
-
-    async fn pause(&self, reference: &JobRef) -> Result<Job> {
-        let job = self.resolve(reference).await?;
-        if job.state != JobState::Running {
-            return Err(Error::conflict(format!(
-                "only a running job can pause; this one is `{}`",
-                job.state.as_str()
-            )));
-        }
-        self.repo
-            .transition(job.id, JobState::Paused, self.clock.now())
-            .await
-    }
-
-    async fn resume(&self, reference: &JobRef) -> Result<Job> {
-        let job = self.resolve(reference).await?;
-        if !matches!(job.state, JobState::Paused | JobState::Interrupted) {
-            return Err(Error::conflict(format!(
-                "only a paused/interrupted job can resume; this one is `{}`",
-                job.state.as_str()
-            )));
-        }
-        self.repo
-            .transition(job.id, JobState::Running, self.clock.now())
-            .await
-    }
-
-    async fn retry(&self, reference: &JobRef) -> Result<Job> {
-        let job = self.resolve(reference).await?;
-        if !matches!(job.state, JobState::Failed | JobState::PartialSuccess) {
-            return Err(Error::conflict(format!(
-                "only a failed/partial job can retry; this one is `{}`",
-                job.state.as_str()
-            )));
-        }
-        self.repo
-            .transition(job.id, JobState::Running, self.clock.now())
-            .await
     }
 
     async fn cancel(&self, reference: &JobRef) -> Result<Job> {

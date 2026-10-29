@@ -24,11 +24,8 @@ pub(super) fn config_show(dirs: &AppDirs) -> HandlerResult {
 ///
 /// Pending repairs and interrupted jobs are surfaced as warnings on top of
 /// the detail view so they cannot scroll by unnoticed.
-pub(super) async fn doctor(
-    app: &rstore_application::ApplicationApi,
-    dirs: &AppDirs,
-) -> HandlerResult {
-    let report = app.diagnostics().health(&dirs.db_path).await;
+pub(super) async fn doctor(ctx: &super::Ctx<'_>) -> HandlerResult {
+    let report = ctx.app.diagnostics().health().await;
 
     let data = super::json_value(&report)?;
 
@@ -58,7 +55,7 @@ pub(super) async fn doctor(
     }
     if report.interrupted_jobs > 0 {
         out = out.with_warning(format!(
-            "{} interrupted job(s) — re-run the transfer or `task resume`",
+            "{} interrupted job(s) — re-run the original command to resume",
             report.interrupted_jobs
         ));
     }

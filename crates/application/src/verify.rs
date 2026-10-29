@@ -72,7 +72,7 @@ impl RemoteVerifyHandler {
         };
         // The operation decides which provider state counts as settled:
         // everything but a delete must still be present.
-        let expect_present = operation != crate::mutation::MutationOperation::Delete.as_str();
+        let expect_present = operation != rstore_domain::MutationOperation::Delete;
 
         match self.verify_presence(&locator, expect_present).await {
             // Verified: the dispatcher acknowledges the fact.
@@ -80,7 +80,7 @@ impl RemoteVerifyHandler {
             // Permanent divergence: record it for `repair`, then acknowledge —
             // retrying could never succeed.
             Ok(Err(detail)) => {
-                self.record_repair(event, Some(&locator), Some(&operation), detail)
+                self.record_repair(event, Some(&locator), Some(operation), detail)
                     .await?;
                 Ok(())
             }
@@ -150,7 +150,7 @@ impl RemoteVerifyHandler {
         &self,
         event: &OutboxEvent,
         locator: Option<&RemoteLocator>,
-        operation: Option<&str>,
+        operation: Option<rstore_domain::MutationOperation>,
         detail: String,
     ) -> Result<()> {
         let item = RepairItem {
@@ -164,8 +164,8 @@ impl RemoteVerifyHandler {
             attempts: event.attempts,
             last_error: Some(detail),
             next_attempt_at: self.clock.now(),
-            locator: locator.and_then(|value| serde_json::to_string(value).ok()),
-            operation: operation.map(str::to_owned),
+            locator: locator.cloned(),
+            operation,
         };
         self.repairs.insert(&item).await
     }

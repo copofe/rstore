@@ -82,28 +82,24 @@ API only; job notifications and full pages are deferred.
 ## 4. CLI commands
 
 ```text
-rstore connection add|list|show|edit|test|remove
-rstore bucket discover|add|list|show|edit|remove
-rstore bucket ignore add|list|remove
-rstore bucket link show|set
-rstore workspace create|list|show|edit|remove
-rstore workspace bucket add|remove|list
-rstore remote ls|stat
-rstore index start|status|stats|pause|resume|cancel|refresh|rebuild
-rstore files list|search|show
-rstore tag create|list|edit|remove|merge|add|detach
-rstore upload
-rstore download
-rstore cp
-rstore mv
-rstore rm
-rstore task list|show|pause|resume|retry|cancel
-rstore url
-rstore catalog gc
+rstore ls|stat|cp|mv|rm|url
+rstore find
+rstore tag add|remove|list|edit|delete|merge
+rstore connection add|list|show|test|edit|remove        (alias: conn)
+rstore bucket list|add|show|edit|remove
+rstore workspace list|use|create|show|edit|delete|add|remove   (alias: ws)
+rstore index run|status|cancel|gc
+rstore task list|show|cancel
 rstore config show|export|import
 rstore doctor
 rstore version
 ```
+
+Global flags: `-w/--workspace` (env `RSTORE_WORKSPACE`) picks the workspace
+for catalog commands, otherwise the current workspace — or the only one —
+applies; `-y/--yes` confirms destructive actions. `add`/`remove` change a
+registration or association and never touch remote data; `create`/`delete`
+manage local entities; only `rm` deletes remote objects.
 
 Short references expand to canonical strings first and resolve into
 `RemoteUri` afterwards; only flows that need stable catalog/outbox identity
@@ -114,6 +110,10 @@ construct a `RemoteLocator`. Short-reference rules:
 - Recursive operations require a directory reference or explicit
   `--recursive`.
 - `-` reads one reference per line from stdin.
+- `cp` routes by its arguments: `./`, `../`, `~/` and absolute paths are
+  local; otherwise an argument is remote when its first segment names a
+  registered connection or bucket. A first segment that is both registered
+  and an existing local path is rejected as ambiguous.
 
 ## 5. Application API
 
@@ -155,9 +155,10 @@ job intent
 
 Outbox events carry event-id idempotency, aggregate ordering, backoff retry,
 failure records, and repair state. The first projection consumer re-verifies
-each settled mutation against the provider at startup (`RemoteVerifyHandler`
-through `Runtime::drain_outbox`): present objects acknowledge the fact, missing
-ones become repair rows, transient failures stay queued. Progress events are
+each settled mutation against the provider (`RemoteVerifyHandler` through the
+budgeted `Runtime::drain_outbox`, run before remote-facing CLI commands and at
+desktop startup): present objects acknowledge the fact, missing ones become
+repair rows, transient failures stay queued. Progress events are
 runtime-only and never become domain events.
 
 ## 7. Security

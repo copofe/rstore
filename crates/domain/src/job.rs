@@ -65,10 +65,6 @@ pub enum JobState {
     Pending,
     /// Actively executing.
     Running,
-    /// User-paused, resumable.
-    Paused,
-    /// Backing off before another attempt.
-    Retrying,
     /// Finished with some items failing.
     PartialSuccess,
     /// All items succeeded.
@@ -92,7 +88,7 @@ impl JobState {
 
     /// Whether the state is actively consuming resources.
     pub fn is_active(self) -> bool {
-        matches!(self, Self::Running | Self::Retrying)
+        self == Self::Running
     }
 
     /// Canonical token stored in the `state` column.
@@ -100,8 +96,6 @@ impl JobState {
         match self {
             Self::Pending => "pending",
             Self::Running => "running",
-            Self::Paused => "paused",
-            Self::Retrying => "retrying",
             Self::PartialSuccess => "partial_success",
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
@@ -124,8 +118,6 @@ impl JobState {
         match token {
             "pending" => Ok(Self::Pending),
             "running" => Ok(Self::Running),
-            "paused" => Ok(Self::Paused),
-            "retrying" => Ok(Self::Retrying),
             "partial_success" => Ok(Self::PartialSuccess),
             "succeeded" => Ok(Self::Succeeded),
             "failed" => Ok(Self::Failed),
@@ -139,8 +131,8 @@ impl JobState {
     ///
     /// # Errors
     /// Returns [`Error::conflict`] when `(self, target)` is not an allowed
-    /// edge of the transition table; terminal states can only be re-entered
-    /// via retry into `Running`.
+    /// edge of the transition table. Every run is a fresh job, so no state
+    /// leads back into `Running`; an interrupted job can only be cancelled.
     pub fn transition(self, target: JobState) -> Result<JobState, Error> {
         use JobState::*;
         let allowed = match (self, target) {
@@ -151,24 +143,12 @@ impl JobState {
             // Running transition too: a process can die immediately after
             // creating the pending row.
             (Pending, Interrupted) => true,
-            (Running, Paused) => true,
-            (Running, Retrying) => true,
             (Running, Succeeded) => true,
             (Running, Failed) => true,
             (Running, PartialSuccess) => true,
             (Running, Cancelled) => true,
             (Running, Interrupted) => true,
-            (Paused, Running) => true,
-            (Paused, Cancelled) => true,
-            (Retrying, Running) => true,
-            (Retrying, Failed) => true,
-            (Retrying, Cancelled) => true,
-            (Retrying, Interrupted) => true,
-            (Interrupted, Running) => true,
             (Interrupted, Cancelled) => true,
-            // `task retry` re-runs a finished-but-unsuccessful job.
-            (Failed, Running) => true,
-            (PartialSuccess, Running) => true,
             (s, t) if s == t => true,
             _ => false,
         };

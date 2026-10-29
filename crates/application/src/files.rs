@@ -44,7 +44,7 @@ pub struct FilesPage {
 /// Mixed-list queries over the indexed catalog.
 #[async_trait]
 pub trait FilesService: Send + Sync {
-    /// `files list` / `files search` — one filtered, sorted, paginated query.
+    /// `find` — one filtered, sorted, paginated query.
     async fn list(
         &self,
         workspace: &WorkspaceRef,
@@ -52,8 +52,12 @@ pub trait FilesService: Send + Sync {
         sort: FileSort,
         page: &PageRequest,
     ) -> Result<FilesPage>;
-    /// `files show` — one object with tags and staleness state.
-    async fn show(&self, workspace: &WorkspaceRef, uri: &str) -> Result<FileEntry>;
+    /// `stat --offline` — one object with tags and staleness state.
+    async fn show(
+        &self,
+        workspace: &WorkspaceRef,
+        uri: &crate::reference::RemoteUri,
+    ) -> Result<FileEntry>;
 }
 
 /// Default files implementation over the catalog query seam and the registry stores.
@@ -188,7 +192,11 @@ impl FilesService for DefaultFilesService {
         })
     }
 
-    async fn show(&self, workspace: &WorkspaceRef, uri: &str) -> Result<FileEntry> {
+    async fn show(
+        &self,
+        workspace: &WorkspaceRef,
+        uri: &crate::reference::RemoteUri,
+    ) -> Result<FileEntry> {
         let workspace_id = self.workspace_id(workspace).await?;
         let object = self.locator.resolve(uri, workspace_id).await?;
         self.entry_for(workspace_id, &object).await

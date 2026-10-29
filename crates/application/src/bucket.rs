@@ -28,8 +28,10 @@ pub enum BucketRef {
 }
 
 impl BucketRef {
-    /// Parse: `bkt_…` id, `scope/name`, else a bare name.
+    /// Parse: `bkt_…` id, `scope/name`, else a bare name. A trailing `/` is
+    /// tolerated, so a bucket-root reference (`media/`) names the bucket.
     pub fn parse(s: &str) -> Self {
+        let s = s.trim_end_matches('/');
         if s.starts_with("bkt_") {
             if let Ok(id) = s.parse() {
                 return BucketRef::Id(id);

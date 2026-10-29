@@ -147,12 +147,21 @@ impl ConnectionDiagnostics {
                 buckets
             }
             Err(e) => {
-                // A network failure is not an authentication failure — only unreachable
-                // networks mark the auth check as passed-by-default here.
+                // Only a refused listing proves the endpoint answered and accepted the
+                // credentials; every other failure — unreachable, rejected credentials,
+                // unknown — fails the endpoint/auth check too.
+                let authenticated = e.code == ErrorCode::Forbidden;
                 checks.push(CheckResult {
                     name: "endpoint/auth".into(),
-                    passed: e.code != ErrorCode::NetworkUnreachable,
-                    detail: e.to_string(),
+                    passed: authenticated,
+                    detail: if authenticated {
+                        format!(
+                            "authenticated against {}; listing is not permitted",
+                            config.endpoint
+                        )
+                    } else {
+                        e.to_string()
+                    },
                 });
                 checks.push(CheckResult {
                     name: "list_buckets".into(),

@@ -2,18 +2,26 @@
 //!
 //! A workspace is a local grouping of registered buckets; creating, editing, or removing one
 //! never touches remote state — removing a workspace removes neither buckets nor remote data.
+//! One workspace may be selected as current; commands that omit a workspace reference target
+//! it ([`WorkspaceService::target`]).
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use rstore_application_ports::{IgnoreRuleStore, WorkspaceStore};
+use rstore_application_ports::{IgnoreRuleStore, SettingsStore, WorkspaceStore};
 use rstore_domain::id::{BucketId, WorkspaceId};
 use rstore_domain::workspace::{IgnoreRule, IgnoreRuleId, Workspace};
 use rstore_domain::{Clock, Error, Result};
 
 use crate::bucket::{BucketRef, BucketService};
 
-/// Reference a workspace by id or name. There is never an implicit default workspace.
+/// Settings key holding the current workspace's id.
+const CURRENT_WORKSPACE_KEY: &str = "workspace.current";
+
+/// Name of the workspace created when the first bucket is enrolled into none.
+const DEFAULT_WORKSPACE_NAME: &str = "default";
+
+/// Reference a workspace by id or name.
 #[derive(Debug, Clone)]
 pub enum WorkspaceRef {
     Id(WorkspaceId),
@@ -64,6 +72,8 @@ pub struct UpdateWorkspaceInput {
 pub struct WorkspaceWithCount {
     pub workspace: Workspace,
     pub bucket_count: u64,
+    /// Whether this is the selected current workspace.
+    pub current: bool,
 }
 
 /// A workspace with its bucket membership resolved.
@@ -91,15 +101,39 @@ pub(crate) async fn resolve_workspace(
 /// Workspace lifecycle and bucket membership.
 #[async_trait]
 pub trait WorkspaceService: Send + Sync {
+    /// Create a workspace; it becomes current when no workspace is selected yet.
     async fn create(&self, input: CreateWorkspaceInput) -> Result<Workspace>;
     async fn list(&self) -> Result<Vec<WorkspaceWithCount>>;
     async fn resolve(&self, reference: &WorkspaceRef) -> Result<Workspace>;
+    /// The selected current workspace, if any.
+    ///
+    /// # Errors
+    /// `not_found` when the selection names a workspace that no longer exists.
+    async fn current(&self) -> Result<Option<Workspace>>;
+    /// Select `reference` as the current workspace.
+    async fn select(&self, reference: &WorkspaceRef) -> Result<Workspace>;
+    /// The workspace a command targets: the explicit reference, else the current workspace,
+    /// else the only workspace when exactly one exists.
+    ///
+    /// # Errors
+    /// `invalid_input` when no reference is given and none of the fallbacks applies.
+    async fn target(&self, explicit: Option<&WorkspaceRef>) -> Result<Workspace>;
+    /// Add a registered bucket to the workspace a registration targets — the explicit
+    /// reference, else the current or only workspace. When no workspace exists yet, `default`
+    /// is created and selected. Returns `None`, leaving the bucket unenrolled, when several
+    /// workspaces exist and none is selected.
+    async fn enroll(
+        &self,
+        bucket: &BucketRef,
+        explicit: Option<&WorkspaceRef>,
+    ) -> Result<Option<Workspace>>;
     async fn show(&self, reference: &WorkspaceRef) -> Result<WorkspaceDetail>;
     async fn update(
         &self,
         reference: &WorkspaceRef,
         input: UpdateWorkspaceInput,
     ) -> Result<Workspace>;
+    /// Delete a workspace, clearing the current selection when it pointed here.
     async fn remove(&self, reference: &WorkspaceRef) -> Result<()>;
     async fn add_bucket(&self, reference: &WorkspaceRef, bucket: &BucketRef) -> Result<BucketId>;
     async fn remove_bucket(&self, reference: &WorkspaceRef, bucket: &BucketRef) -> Result<()>;
@@ -115,7 +149,17 @@ pub struct DefaultWorkspaceService {
     workspaces: Arc<dyn WorkspaceStore>,
     buckets: Arc<dyn BucketService>,
     ignores: Arc<dyn IgnoreRuleStore>,
+    settings: Arc<dyn SettingsStore>,
     clock: Arc<dyn Clock>,
+}
+
+/// What an omitted workspace reference resolves to.
+enum Implicit {
+    Found(Workspace),
+    /// No workspace exists.
+    Empty,
+    /// This many workspaces exist and none is selected.
+    Ambiguous(usize),
 }
 
 impl DefaultWorkspaceService {
@@ -123,18 +167,56 @@ impl DefaultWorkspaceService {
         workspaces: Arc<dyn WorkspaceStore>,
         buckets: Arc<dyn BucketService>,
         ignores: Arc<dyn IgnoreRuleStore>,
+        settings: Arc<dyn SettingsStore>,
         clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
             workspaces,
             buckets,
             ignores,
+            settings,
             clock,
         }
     }
 
     async fn find(&self, reference: &WorkspaceRef) -> Result<Workspace> {
         resolve_workspace(self.workspaces.as_ref(), reference).await
+    }
+
+    /// The stored selection, without checking that the workspace still exists.
+    async fn current_id(&self) -> Result<Option<WorkspaceId>> {
+        self.settings
+            .get(CURRENT_WORKSPACE_KEY)
+            .await?
+            .map(|raw| {
+                raw.parse::<WorkspaceId>().map_err(|error| {
+                    Error::database(format!(
+                        "setting `{CURRENT_WORKSPACE_KEY}` holds `{raw}`, not a workspace id"
+                    ))
+                    .with_source(error)
+                })
+            })
+            .transpose()
+    }
+
+    async fn set_current(&self, id: WorkspaceId) -> Result<()> {
+        self.settings
+            .set(CURRENT_WORKSPACE_KEY, &id.to_string())
+            .await
+    }
+
+    /// Resolve an omitted reference: the current workspace, else the only one.
+    async fn implicit(&self) -> Result<Implicit> {
+        if let Some(current) = self.current().await? {
+            return Ok(Implicit::Found(current));
+        }
+        let all = self.workspaces.list().await?;
+        let count = all.len();
+        Ok(match all.into_iter().next() {
+            None => Implicit::Empty,
+            Some(only) if count == 1 => Implicit::Found(only.workspace),
+            Some(_) => Implicit::Ambiguous(count),
+        })
     }
 
     async fn bucket_id(&self, bucket: &BucketRef) -> Result<BucketId> {
@@ -152,16 +234,21 @@ impl WorkspaceService for DefaultWorkspaceService {
         let mut workspace = Workspace::new(WorkspaceId::new_random(), name, self.clock.now());
         workspace.description = input.description;
         self.workspaces.insert(&workspace).await?;
+        if self.current_id().await?.is_none() {
+            self.set_current(workspace.id).await?;
+        }
         Ok(workspace)
     }
 
     async fn list(&self) -> Result<Vec<WorkspaceWithCount>> {
+        let current = self.current_id().await?;
         Ok(self
             .workspaces
             .list()
             .await?
             .into_iter()
             .map(|row| WorkspaceWithCount {
+                current: current == Some(row.workspace.id),
                 workspace: row.workspace,
                 bucket_count: row.bucket_count,
             })
@@ -170,6 +257,71 @@ impl WorkspaceService for DefaultWorkspaceService {
 
     async fn resolve(&self, reference: &WorkspaceRef) -> Result<Workspace> {
         self.find(reference).await
+    }
+
+    async fn current(&self) -> Result<Option<Workspace>> {
+        let Some(id) = self.current_id().await? else {
+            return Ok(None);
+        };
+        self.workspaces
+            .get(id)
+            .await?
+            .ok_or_else(|| {
+                Error::not_found(format!(
+                    "the current workspace `{id}` no longer exists; select another with \
+                     `workspace use <name>`"
+                ))
+            })
+            .map(Some)
+    }
+
+    async fn select(&self, reference: &WorkspaceRef) -> Result<Workspace> {
+        let workspace = self.find(reference).await?;
+        self.set_current(workspace.id).await?;
+        Ok(workspace)
+    }
+
+    async fn target(&self, explicit: Option<&WorkspaceRef>) -> Result<Workspace> {
+        if let Some(reference) = explicit {
+            return self.find(reference).await;
+        }
+        match self.implicit().await? {
+            Implicit::Found(workspace) => Ok(workspace),
+            Implicit::Empty => Err(Error::invalid_input(
+                "no workspace exists yet; create one with `workspace create <name>`",
+            )),
+            Implicit::Ambiguous(count) => Err(Error::invalid_input(format!(
+                "{count} workspaces exist and none is selected; select one with \
+                 `workspace use <name>` or pass `--workspace`"
+            ))),
+        }
+    }
+
+    async fn enroll(
+        &self,
+        bucket: &BucketRef,
+        explicit: Option<&WorkspaceRef>,
+    ) -> Result<Option<Workspace>> {
+        // Resolve the bucket first so a bad reference never creates `default`.
+        let bucket_id = self.bucket_id(bucket).await?;
+        let workspace = match explicit {
+            Some(reference) => self.find(reference).await?,
+            None => match self.implicit().await? {
+                Implicit::Found(workspace) => workspace,
+                Implicit::Empty => {
+                    self.create(CreateWorkspaceInput {
+                        name: DEFAULT_WORKSPACE_NAME.to_string(),
+                        description: None,
+                    })
+                    .await?
+                }
+                Implicit::Ambiguous(_) => return Ok(None),
+            },
+        };
+        self.workspaces
+            .add_bucket(workspace.id, bucket_id, self.clock.now())
+            .await?;
+        Ok(Some(workspace))
     }
 
     async fn show(&self, reference: &WorkspaceRef) -> Result<WorkspaceDetail> {
@@ -209,6 +361,11 @@ impl WorkspaceService for DefaultWorkspaceService {
 
     async fn remove(&self, reference: &WorkspaceRef) -> Result<()> {
         let workspace = self.find(reference).await?;
+        // Clear the selection before deleting: an interruption between the two writes leaves an
+        // unselected workspace, never a selection pointing at a deleted one.
+        if self.current_id().await? == Some(workspace.id) {
+            self.settings.delete(CURRENT_WORKSPACE_KEY).await?;
+        }
         self.workspaces.delete(workspace.id).await?;
         // Tag associations cascade with the workspace row (workspace isolation ends with the
         // workspace itself); bucket rows are untouched.

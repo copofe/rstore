@@ -54,7 +54,8 @@
 - 结果写 stdout，日志和进度写 stderr。
 - JSON 使用统一 envelope；输出不包含入口层无法保证的持久化 Row。
 - 破坏性命令在非交互环境必须要求 `--yes`。
-- 新命令同时加入 `crates/cli/src/args.rs` 和 `Command::path()`。
+- 新命令加入 `crates/cli/src/args.rs`；envelope 的 `command` 标识由 clap 命令树
+  自动推出。会访问远端的命令同时登记到 `Command::reaches_remote()`。
 - CLI 只解析输入、组装 Command/Query、调用 Application API、渲染 API 返回值
   和统一 envelope；不得渲染 persistence Row。
 
@@ -66,9 +67,11 @@
   View/Page/Report/Outcome，不暴露 SQLite、AWS SDK 或具体 Service 实现。
 - Domain Event 记录业务事实；进度消息属于运行时消息，桌面通知通道尚未接入。
 - Outbox 支持幂等、重试、失败记录和 Repair 查询。
-- Outbox 的消费入口是启动时的一次性排水：Bootstrap 在取得写锁后把积压事件
-  交付给 RemoteVerifyHandler（远端复验，缺失入 repair，瞬时错误留队重试）。
-  常驻消费循环待长驻进程（桌面端）出现后再引入。
+- Outbox 的消费入口是有时间预算的一次性排水 `Runtime::drain_outbox(budget)`：
+  入口在取得写锁后决定何时调用——CLI 只在会访问远端的命令前排水（预算 2 秒），
+  桌面端在启动时排水。积压事件交付给 RemoteVerifyHandler（远端复验，缺失入
+  repair，瞬时错误留队重试），预算耗尽时未处理的事件留到下次。常驻消费循环待
+  长驻进程（桌面端）出现后再引入。
 - 不引入 Event Sourcing、微服务或完整桌面页面。
 
 ## 测试与交付

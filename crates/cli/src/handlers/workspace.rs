@@ -1,30 +1,16 @@
-//! `workspace …` handlers (WSP-/IGN-).
+//! `workspace …` handlers (WSP-). Subcommands without a workspace argument
+//! act on the workspace from `-w`, else the current one.
 
 use rstore_application::{BucketRef, CreateWorkspaceInput, UpdateWorkspaceInput, WorkspaceRef};
+use rstore_domain::{Bucket, Workspace};
 
-use super::HandlerResult;
-use crate::args::{IgnoreCommand, WorkspaceBucketCommand, WorkspaceCommand};
+use super::{Ctx, HandlerResult};
+use crate::args::WorkspaceCommand;
 use crate::output::HandlerOutput;
 
-pub(super) async fn workspace(
-    action: &WorkspaceCommand,
-    app: &rstore_application::ApplicationApi,
-    session: &super::tty::Session,
-) -> HandlerResult {
-    let svc = app.catalog().workspaces();
+pub(super) async fn workspace(ctx: &Ctx<'_>, action: &WorkspaceCommand) -> HandlerResult {
+    let svc = ctx.app.catalog().workspaces();
     match action {
-        WorkspaceCommand::Create { name, description } => {
-            let ws = svc
-                .create(CreateWorkspaceInput {
-                    name: name.clone(),
-                    description: description.clone(),
-                })
-                .await?;
-            Ok(
-                HandlerOutput::human(format!("workspace `{}` created ({})\n", ws.name, ws.id))
-                    .with_data(super::json_value(&ws)?),
-            )
-        }
         WorkspaceCommand::List => {
             let list = svc.list().await?;
             let data: Vec<serde_json::Value> = list
@@ -35,12 +21,14 @@ pub(super) async fn workspace(
                         "name": w.workspace.name,
                         "description": w.workspace.description,
                         "bucket_count": w.bucket_count,
+                        "current": w.current,
                     })
                 })
                 .collect();
             let mut table = super::format::Table::new(
-                &["NAME", "BUCKETS", "ID"],
+                &["", "NAME", "BUCKETS", "ID"],
                 &[
+                    super::format::Align::Left,
                     super::format::Align::Left,
                     super::format::Align::Left,
                     super::format::Align::Left,
@@ -48,6 +36,7 @@ pub(super) async fn workspace(
             );
             for w in &list {
                 table.row(vec![
+                    if w.current { "*" } else { "" }.to_string(),
                     w.workspace.name.clone(),
                     format!("{} buckets", w.bucket_count),
                     w.workspace.id.to_string(),
@@ -55,13 +44,47 @@ pub(super) async fn workspace(
             }
             let human = super::format::listing(
                 "Workspaces:",
-                "No workspaces. Create one with `rstore workspace create <name>`.",
+                "No workspaces. Registering a bucket creates `default`, or run \
+                 `rstore workspace create <name>`.",
                 table,
             );
             Ok(HandlerOutput::human(human).with_data(serde_json::json!(data)))
         }
-        WorkspaceCommand::Show { reference } => {
-            let detail = svc.show(&WorkspaceRef::parse(reference)).await?;
+        WorkspaceCommand::Use { workspace } => {
+            let ws = svc.select(&WorkspaceRef::parse(workspace)).await?;
+            Ok(
+                HandlerOutput::human(format!("now using workspace `{}`\n", ws.name))
+                    .with_data(super::json_value(&ws)?),
+            )
+        }
+        WorkspaceCommand::Create { name, description } => {
+            let ws = svc
+                .create(CreateWorkspaceInput {
+                    name: name.clone(),
+                    description: description.clone(),
+                })
+                .await?;
+            let current = svc.current().await?.is_some_and(|c| c.id == ws.id);
+            let note = if current { " — now current" } else { "" };
+            Ok(HandlerOutput::human(format!(
+                "workspace `{}` created ({}){note}\n",
+                ws.name, ws.id
+            ))
+            .with_data(super::merge_field(
+                super::json_value(&ws)?,
+                "current",
+                Some(serde_json::Value::Bool(current)),
+            )?))
+        }
+        WorkspaceCommand::Show => {
+            let target = ctx.workspace().await?;
+            let detail = svc.show(&WorkspaceRef::Id(target.id)).await?;
+            let labels = super::bucket_labels(ctx.app).await?;
+            let names: Vec<String> = detail
+                .buckets
+                .iter()
+                .map(|id| labels.get(id).cloned().unwrap_or_else(|| id.to_string()))
+                .collect();
             let mut fields = super::format::Fields::new();
             fields
                 .header(format!(
@@ -74,26 +97,24 @@ pub(super) async fn workspace(
                 fields.push("description", d);
             }
             let mut human = fields.render();
-            for b in &detail.buckets {
-                human.push_str(&format!("  - {b}\n"));
+            for name in &names {
+                human.push_str(&format!("  - {name}\n"));
             }
             let data = serde_json::json!({
                 "id": detail.workspace.id.to_string(),
                 "name": detail.workspace.name,
                 "description": detail.workspace.description,
                 "buckets": detail.buckets.iter().map(|b| b.to_string()).collect::<Vec<_>>(),
+                "bucket_names": names,
                 "object_count": detail.object_count,
             });
             Ok(HandlerOutput::human(human).with_data(data))
         }
-        WorkspaceCommand::Edit {
-            reference,
-            name,
-            description,
-        } => {
+        WorkspaceCommand::Edit { name, description } => {
+            let target = ctx.workspace().await?;
             let ws = svc
                 .update(
-                    &WorkspaceRef::parse(reference),
+                    &WorkspaceRef::Id(target.id),
                     UpdateWorkspaceInput {
                         name: name.clone(),
                         description: description.clone().map(|d| {
@@ -111,102 +132,59 @@ pub(super) async fn workspace(
                     .with_data(super::json_value(&ws)?),
             )
         }
-        WorkspaceCommand::Remove { reference, yes } => {
-            let reference = WorkspaceRef::parse(reference);
+        WorkspaceCommand::Delete { workspace } => {
+            let reference = WorkspaceRef::parse(workspace);
             let ws = svc.resolve(&reference).await?;
             super::tty::remove_flow(
                 format!(
-                    "remove workspace `{}` (buckets and remote data are kept)",
+                    "delete workspace `{}` (buckets and remote data are kept)",
                     ws.name
                 ),
-                *yes,
-                session,
+                ctx.yes,
+                &ctx.session,
                 svc.remove(&reference),
-                format!("workspace `{}` removed; buckets untouched\n", ws.name),
+                format!("workspace `{}` deleted; buckets untouched\n", ws.name),
             )
             .await
-            .map(|out| out.with_data(serde_json::json!({"removed": ws.id.to_string()})))
+            .map(|out| out.with_data(serde_json::json!({"deleted": ws.id.to_string()})))
         }
-        WorkspaceCommand::Bucket { action } => bucket_action(svc.as_ref(), action, app).await,
-    }
-}
-
-async fn bucket_action(
-    svc: &dyn rstore_application::WorkspaceService,
-    action: &WorkspaceBucketCommand,
-    _app: &rstore_application::ApplicationApi,
-) -> HandlerResult {
-    match action {
-        WorkspaceBucketCommand::Add { workspace, bucket } => {
-            let id = svc
-                .add_bucket(&WorkspaceRef::parse(workspace), &BucketRef::parse(bucket))
-                .await?;
-            Ok(
-                HandlerOutput::human(format!("bucket {id} added to `{workspace}`\n")).with_data(
-                    serde_json::json!({"workspace": workspace, "bucket": id.to_string()}),
-                ),
-            )
-        }
-        WorkspaceBucketCommand::Remove { workspace, bucket } => {
-            svc.remove_bucket(&WorkspaceRef::parse(workspace), &BucketRef::parse(bucket))
-                .await?;
-            Ok(
-                HandlerOutput::human(format!("bucket `{bucket}` removed from `{workspace}`\n"))
-                    .with_data(serde_json::json!({"workspace": workspace, "bucket": bucket})),
-            )
-        }
-        WorkspaceBucketCommand::List { workspace } => {
-            let detail = svc.show(&WorkspaceRef::parse(workspace)).await?;
-            let data: Vec<String> = detail.buckets.iter().map(|b| b.to_string()).collect();
-            let mut table =
-                super::format::Table::new(&["BUCKET ID"], &[super::format::Align::Left]);
-            for b in &detail.buckets {
-                table.row(vec![b.to_string()]);
+        WorkspaceCommand::Add { buckets } => {
+            let target = ctx.workspace().await?;
+            let resolved = resolve_all(ctx, buckets).await?;
+            for bucket in &resolved {
+                svc.add_bucket(&WorkspaceRef::Id(target.id), &BucketRef::Id(bucket.id))
+                    .await?;
             }
-            let human = super::format::listing(
-                &format!("Buckets in `{workspace}`:"),
-                &format!("workspace `{workspace}` has no buckets"),
-                table,
-            );
-            Ok(HandlerOutput::human(human).with_data(serde_json::json!(data)))
+            membership_output(&target, buckets, "added to")
+        }
+        WorkspaceCommand::Remove { buckets } => {
+            let target = ctx.workspace().await?;
+            let resolved = resolve_all(ctx, buckets).await?;
+            for bucket in &resolved {
+                svc.remove_bucket(&WorkspaceRef::Id(target.id), &BucketRef::Id(bucket.id))
+                    .await?;
+            }
+            membership_output(&target, buckets, "removed from")
         }
     }
 }
 
-pub(super) async fn ignore(
-    action: &IgnoreCommand,
-    app: &rstore_application::ApplicationApi,
-) -> HandlerResult {
-    let svc = app.catalog().workspaces();
-    match action {
-        IgnoreCommand::Add { bucket, directory } => {
-            let rule = svc.ignore_add(&BucketRef::parse(bucket), directory).await?;
-            Ok(
-                HandlerOutput::human(format!("ignoring `{}` in {bucket}\n", rule.directory))
-                    .with_data(super::json_value(&rule)?),
-            )
-        }
-        IgnoreCommand::List { bucket } => {
-            let rules = svc.ignore_list(&BucketRef::parse(bucket)).await?;
-            let mut table =
-                super::format::Table::new(&["DIRECTORY"], &[super::format::Align::Left]);
-            for r in &rules {
-                table.row(vec![r.directory.clone()]);
-            }
-            let human = super::format::listing(
-                &format!("Ignore rules for {bucket}:"),
-                &format!("no ignore rules for {bucket}"),
-                table,
-            );
-            Ok(HandlerOutput::human(human).with_data(super::json_value(&rules)?))
-        }
-        IgnoreCommand::Remove { bucket, directory } => {
-            svc.ignore_remove(&BucketRef::parse(bucket), directory)
-                .await?;
-            Ok(HandlerOutput::human(format!(
-                "ignore rule removed for `{directory}` in {bucket}\n"
-            ))
-            .with_data(serde_json::json!({"bucket": bucket, "directory": directory})))
-        }
+/// Resolve every bucket reference before any membership changes, so a typo
+/// leaves the workspace untouched.
+async fn resolve_all(ctx: &Ctx<'_>, references: &[String]) -> rstore_domain::Result<Vec<Bucket>> {
+    let buckets = ctx.app.registry().buckets();
+    let mut resolved = Vec::with_capacity(references.len());
+    for reference in references {
+        resolved.push(buckets.resolve(&BucketRef::parse(reference)).await?);
     }
+    Ok(resolved)
+}
+
+fn membership_output(workspace: &Workspace, buckets: &[String], verb: &str) -> HandlerResult {
+    let human: String = buckets
+        .iter()
+        .map(|bucket| format!("bucket `{bucket}` {verb} `{}`\n", workspace.name))
+        .collect();
+    Ok(HandlerOutput::human(human)
+        .with_data(serde_json::json!({"workspace": workspace.name, "buckets": buckets})))
 }

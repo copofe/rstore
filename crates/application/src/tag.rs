@@ -2,11 +2,12 @@
 //!
 //! Tags are workspace-scoped and keyed to the stable object id, so they survive product-side
 //! renames and same-path overwrites. Attach validates that the object's bucket belongs to the
-//! workspace (workspace isolation).
+//! workspace (workspace isolation) and creates tags it does not find.
 
 use std::sync::Arc;
 
 use crate::batch_outcome::{BatchOutcome, ItemOutcome};
+use crate::reference::RemoteUri;
 use crate::workspace::WorkspaceRef;
 use async_trait::async_trait;
 use rstore_application_ports::{TagStore, WorkspaceStore};
@@ -71,6 +72,14 @@ pub struct TagWithCount {
     pub object_count: u64,
 }
 
+/// Outcome of a batch attach: per-object results plus the tags the attach created.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AttachReport {
+    /// Tags that did not exist in the workspace and were created by this attach.
+    pub created: Vec<Tag>,
+    pub outcome: BatchOutcome<()>,
+}
+
 /// Outcome of merging one tag into another.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MergeReport {
@@ -102,38 +111,32 @@ pub trait TagService: Send + Sync {
         source: &TagRef,
         target: &TagRef,
     ) -> Result<MergeReport>;
-    /// Attach tags to one object located by a remote reference; `replace` swaps the whole tag
-    /// set instead of extending it.
-    async fn attach(
-        &self,
-        workspace: &WorkspaceRef,
-        uri: &str,
-        tags: &[String],
-        replace: bool,
-    ) -> Result<()>;
-    /// Attach tags to a batch, resolving shared workspace/tag inputs once.
+    /// Attach tags to a batch of objects located by remote references, resolving shared
+    /// workspace/tag inputs once; `replace` swaps each object's whole tag set instead of
+    /// extending it. Tag names missing from the workspace are created (default color) once
+    /// the first object resolves — a batch that tags nothing creates nothing — and reported
+    /// in [`AttachReport::created`].
     ///
-    /// Failures are per-item: each URI gets an outcome with the error text instead of aborting
-    /// the whole batch.
+    /// Failures are per-item: each reference gets an outcome with the error text instead of
+    /// aborting the whole batch.
     async fn attach_many(
         &self,
         workspace: &WorkspaceRef,
-        uris: &[String],
+        uris: &[RemoteUri],
         tags: &[String],
         replace: bool,
-    ) -> Result<BatchOutcome<()>>;
-    /// Detach tags from one object; empty `tags` detaches all of them.
-    async fn detach(&self, workspace: &WorkspaceRef, uri: &str, tags: &[String]) -> Result<()>;
+    ) -> Result<AttachReport>;
     /// Detach tags from a batch, resolving shared workspace/tag inputs once (per-item
-    /// outcomes, as in [`Self::attach_many`]).
+    /// outcomes, as in [`Self::attach_many`]); empty `tags` detaches all of them. Unknown tag
+    /// names are an error, never created.
     async fn detach_many(
         &self,
         workspace: &WorkspaceRef,
-        uris: &[String],
+        uris: &[RemoteUri],
         tags: &[String],
     ) -> Result<BatchOutcome<()>>;
-    /// Tag names for one object (files show).
-    async fn tags_for(&self, workspace: &WorkspaceRef, uri: &str) -> Result<Vec<String>>;
+    /// Tag names for one object.
+    async fn tags_for(&self, workspace: &WorkspaceRef, uri: &RemoteUri) -> Result<Vec<String>>;
 }
 
 /// Default tag implementation over the tag store and catalog locator.
@@ -191,8 +194,53 @@ impl DefaultTagService {
     /// Resolve `<connection>/<bucket>/<key>` to a catalog row id.
     ///
     /// Workspace membership is enforced by the locator.
-    async fn resolve_object(&self, workspace: WorkspaceId, uri: &str) -> Result<RemoteObjectId> {
+    async fn resolve_object(
+        &self,
+        workspace: WorkspaceId,
+        uri: &RemoteUri,
+    ) -> Result<RemoteObjectId> {
         Ok(self.locator.resolve(uri, workspace).await?.id)
+    }
+
+    /// Build and persist a new tag; the one home of the name rule and the default color.
+    async fn insert_tag(
+        &self,
+        workspace: WorkspaceId,
+        name: &str,
+        color: Option<String>,
+        description: Option<String>,
+    ) -> Result<Tag> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(Error::invalid_input("tag name is empty"));
+        }
+        let mut tag = Tag::new(TagId::new_random(), workspace, name, self.clock.now());
+        tag.color = color.unwrap_or_else(|| "gray".to_string());
+        tag.description = description;
+        self.tags.insert(&tag).await?;
+        Ok(tag)
+    }
+
+    /// Split names into the workspace's existing tag ids and the names it lacks. Names are
+    /// trimmed and deduplicated first, so `a, a` names one tag.
+    async fn partition_tags(
+        &self,
+        workspace: WorkspaceId,
+        names: &[String],
+    ) -> Result<(Vec<TagId>, Vec<String>)> {
+        let mut ids = Vec::with_capacity(names.len());
+        let mut missing = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for name in names.iter().map(|name| name.trim()) {
+            if !seen.insert(name) {
+                continue;
+            }
+            match self.tags.get(workspace, name).await? {
+                Some(existing) => ids.push(existing.id),
+                None => missing.push(name.to_string()),
+            }
+        }
+        Ok((ids, missing))
     }
 
     // Resolve names to ids through the store's by-name lookup — no per-name `TagRef`
@@ -212,14 +260,24 @@ impl DefaultTagService {
         Ok(ids)
     }
 
-    async fn attach_resolved(
+    /// Attach to one object. Any name still in `missing` is created first — only after the
+    /// object resolves — and moves into `tags` and `created`.
+    async fn attach_one(
         &self,
         workspace: WorkspaceId,
-        uri: &str,
-        tags: &[TagId],
+        uri: &RemoteUri,
+        tags: &mut Vec<TagId>,
+        missing: &mut Vec<String>,
+        created: &mut Vec<Tag>,
         replace: bool,
     ) -> Result<()> {
         let object = self.resolve_object(workspace, uri).await?;
+        while let Some(name) = missing.first() {
+            let tag = self.insert_tag(workspace, name, None, None).await?;
+            missing.remove(0);
+            tags.push(tag.id);
+            created.push(tag);
+        }
         if replace {
             self.tags.clear_object(workspace, object).await?;
         }
@@ -233,7 +291,7 @@ impl DefaultTagService {
     async fn detach_resolved(
         &self,
         workspace: WorkspaceId,
-        uri: &str,
+        uri: &RemoteUri,
         tags: &[TagId],
     ) -> Result<()> {
         let object = self.resolve_object(workspace, uri).await?;
@@ -251,15 +309,8 @@ impl DefaultTagService {
 impl TagService for DefaultTagService {
     async fn create(&self, input: CreateTagInput) -> Result<Tag> {
         let workspace = self.resolve_workspace(&input.workspace).await?;
-        let name = input.name.trim();
-        if name.is_empty() {
-            return Err(Error::invalid_input("tag name is empty"));
-        }
-        let mut tag = Tag::new(TagId::new_random(), workspace.id, name, self.clock.now());
-        tag.color = input.color.unwrap_or_else(|| "gray".to_string());
-        tag.description = input.description;
-        self.tags.insert(&tag).await?;
-        Ok(tag)
+        self.insert_tag(workspace.id, &input.name, input.color, input.description)
+            .await
     }
 
     async fn list(&self, workspace: &WorkspaceRef) -> Result<Vec<TagWithCount>> {
@@ -334,53 +385,45 @@ impl TagService for DefaultTagService {
         })
     }
 
-    async fn attach(
-        &self,
-        workspace: &WorkspaceRef,
-        uri: &str,
-        tags: &[String],
-        replace: bool,
-    ) -> Result<()> {
-        let workspace = self.resolve_workspace(workspace).await?;
-        let resolved = self.resolve_many(workspace.id, tags).await?;
-        self.attach_resolved(workspace.id, uri, &resolved, replace)
-            .await
-    }
-
     async fn attach_many(
         &self,
         workspace: &WorkspaceRef,
-        uris: &[String],
+        uris: &[RemoteUri],
         tags: &[String],
         replace: bool,
-    ) -> Result<BatchOutcome<()>> {
+    ) -> Result<AttachReport> {
         let workspace = self.resolve_workspace(workspace).await?;
-        let tags = self.resolve_many(workspace.id, tags).await?;
+        let (mut tags, mut missing) = self.partition_tags(workspace.id, tags).await?;
+        let mut created = Vec::new();
         let mut items = Vec::with_capacity(uris.len());
         for uri in uris {
             items.push(
                 match self
-                    .attach_resolved(workspace.id, uri, &tags, replace)
+                    .attach_one(
+                        workspace.id,
+                        uri,
+                        &mut tags,
+                        &mut missing,
+                        &mut created,
+                        replace,
+                    )
                     .await
                 {
-                    Ok(()) => ItemOutcome::succeeded(uri.clone(), None),
-                    Err(e) => ItemOutcome::failed(uri.clone(), &e),
+                    Ok(()) => ItemOutcome::succeeded(uri.to_string(), None),
+                    Err(e) => ItemOutcome::failed(uri.to_string(), &e),
                 },
             );
         }
-        Ok(BatchOutcome::new(items))
-    }
-
-    async fn detach(&self, workspace: &WorkspaceRef, uri: &str, tags: &[String]) -> Result<()> {
-        let workspace = self.resolve_workspace(workspace).await?;
-        let resolved = self.resolve_many(workspace.id, tags).await?;
-        self.detach_resolved(workspace.id, uri, &resolved).await
+        Ok(AttachReport {
+            created,
+            outcome: BatchOutcome::new(items),
+        })
     }
 
     async fn detach_many(
         &self,
         workspace: &WorkspaceRef,
-        uris: &[String],
+        uris: &[RemoteUri],
         tags: &[String],
     ) -> Result<BatchOutcome<()>> {
         let workspace = self.resolve_workspace(workspace).await?;
@@ -388,14 +431,14 @@ impl TagService for DefaultTagService {
         let mut items = Vec::with_capacity(uris.len());
         for uri in uris {
             items.push(match self.detach_resolved(workspace.id, uri, &tags).await {
-                Ok(()) => ItemOutcome::succeeded(uri.clone(), None),
-                Err(e) => ItemOutcome::failed(uri.clone(), &e),
+                Ok(()) => ItemOutcome::succeeded(uri.to_string(), None),
+                Err(e) => ItemOutcome::failed(uri.to_string(), &e),
             });
         }
         Ok(BatchOutcome::new(items))
     }
 
-    async fn tags_for(&self, workspace: &WorkspaceRef, uri: &str) -> Result<Vec<String>> {
+    async fn tags_for(&self, workspace: &WorkspaceRef, uri: &RemoteUri) -> Result<Vec<String>> {
         let workspace = self.resolve_workspace(workspace).await?;
         let object = self.resolve_object(workspace.id, uri).await?;
         self.tags.tags_for_object(workspace.id, object).await

@@ -1,17 +1,14 @@
 //! `task …` handlers (JOB-).
 
-use super::HandlerResult;
+use super::{Ctx, HandlerResult};
 use crate::output::HandlerOutput;
 
 // --- task ------------------------------------------------------------------
 
-pub(super) async fn task(
-    action: &crate::args::TaskCommand,
-    app: &rstore_application::ApplicationApi,
-) -> HandlerResult {
+pub(super) async fn task(ctx: &Ctx<'_>, action: &crate::args::TaskCommand) -> HandlerResult {
     use rstore_application::JobRef;
 
-    let svc = app.jobs();
+    let svc = ctx.app.jobs();
     match action {
         crate::args::TaskCommand::List => {
             let jobs = svc.list().await?;
@@ -50,8 +47,11 @@ pub(super) async fn task(
             }
             Ok(HandlerOutput::human(human).with_data(data))
         }
-        crate::args::TaskCommand::Show { reference, errors } => {
-            let job = svc.resolve(&JobRef::parse(reference)?).await?;
+        crate::args::TaskCommand::Show { job, errors } => {
+            // Without a reference, the newest job (ordinal 1).
+            let job = svc
+                .resolve(&JobRef::parse(job.as_deref().unwrap_or("1"))?)
+                .await?;
             let data = super::json_value(&job)?;
             let mut fields = super::format::Fields::new();
             fields
@@ -84,29 +84,15 @@ pub(super) async fn task(
             }
             Ok(HandlerOutput::human(human).with_data(data))
         }
-        crate::args::TaskCommand::Pause { reference } => {
-            let job = svc.pause(&JobRef::parse(reference)?).await?;
-            control_output(job, "Paused")
-        }
-        crate::args::TaskCommand::Resume { reference } => {
-            let job = svc.resume(&JobRef::parse(reference)?).await?;
-            control_output(job, "Resumed (running)")
-        }
-        crate::args::TaskCommand::Retry { reference } => {
-            let job = svc.retry(&JobRef::parse(reference)?).await?;
-            control_output(job, "Retrying (running)")
-        }
-        crate::args::TaskCommand::Cancel { reference } => {
-            let job = svc.cancel(&JobRef::parse(reference)?).await?;
-            control_output(job, "Cancelled")
+        crate::args::TaskCommand::Cancel { job } => {
+            let job = svc.cancel(&JobRef::parse(job)?).await?;
+            let data = super::json_value(&job)?;
+            Ok(HandlerOutput::human(format!(
+                "Cancelled job {} ({})\n",
+                job.id,
+                job.kind.as_str()
+            ))
+            .with_data(data))
         }
     }
-}
-
-fn control_output(job: rstore_domain::job::Job, verb: &str) -> HandlerResult {
-    let data = super::json_value(&job)?;
-    Ok(
-        HandlerOutput::human(format!("{verb} job {} ({})\n", job.id, job.kind.as_str()))
-            .with_data(data),
-    )
 }

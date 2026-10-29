@@ -9,12 +9,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use rstore_application_ports::{RepairItem, RepairKind, RepairStatus, RepairStore};
-use rstore_domain::id::{ReceiptId, RepairId};
-use rstore_domain::{Clock, Error, Result};
+use rstore_domain::id::{EventId, ReceiptId, RepairId};
+use rstore_domain::{Clock, Error, MutationOperation, Result};
 use sqlx::sqlite::SqlitePool;
 use time::OffsetDateTime;
 
-use crate::codec::{unix_secs, RowReader};
+use crate::codec::{unix_secs, uuid_to_text, RowReader};
 use crate::error::map_sqlx;
 use crate::tx::WriteGate;
 
@@ -76,7 +76,7 @@ fn decode_repair(row: sqlx::sqlite::SqliteRow) -> Result<RepairItem> {
         id: reader.text("id")?.parse()?,
         event_id: reader
             .opt_text("event_id")?
-            .map(|token| token.parse())
+            .map(|token| uuid::Uuid::parse_str(&token).map(EventId::from_uuid))
             .transpose()
             .map_err(|e| Error::database("decode repair event id").with_source(e))?,
         receipt_id: reader
@@ -87,9 +87,16 @@ fn decode_repair(row: sqlx::sqlite::SqliteRow) -> Result<RepairItem> {
         status: RepairStatus::parse(&reader.text("status")?)?,
         attempts: reader.integer("attempts")? as u32,
         last_error: reader.opt_text("last_error")?,
-        locator: reader.opt_text("locator_json")?,
+        locator: reader
+            .opt_text("locator_json")?
+            .map(|json| serde_json::from_str(&json))
+            .transpose()
+            .map_err(|e| Error::database("decode repair locator").with_source(e))?,
         next_attempt_at: reader.timestamp("next_attempt_at")?,
-        operation: reader.opt_text("operation")?,
+        operation: reader
+            .opt_text("operation")?
+            .map(|token| MutationOperation::parse(&token))
+            .transpose()?,
     })
 }
 
@@ -117,12 +124,17 @@ where
              next_attempt_at = excluded.next_attempt_at, updated_at = excluded.updated_at",
     )
     .bind(item.id.to_string())
-    .bind(item.event_id.map(|id| id.to_string()))
+    .bind(item.event_id.as_ref().map(uuid_to_text))
     .bind(item.receipt_id.as_ref().map(ReceiptId::to_string))
     .bind(item.kind.as_str())
     .bind(item.status.as_str())
-    .bind(&item.locator)
-    .bind(&item.operation)
+    .bind(
+        item.locator
+            .as_ref()
+            .map(super::receipt::locator_json)
+            .transpose()?,
+    )
+    .bind(item.operation.map(MutationOperation::as_str))
     .bind(i64::from(item.attempts))
     .bind(&item.last_error)
     .bind(unix_secs(item.next_attempt_at))

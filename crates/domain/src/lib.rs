@@ -28,10 +28,10 @@ pub use conflict::{ConflictDecision, ConflictProbe, Resolved};
 pub use connection::{AddressingStyle, ConnectionConfig, ConnectionTestStatus, Region};
 pub use contexts::BoundedContext;
 pub use error::{Error, ErrorCode, ErrorContext, Result};
-pub use events::{DomainEvent, EventEnvelope, DOMAIN_EVENT_SCHEMA_VERSION};
+pub use events::{DomainEvent, EventEnvelope, MutationOperation, DOMAIN_EVENT_SCHEMA_VERSION};
 pub use id::{
-    BucketId, ConnectionId, IndexRunId, JobId, ReceiptId, RemoteObjectId, RepairId, TagId, TypedId,
-    WorkspaceId,
+    BucketId, ConnectionId, EventId, IndexRunId, JobId, ReceiptId, RemoteObjectId, RepairId, TagId,
+    TypedId, WorkspaceId,
 };
 pub use job::{Job, JobItem, JobKind, JobState};
 pub use link::LinkProfile;

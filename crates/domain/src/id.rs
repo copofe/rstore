@@ -165,14 +165,20 @@ define_id!(
     "rep"
 );
 
+define_id!(
+    /// Identifies one domain fact in the outbox.
+    EventId,
+    "evt"
+);
+
 /// Repair identity is deterministic: one underlying cause maps to exactly
 /// one repair row, so repeated dispatch or re-projection upserts the same
 /// row instead of accumulating duplicates.
 impl RepairId {
     /// Identity for event-driven repairs: outbox delivery dead-letters and
     /// remote-verification divergences.
-    pub const fn from_event(event_id: uuid::Uuid) -> Self {
-        Self(event_id)
+    pub const fn from_event(event_id: EventId) -> Self {
+        Self(event_id.0)
     }
 
     /// Identity for receipt-driven repairs: settlement and projection

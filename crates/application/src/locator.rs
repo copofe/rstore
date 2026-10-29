@@ -121,6 +121,16 @@ impl CatalogLocator {
         Ok((config, bucket, storage))
     }
 
+    /// `<connection>/<bucket>` for report labels; the connection id stands
+    /// in when its row is gone.
+    pub async fn bucket_label(&self, bucket: &rstore_domain::Bucket) -> String {
+        let connection = match self.connections.get(bucket.connection_id).await {
+            Ok(Some(config)) => config.name,
+            _ => bucket.connection_id.to_string(),
+        };
+        format!("{connection}/{}", bucket.name)
+    }
+
     /// Resolve an already-registered bucket to its connection config and a
     /// connected adapter.
     ///
@@ -161,24 +171,23 @@ impl CatalogLocator {
         }
     }
 
-    /// Resolve a URI string to a catalog row that must exist and belong to
+    /// Resolve a reference to a catalog row that must exist and belong to
     /// the given workspace.
     ///
     /// A not-found error covers three distinct cases on purpose — unknown
-    /// locator shape, unindexed object ("run `index start` first"), and an
+    /// locator shape, unindexed object ("run `index run` first"), and an
     /// object outside the workspace — so callers cannot distinguish a
     /// missing object from one they must not see.
-    pub async fn resolve(&self, uri: &str, workspace: WorkspaceId) -> Result<RemoteObject> {
-        let parsed = RemoteUri::parse(uri)?;
-        let (config, bucket) = self.resolve_bucket(&parsed).await?;
-        let path = ObjectPath::new(&parsed.key)?;
+    pub async fn resolve(&self, uri: &RemoteUri, workspace: WorkspaceId) -> Result<RemoteObject> {
+        let (config, bucket) = self.resolve_bucket(uri).await?;
+        let path = ObjectPath::new(&uri.key)?;
         let object = self
             .catalog
             .find_by_locator(config.id, bucket.id, &path)
             .await?
             .ok_or_else(|| {
                 Error::not_found(format!(
-                    "`{uri}` is not in the catalog; run `index start` first"
+                    "`{uri}` is not in the catalog; run `index run` first"
                 ))
             })?;
         let member = self.workspaces.buckets(workspace).await?;

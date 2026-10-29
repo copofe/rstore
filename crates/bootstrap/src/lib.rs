@@ -9,11 +9,15 @@
 //! throwaway databases) and [`Runtime::open_locked`] (the full process-startup
 //! sequence every binary runs). Both assemble dependencies through the single
 //! assembly point `rstore_persistence::assemble`, which the test fixture shares.
+//! Draining the outbox is a separate, budgeted step ([`Runtime::drain_outbox`])
+//! the entry point schedules: it reaches the remote, so a command that never
+//! does must not wait on it.
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
-use rstore_application::Application;
+use rstore_application::{Application, DispatchReport};
 use rstore_domain::{Clock, Error, Result, SystemClock};
 use rstore_persistence::Database;
 use rstore_platform::{AppDirs, AppLock, LockError};
@@ -93,19 +97,26 @@ impl Runtime {
         };
         let mut runtime = Self::open(RuntimeConfig::new(app_dirs.db_path.clone())).await?;
         runtime._lock = Some(lock);
-        // Under the write lock: the drain records repairs, so it must respect
-        // the single-writer discipline like every other write path.
-        let report = runtime.application.drain_outbox().await?;
+        Ok(runtime)
+    }
+
+    /// Verify settled remote mutations from the outbox backlog within
+    /// `budget` (see [`Application::drain_outbox`]). Call it after
+    /// [`Self::open_locked`]: the drain records repairs, so it must run under
+    /// the single-writer lock like every other write path.
+    pub async fn drain_outbox(&self, budget: Duration) -> Result<DispatchReport> {
+        let report = self.application.drain_outbox(budget).await?;
         if report.claimed > 0 {
             tracing::info!(
                 claimed = report.claimed,
                 published = report.published,
                 retried = report.retried,
+                deferred = report.deferred,
                 repair_required = report.repair_required,
-                "outbox drained at startup"
+                "outbox drained"
             );
         }
-        Ok(runtime)
+        Ok(report)
     }
 
     pub fn application(&self) -> &Application {

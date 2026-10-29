@@ -1,24 +1,21 @@
-//! Upload/download/cp/mv handlers plus the stderr progress sink: sources
-//! and conflict policy are resolved here, the transfer runs through the
-//! application seam, and results render via the shared batch-report
-//! grammar.
+//! `cp` / `mv` handlers plus the stderr progress sink: the application's
+//! reference grammar routes each `cp` to an upload, download, or remote copy;
+//! the conflict policy is settled here, the transfer runs through the
+//! application seam, and results render via the shared batch-report grammar.
 
 use std::io::Write;
 use std::path::PathBuf;
 
-use rstore_application::{BatchDownloadReport, TransferReport};
-use rstore_transfer::{CancellationToken, NullProgressSink, Progress, ProgressSink};
+use rstore_application::{
+    BatchDownloadCommand, BatchDownloadReport, NullProgressSink, Progress, ProgressSink, RemoteUri,
+    RunControl, RunOptions, TransferConfig, TransferReport, TransferRoute,
+};
 
 use super::format::{human_size, speed};
 use super::tty::resolve_conflict;
-use super::HandlerResult;
+use super::{Ctx, HandlerResult};
+use crate::args::CopyArgs;
 use rstore_domain::{ConflictPolicy, Error};
-
-/// Transfer direction shared by the upload and download CLI arms.
-pub(super) enum Direction {
-    Upload,
-    Download,
-}
 
 /// stderr progress line: `label 42% (12.3MB/29.4MB) 3.1MB/s`. Never writes
 /// stdout; coalesces to one update per 250ms.
@@ -68,245 +65,218 @@ impl ProgressSink for StderrProgress {
     }
 }
 
-fn sink_for(args: &crate::args::TransferArgs, label: &str, quiet: bool) -> Box<dyn ProgressSink> {
-    sink_for_flags(progress_suppressed(args.no_progress, quiet), label)
-}
-
-fn progress_suppressed(no_progress: bool, quiet: bool) -> bool {
-    no_progress || quiet
-}
-
-fn sink_for_flags(no_progress: bool, label: &str) -> Box<dyn ProgressSink> {
-    if no_progress {
+fn progress_sink(ctx: &Ctx<'_>, args: &CopyArgs, label: &str) -> Box<dyn ProgressSink> {
+    if args.no_progress || ctx.quiet {
         Box::new(NullProgressSink)
     } else {
         Box::new(StderrProgress::new(label))
     }
 }
 
-/// Runs one `upload` or `download`: resolve sources (`-` reads stdin),
-/// settle the conflict policy, then dispatch to the matching application
-/// command and render its report.
-pub(super) async fn transfer(
-    app: &rstore_application::ApplicationApi,
-    args: &crate::args::TransferArgs,
-    direction: Direction,
-    cancel: &CancellationToken,
-    quiet: bool,
-    session: &super::tty::Session,
-) -> HandlerResult {
-    use rstore_application::{RunOptions, UploadObjectsCommand, UploadPlan};
-
+/// `cp SRC... DST`: the reference grammar decides the direction once, then
+/// the matching application command runs.
+pub(super) async fn cp(ctx: &Ctx<'_>, args: &CopyArgs) -> HandlerResult {
     let sources = super::tty::resolve_uris(
         &args.sources,
-        match direction {
-            Direction::Upload => "upload needs at least one local source path",
-            Direction::Download => "download needs at least one remote source reference",
-        },
+        "cp needs at least one source (or `-` to read them from stdin)",
     )?;
-    let options = RunOptions {
+    match ctx
+        .app
+        .registry()
+        .references()
+        .route(&sources, &args.target)
+        .await?
+    {
+        TransferRoute::Upload { sources, target } => {
+            reject_keep_tags(args)?;
+            upload(ctx, args, sources, target).await
+        }
+        TransferRoute::Download { sources, target } => {
+            reject_keep_tags(args)?;
+            download(ctx, args, &sources, target).await
+        }
+        TransferRoute::Copy { sources, target } => {
+            remote_copy(ctx, args, sources, target, false).await
+        }
+    }
+}
+
+/// `mv SRC... DST`: remote-to-remote only — copy, verify, then delete.
+pub(super) async fn mv(ctx: &Ctx<'_>, args: &CopyArgs) -> HandlerResult {
+    let sources = super::tty::resolve_uris(
+        &args.sources,
+        "mv needs at least one remote source (or `-` to read them from stdin)",
+    )?;
+    match ctx
+        .app
+        .registry()
+        .references()
+        .route(&sources, &args.target)
+        .await?
+    {
+        TransferRoute::Copy { sources, target } => {
+            remote_copy(ctx, args, sources, target, true).await
+        }
+        TransferRoute::Upload { .. } | TransferRoute::Download { .. } => Err(Error::invalid_input(
+            "mv moves objects between remote locations only; use cp to upload or download",
+        )),
+    }
+}
+
+fn reject_keep_tags(args: &CopyArgs) -> Result<(), Error> {
+    if args.keep_tags {
+        return Err(Error::invalid_input(
+            "--keep-tags applies to remote-to-remote copies only",
+        ));
+    }
+    Ok(())
+}
+
+/// Settle the conflict policy: `-f` or `--conflict` first, then the target
+/// bucket's default (precedence owned by the application), then the prompt.
+async fn conflict_policy(
+    ctx: &Ctx<'_>,
+    args: &CopyArgs,
+    target: Option<&RemoteUri>,
+) -> Result<ConflictPolicy, Error> {
+    let explicit = if args.force {
+        Some(ConflictPolicy::Overwrite)
+    } else {
+        args.conflict
+            .as_deref()
+            .map(ConflictPolicy::parse)
+            .transpose()?
+    };
+    resolve_conflict(
+        ctx.app.transfer().conflict_policy(explicit, target).await?,
+        &ctx.session,
+    )
+}
+
+fn run_options(args: &CopyArgs) -> RunOptions {
+    RunOptions {
         dry_run: args.dry_run,
         ..Default::default()
-    };
+    }
+}
 
-    let report = match direction {
-        Direction::Upload => {
-            let target = super::expand_remote(app, &args.target).await?;
-            let (connection, bucket, prefix) = rstore_application::RemoteUri::parse_base(&target)?;
-            let explicit = args
-                .conflict
-                .as_deref()
-                .map(ConflictPolicy::parse)
-                .transpose()?;
-            let conflict = resolve_conflict(
-                app.transfer()
-                    .conflict_policy(explicit, Some((&connection, &bucket)))
-                    .await?,
-                args.yes,
-                session,
-            )?;
-            let plan = UploadPlan {
-                connection,
-                bucket,
-                prefix,
-                sources: sources.iter().map(PathBuf::from).collect(),
-                conflict,
-                recursive: args.recursive,
-            };
-            app.transfer()
-                .run_upload(
-                    &UploadObjectsCommand { plan, options },
-                    sink_for(args, "upload", quiet).as_ref(),
-                    cancel,
+async fn upload(
+    ctx: &Ctx<'_>,
+    args: &CopyArgs,
+    sources: Vec<PathBuf>,
+    target: RemoteUri,
+) -> HandlerResult {
+    let conflict = conflict_policy(ctx, args, Some(&target)).await?;
+    let plan = rstore_application::UploadPlan {
+        connection: target.connection,
+        bucket: target.bucket,
+        prefix: target.key,
+        sources,
+        conflict,
+        recursive: args.recursive,
+    };
+    let progress = progress_sink(ctx, args, "upload");
+    let report = ctx
+        .app
+        .transfer()
+        .run_upload(
+            &rstore_application::UploadObjectsCommand {
+                plan,
+                options: run_options(args),
+            },
+            RunControl {
+                progress: progress.as_ref(),
+                cancel: ctx.cancel,
+            },
+        )
+        .await?;
+    render_transfer_report(report, args.dry_run)
+}
+
+async fn download(
+    ctx: &Ctx<'_>,
+    args: &CopyArgs,
+    sources: &[RemoteUri],
+    target: PathBuf,
+) -> HandlerResult {
+    let mode = rstore_application::classify_download(sources.len(), &target)?;
+    let conflict = conflict_policy(ctx, args, None).await?;
+    let mut plans = rstore_application::download_plans(sources, target, conflict, args.recursive);
+    let options = run_options(args);
+    let progress = progress_sink(ctx, args, "download");
+    let control = RunControl {
+        progress: progress.as_ref(),
+        cancel: ctx.cancel,
+    };
+    match mode {
+        rstore_application::DownloadMode::Batch => {
+            // One child job per source; results aggregate at the
+            // application seam.
+            let report = ctx
+                .app
+                .transfer()
+                .run_batch_download(&BatchDownloadCommand { plans, options }, control)
+                .await?;
+            render_batch_download_report(report, args.dry_run)
+        }
+        rstore_application::DownloadMode::Single => {
+            let plan = plans
+                .pop()
+                .ok_or_else(|| Error::invalid_input("download needs a remote source reference"))?;
+            let report = ctx
+                .app
+                .transfer()
+                .run_download(
+                    &rstore_application::DownloadObjectsCommand { plan, options },
+                    control,
                 )
-                .await?
+                .await?;
+            render_transfer_report(report, args.dry_run)
         }
-        Direction::Download => {
-            let target = std::path::PathBuf::from(&args.target);
-            let mode = rstore_application::classify_download(sources.len(), &target)?;
-            let explicit = args
-                .conflict
-                .as_deref()
-                .map(ConflictPolicy::parse)
-                .transpose()?;
-            let conflict = resolve_conflict(
-                app.transfer().conflict_policy(explicit, None).await?,
-                args.yes,
-                session,
-            )?;
-            let expanded = match mode {
-                rstore_application::DownloadMode::Batch => {
-                    super::expand_remote_batch(app, &sources).await?
-                }
-                rstore_application::DownloadMode::Single => vec![
-                    super::expand_remote(
-                        app,
-                        sources.first().ok_or_else(|| {
-                            Error::invalid_input("download needs a remote source reference")
-                        })?,
-                    )
-                    .await?,
-                ],
-            };
-            let plans =
-                rstore_application::download_plans(&expanded, target, conflict, args.recursive)?;
-            match mode {
-                rstore_application::DownloadMode::Batch => {
-                    // One child job per source URI; results aggregate at the
-                    // application seam.
-                    let report = app
-                        .transfer()
-                        .run_batch_download(
-                            &plans,
-                            &options,
-                            sink_for(args, "download", quiet).as_ref(),
-                            cancel,
-                        )
-                        .await?;
-                    return render_batch_download_report(report, args);
-                }
-                rstore_application::DownloadMode::Single => {
-                    let plan = plans.into_iter().next().ok_or_else(|| {
-                        Error::invalid_input("download needs a remote source reference")
-                    })?;
-                    app.transfer()
-                        .run_download(
-                            &rstore_application::DownloadObjectsCommand { plan, options },
-                            sink_for(args, "download", quiet).as_ref(),
-                            cancel,
-                        )
-                        .await?
-                }
-            }
-        }
-    };
-
-    render_transfer_report(report, args)
+    }
 }
 
-fn render_transfer_report(
-    report: TransferReport,
-    args: &crate::args::TransferArgs,
-) -> HandlerResult {
-    super::report::render_batch(
-        super::json_value(&report)?,
-        args.dry_run.then_some("(dry run — nothing transferred)"),
-        &report.items,
-        format!(
-            "job {} — {} succeeded, {} skipped, {} failed ({})",
-            report.job_id,
-            report.succeeded(),
-            report.skipped(),
-            report.failed(),
-            report.state,
-        ),
-        report.is_interrupted(),
-        report.severity(),
-    )
-}
-
-fn render_batch_download_report(
-    report: BatchDownloadReport,
-    args: &crate::args::TransferArgs,
-) -> HandlerResult {
-    super::report::render_batch(
-        super::json_value(&report)?,
-        args.dry_run.then_some("(dry run — nothing transferred)"),
-        report.reports.iter().flat_map(|child| child.items.iter()),
-        format!(
-            "{} job(s) — {} succeeded, {} skipped, {} failed, {} blocked",
-            report.reports.len(),
-            report.succeeded(),
-            report.skipped(),
-            report.failed(),
-            report.blocked(),
-        ),
-        report.is_interrupted(),
-        report.severity(),
-    )
-}
-
-/// Runs `cp` / `mv`: resolve sources against the target, run the copy or
-/// move service, render the shared report shape.
-pub(super) async fn copy_move(
+async fn remote_copy(
+    ctx: &Ctx<'_>,
+    args: &CopyArgs,
+    sources: Vec<RemoteUri>,
+    target: RemoteUri,
     is_move: bool,
-    args: &crate::args::CopyArgs,
-    app: &rstore_application::ApplicationApi,
-    cancel: &rstore_transfer::CancellationToken,
-    quiet: bool,
-    session: &super::tty::Session,
 ) -> HandlerResult {
-    // `-` reads one URI per line from stdin.
-    let sources =
-        super::tty::resolve_uris(&args.sources, "cp/mv needs at least one remote source URI")?;
-    let sources = super::expand_remote_batch(app, &sources).await?;
-    let target = super::expand_remote(app, &args.target).await?;
-    let (dst_connection, dst_bucket, _) = rstore_application::RemoteUri::parse_base(&target)?;
-    let explicit = args
-        .conflict
-        .as_deref()
-        .map(ConflictPolicy::parse)
-        .transpose()?;
-    let conflict = resolve_conflict(
-        app.transfer()
-            .conflict_policy(explicit, Some((&dst_connection, &dst_bucket)))
-            .await?,
-        args.yes,
-        session,
-    )?;
+    let conflict = conflict_policy(ctx, args, Some(&target)).await?;
     let options = rstore_application::CopyOptions {
         dry_run: args.dry_run,
         conflict,
         recursive: args.recursive,
         keep_tags: args.keep_tags,
-        config: rstore_transfer::TransferConfig::default(),
+        config: TransferConfig::default(),
     };
     let pairs: Vec<rstore_application::CopyPair> = sources
-        .iter()
-        .map(|src| rstore_application::CopyPair {
-            source: src.clone(),
+        .into_iter()
+        .map(|source| rstore_application::CopyPair {
+            source,
             target: target.clone(),
         })
         .collect();
     let command = rstore_application::CopyObjectsCommand { pairs, options };
     let label = if is_move { "moving" } else { "copying" };
-    let progress = sink_for_flags(quiet, label);
-    let report = if is_move {
-        app.transfer()
-            .run_move(&command, cancel, progress.as_ref())
-            .await?
-    } else {
-        app.transfer()
-            .run_copy(&command, cancel, progress.as_ref())
-            .await?
+    let progress = progress_sink(ctx, args, label);
+    let control = RunControl {
+        progress: progress.as_ref(),
+        cancel: ctx.cancel,
     };
-    render_copy_report(report, args)
+    let report = if is_move {
+        ctx.app.transfer().run_move(&command, control).await?
+    } else {
+        ctx.app.transfer().run_copy(&command, control).await?
+    };
+    render_transfer_report(report, args.dry_run)
 }
 
-fn render_copy_report(report: TransferReport, args: &crate::args::CopyArgs) -> HandlerResult {
+fn render_transfer_report(report: TransferReport, dry_run: bool) -> HandlerResult {
     super::report::render_batch(
         super::json_value(&report)?,
-        args.dry_run.then_some("(dry run — nothing written)"),
+        dry_run.then_some("(dry run — nothing transferred)"),
         &report.items,
         format!(
             "job {} — {} succeeded, {} skipped, {} failed, {} blocked ({})",
@@ -316,6 +286,24 @@ fn render_copy_report(report: TransferReport, args: &crate::args::CopyArgs) -> H
             report.failed(),
             report.blocked(),
             report.state,
+        ),
+        report.is_interrupted(),
+        report.severity(),
+    )
+}
+
+fn render_batch_download_report(report: BatchDownloadReport, dry_run: bool) -> HandlerResult {
+    super::report::render_batch(
+        super::json_value(&report)?,
+        dry_run.then_some("(dry run — nothing transferred)"),
+        report.reports.iter().flat_map(|child| child.items.iter()),
+        format!(
+            "{} job(s) — {} succeeded, {} skipped, {} failed, {} blocked",
+            report.reports.len(),
+            report.succeeded(),
+            report.skipped(),
+            report.failed(),
+            report.blocked(),
         ),
         report.is_interrupted(),
         report.severity(),

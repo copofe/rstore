@@ -2,8 +2,8 @@
 
 rstore is a local-first workbench for S3-compatible storage: connect your own
 endpoints (MinIO, Cloudflare R2, Supabase Storage, and others), index buckets
-into a local catalog, and run everyday object work — upload, download, copy,
-move, search, tagging, link generation.
+into a local catalog, and run everyday object work — copy in every direction,
+move, delete, search, tagging, link generation.
 
 The command tree is defined in `crates/cli/src/args.rs`, which is the source
 of truth; `rstore <command> --help` always has the most authoritative flag
@@ -16,300 +16,280 @@ half is the command reference.
 
 ### 0. Conventions
 
-- **Short references** (recommended): every command that accepts a remote
-  location takes `<bucket>/[prefix/]<key>`, e.g. `media/img/logo.png`; the
-  bucket root is `media/` or bare `media`. When the bucket name is ambiguous
-  across connections, write `<connection>/<bucket>/…` (e.g.
-  `nas/media/img/`).
-- **Reference forms**: connections accept a name or a `conn_…` id; buckets
-  accept a `bkt_…` id, `<connection>/<name>`, or a bare unique name; tasks
-  accept a `job_…` id or the ordinal shown by `task list` (`1` = newest).
-- **Output discipline**: results go to stdout; progress and logs go to
-  stderr. Add `--json` for the machine-readable envelope.
-- **Exit codes**: `0` success; `13` a batch in which any item failed;
-  `130` interrupted by Ctrl+C; `14` local disk I/O failure; `11`
-  capability unsupported (e.g. presigning). Every other failure maps to the
-  code in the JSON envelope's `errors[].code`.
-- **Destructive operations** (`rm`, `bucket remove`, `connection remove`,
-  `catalog gc`, `tag merge`, `index rebuild`, …) confirm interactively;
-  scripts and pipelines must pass `--yes`.
+- **One reference grammar.** Every remote argument reads
+  `[<connection>/]<bucket>/[key]`, e.g. `media/img/logo.png`; the bucket root
+  is `media/`. Add the connection segment only when a bucket name exists on
+  several connections (`nas/media/img/`). Bucket arguments use the same
+  grammar without a key (`media`, `nas/media`, or a `bkt_…` id).
+- **The current workspace.** Catalog commands (`find`, `tag`, `stat
+  --offline`, `index run`, and the `workspace` subcommands without a name)
+  act on the workspace from `-w/--workspace` (or `RSTORE_WORKSPACE`), else
+  the current workspace, else the only one. Registering the first bucket
+  creates a `default` workspace and selects it.
+- **Verbs mean one thing.** `add`/`remove` change a registration or an
+  association and never touch remote data; `create`/`delete` manage local
+  entities (workspaces, tags); only `rm` deletes remote objects.
+- **Output discipline**: results go to stdout; progress, warnings, and logs
+  go to stderr. Add `--json` for the machine-readable envelope.
+- **Confirmation**: destructive actions (`rm`, `bucket remove`, `connection
+  remove`, `workspace delete`, `tag delete`, `tag merge`, `index run
+  --rebuild`, `index gc`) prompt on a terminal; scripts pass the global
+  `-y/--yes`. `-y` never means "overwrite" — that is `-f`.
+- **Exit codes**: `0` success; `13` a batch in which any item failed; `130`
+  interrupted by Ctrl+C; `6` endpoint unreachable (DNS, refused or dropped
+  connection, timeout); `14` local disk I/O failure; `11` capability
+  unsupported (e.g. presigning). Every other failure maps to the code in the
+  JSON envelope's `errors[].code`.
+- **Background verification**: commands that reach the remote anyway (`ls`
+  with a reference, `stat`, `cp`, `mv`, `rm`, `index run`, `conn add/test`,
+  `bucket add`, `bucket list --remote`) first spend at most two seconds
+  re-checking earlier uploads, copies, and deletes; anything left waits for
+  the next such command. Local-only commands never touch the network.
 
 ### 1. Connecting storage
 
 ```sh
-# Register a connection (credentials are stored with the connection config,
-# or entered interactively when omitted).
-rstore connection add bucket_name \
-  --endpoint http://localhost:9000 \
-  --public-base https://public.example.com \
-  --cdn-base https://cdn.example.com \
-  --region auto \
-  --access-key AK... --secret-key SK...
+# Register, test, and pick buckets in one step. On a terminal, omitted keys
+# are prompted with hidden input and the visible buckets are offered as a
+# numbered list.
+rstore conn add nas --endpoint http://localhost:9000 --provider minio
 
-# Three-step check: stored credentials, authentication, ListBuckets.
-rstore connection test bucket_name
+# Non-interactive: pass everything, including which buckets to register.
+rstore conn add r2 --endpoint https://<account>.r2.cloudflarestorage.com \
+  --provider r2 --access-key AK --secret-key SK --buckets all
+rstore conn add supa --endpoint https://<ref>.storage.supabase.co/storage/v1/s3 \
+  --provider supabase --access-key AK --secret-key SK --buckets media,avatars
 
-# Common variants.
-rstore connection list --filter prod          # fuzzy match on name/endpoint
-rstore connection show bucket_name            # secrets shown masked
-rstore connection show bucket_name --capabilities  # probe list/multipart/copy/presign
-rstore connection edit bucket_name --region us-east-1
-rstore connection remove bucket_name --yes    # removes only the registration
+# Everything else.
+rstore conn list prod                      # substring filter on name/endpoint
+rstore conn show nas                       # secrets shown masked
+rstore conn show nas --capabilities        # probe list/multipart/copy/presign
+rstore conn test nas --write               # adds a write probe
+rstore conn edit nas --region us-east-1
+rstore conn remove nas -y                  # removes only the registration
 ```
 
-**Endpoint details**
+**Provider presets** fill the addressing style: `minio` and `supabase` use
+path-style requests, `aws`, `r2`, and `generic` let the SDK decide.
+`--addressing-style auto|path|virtual-host` overrides the preset. If the
+connection test passes but bucket operations return 404, check this first.
 
-- A trailing `/` on path-style endpoints (e.g. Supabase's
-  `https://<ref>.storage.supabase.co/storage/v1/s3`) is normalized, but write
-  the full URL anyway.
-- `--addressing-style` controls where the bucket name sits in request URLs:
-  - `auto` — let the SDK/service decide;
-  - `path` — `https://endpoint/bucket/key`; gateways like Supabase usually
-    require this;
-  - `virtual-host` — `https://bucket.endpoint/key`; requires DNS and a TLS
-    certificate covering the bucket subdomain.
-  If connection tests pass but bucket operations return 404, check this
-  first.
-- Managed clouds are fine on the default `auto`.
+**The test** lists buckets with the stored keys. `endpoint/auth` passes only
+when the endpoint answered and accepted the credentials (a refused listing
+still counts as authenticated); an unreachable endpoint or rejected keys fail
+it.
+
+**After the test**, `conn add` registers buckets: the `--buckets` list, every
+visible bucket for `--buckets all`, or your choice on a terminal. A failing
+test or a missing ListBuckets permission degrades to a warning — the
+connection stays registered; add buckets by name later. `--no-test` skips
+the test and the interactive choice.
 
 **Credential storage**
 
-- `--access-key/--secret-key` are written directly into the connection row of
-  the local SQLite catalog.
-- Interactive terminals prompt with hidden input when both flags are omitted;
+- Keys are written into the connection row of the local SQLite catalog.
+- Terminals prompt with hidden input when both key flags are omitted;
   non-interactive runs and `--json` never prompt.
-- `connection show` masks everything but the first and last characters.
+- `conn show` masks everything but the first and last characters.
   Plaintext credentials never enter exports, JSON output, or logs.
-- Registering without credentials is allowed; tests and remote operations
-  then report the missing credentials explicitly.
 
 ### 2. Registering buckets
 
-Only explicitly registered buckets can be operated on — protection against
-pointing at the wrong bucket:
+Only registered buckets can be operated on — protection against pointing at
+the wrong bucket. Registered buckets join the current workspace.
 
 ```sh
-# Discovery lists what the credentials can see.
-rstore bucket discover bucket_name
+rstore bucket list --remote                # what the credentials can see
+rstore bucket list --remote nas            # one connection only
 
-# Registration probes readability; a failed probe warns but does not block.
-rstore bucket add bucket_name media
+rstore bucket add media photos             # connection optional while only one exists
+rstore bucket add nas/archive --read-only  # refuse writes
+rstore bucket add tmp --no-delete --no-index --conflict skip
 
-# Local policy at registration time.
-rstore bucket add bucket_name archive --read-only            # refuse writes
-rstore bucket add bucket_name trash --allow-delete=false     # forbid deletes
-rstore bucket add bucket_name tmp --index-enabled=false      # skip indexing
-rstore bucket add bucket_name cold --conflict skip           # default policy
-
-# Inspect and adjust.
-rstore bucket list
-rstore bucket show bucket_name/media
-rstore bucket edit bucket_name/media --read-only=false
-rstore bucket edit bucket_name/media --concurrency 8   # 0 clears the override
-rstore bucket remove bucket_name/media --yes           # removes only the registration
-```
-
-**Ignore rules** skip directories during indexing:
-
-```sh
-rstore bucket ignore add bucket_name/media .trash
-rstore bucket ignore list bucket_name/media
-rstore bucket ignore remove bucket_name/media .trash
+rstore bucket list                         # registered buckets
+rstore bucket show media                   # settings, link profile, ignore rules
+rstore bucket edit media --read-only=false --concurrency 8   # 0 clears the override
+rstore bucket edit media --ignore .trash --ignore cache/     # skip when indexing
+rstore bucket edit media --unignore cache/
+rstore bucket remove tmp archive -y        # removes only the registrations
 ```
 
 ### 3. Working against the live remote
 
 ```sh
-rstore remote ls media/                          # paginated listing
-rstore remote ls media/img/ --limit 100
-rstore remote ls media/ --cursor <token>         # next page
-rstore remote ls media/ --update-catalog         # feed rows into the catalog
+rstore ls                                  # registered buckets, as browse roots
+rstore ls media/                           # paginated listing
+rstore ls media/img/ --limit 100
+rstore ls media/ --cursor <token>          # next page
+rstore ls media/ --catalog                 # also record the rows in the catalog
 
-rstore remote stat media/img/logo.png
+rstore stat media/img/logo.png             # live metadata
 ```
 
-### 4. Upload and download
+### 4. Copy, move, delete
+
+`cp` covers uploads, downloads, and remote copies. The direction comes from
+the arguments:
+
+- `./…`, `../…`, `~/…` and absolute paths are always local;
+- otherwise an argument is remote when its first segment names a registered
+  bucket or connection, and local when it names neither;
+- if the first segment is registered **and** exists as a local path, the
+  command stops and asks you to write `./…` (or qualify the remote with its
+  connection) instead of guessing.
 
 ```sh
-# Upload: target is <bucket>/[prefix/]; the file name lands under the prefix.
-rstore upload ./report.pdf media/docs/
-rstore upload ./report.pdf media/                # bucket root
-rstore upload ./src media/backup/ -r             # recursive, keeps structure
-rstore upload a.txt b.txt media/                 # multiple sources
-rstore upload - media/ < files.txt               # batch: one local path per line
+rstore cp ./report.pdf media/docs/          # upload; trailing / keeps the name
+rstore cp ./src media/backup/ -r            # recursive, keeps structure
+rstore cp a.txt b.txt media/                # several sources
+rstore cp media/img/logo.png ./out.png      # download
+rstore cp media/img/ ./img-backup -r        # recursive mirror
+rstore cp media/a.txt backup/a.txt          # remote copy (server-side on one connection)
+rstore cp nas/media/ r2/media/ -r --keep-tags   # cross connection: bounded-memory relay
+printf '%s\n' media/a.txt media/b.txt | rstore cp - backup/
 
-# Connection-qualified form when bucket names are ambiguous.
-rstore upload ./report.pdf bucket_name/media/docs/
+rstore mv media/old.bin media/archive/      # remote → remote only
+rstore mv media/old/ media/arc/ -r --keep-tags
 
-# Download: same source rules, local directory or file target.
-rstore download media/img/logo.png ./out.png
-rstore download media/img/ ./img-backup -r       # recursive mirror
-rstore download - ./downloads < refs.txt
-
-# Conflict policies (upload/download/cp/mv).
---conflict skip        # keep the existing object
---conflict overwrite   # replace it
---conflict rename      # derive name-<random8>.ext
---conflict ask         # interactive resolution
-# Omitted: uploads/cp/mv use the target bucket's stored default; anything
-# unresolved (including downloads writing to disk) behaves as ask.
---yes                  # resolves ask as overwrite non-interactively
-
---dry-run              # per-item preview, nothing transferred
---no-progress          # silence the stderr progress reporting
+rstore rm media/tmp/junk.bin
+rstore rm media/tmp/ -r -y                  # confirmation shows the exact count
+rstore rm media/tmp/ -r -n                  # dry run
 ```
+
+**Conflicts** (`cp`/`mv`): `-f` overwrites; `--conflict skip|overwrite|
+rename|ask` picks a policy. Omitted, uploads and remote copies use the target
+bucket's default; anything still `ask` prompts on a terminal and fails
+non-interactively. `-n/--dry-run` previews per item; `--no-progress`
+silences the stderr progress line.
 
 Large files switch to multipart automatically and resume from checkpoints.
 Ctrl+C is safe at any point: progress persists as an interrupted job, and
 re-running the same command resumes.
 
-### 5. Copy, move, delete
-
-```sh
-# Same connection: server-side copy. Cross connection: bounded-memory relay.
-rstore cp media/a.txt backup/a.txt
-rstore cp media/a.txt backup/dir/       # directory-style target keeps the name
-rstore mv media/old.bin media/archive/
-
-rstore cp media/docs/ backup/docs/ -r
-rstore mv media/old/ media/arc/ -r --keep-tags   # associations travel along
-
-printf '%s\n' media/a.txt media/b.txt | rstore cp - backup/
-
-# Delete: confirmation shows the exact precomputed count; removals persist
-# tombstones into the catalog, and rm itself is an interruptible job.
-rstore rm media/tmp/junk.bin
-rstore rm media/tmp/ -r --yes
-rstore rm media/tmp/ -r --dry-run
-```
-
 `mv` safety order: copy → verify target size → delete source. A failed
-verification leaves the source untouched.
+verification leaves the source untouched. `rm` persists tombstones into the
+catalog and is itself an interruptible job.
 
-### 6. Indexing and the local catalog
+### 5. Indexing the catalog
 
-Indexing scans buckets into the SQLite catalog; it feeds `files` and `tag`:
-
-```sh
-rstore index start bucket_name/media     # note: a bucket reference
-rstore index status                      # per-bucket progress/checkpoints
-rstore index pause bucket_name/media     # mark paused (Ctrl+C stops a live scan)
-rstore index resume bucket_name/media    # continue from the checkpoint
-rstore index cancel bucket_name/media    # stop; completed data stays
-
-rstore index refresh bucket_name/media   # reconcile: remote-gone rows go stale
-rstore index rebuild bucket_name/media --yes  # rescan (tag definitions survive)
-rstore index stats                       # catalog size overview
-rstore catalog gc --dry-run              # preview tombstone purge (30-day default)
-```
-
-Indexing is bucket-scoped; workspaces only scope retrieval (next section).
-Without a workspace you can still feed the catalog via
-`remote ls --update-catalog`, but `files`/`tags` need one.
-
-### 7. Workspaces: scoping retrieval
-
-A workspace is a named view over a set of member buckets; `files` and `tag`
-are workspace-scoped:
+Indexing scans buckets into the SQLite catalog that `find` and `tag` read.
 
 ```sh
-rstore workspace create proj-a --description "Project A assets"
-rstore workspace bucket add proj-a bucket_name/media
-rstore workspace bucket add proj-a bucket_name/backup
-rstore workspace bucket list proj-a
+rstore index run                           # index-enabled buckets of the workspace
+rstore index run media photos              # just these
+rstore index run --all                     # every index-enabled bucket
+rstore index run media --refresh           # rescan; rows gone remotely turn stale
+rstore index run media --rebuild -y        # drop rows and rescan (tags survive)
 
-rstore workspace list
-rstore workspace show proj-a
-rstore workspace remove proj-a --yes    # buckets and remote data untouched
+rstore index status                        # catalog totals + per-bucket state
+rstore index cancel media                  # drop a paused scan's checkpoint
+rstore index gc -n                         # preview tombstone purge (30-day default)
+rstore index gc --retention 7d -y
 ```
 
-### 8. Search and tags
+Ctrl+C pauses the running scan at a checkpoint and skips the remaining
+buckets; `index run` resumes from there. Without a workspace you can still
+feed the catalog through `ls --catalog`.
+
+### 6. Workspaces
+
+A workspace is a named view over a set of member buckets; `find` and `tag`
+are scoped to it, so the same tag name in two projects never collides.
 
 ```sh
-# Mixed listing across member buckets: SQL-level filters + cursor paging.
-rstore files list proj-a
-rstore files list proj-a --bucket bucket_name/media --path docs/
-rstore files list proj-a --sort size:desc --limit 100
-rstore files list proj-a --after <cursor>
-rstore files list proj-a --untagged
-
-rstore files search proj-a logo          # trigram name search
-
-rstore files show media/img/logo.png --workspace proj-a
-
-rstore tag create proj-a important --color ff0000
-rstore tag add proj-a media/img/logo.png --tag important
-rstore tag add proj-a - --tag draft < uris.txt        # batch
-rstore tag add proj-a <uri> --tag a --tag b --replace # replace the whole set
-rstore tag detach proj-a <uri> --tag draft            # omit --tag to clear all
-rstore tag list proj-a                                # includes object counts
-rstore tag merge proj-a old-name new-name --yes       # source tag disappears
-rstore tag remove proj-a draft --yes
+rstore ws list                             # `*` marks the current workspace
+rstore ws create proj-a --description "Project A assets"
+rstore ws use proj-a                       # make it current
+rstore ws add media nas/backup             # membership of the current workspace
+rstore ws remove nas/backup
+rstore ws show                             # buckets and object count
+rstore ws show -w default                  # any other workspace, once
+rstore ws edit --name proj-alpha
+rstore ws delete proj-alpha -y             # buckets and remote data untouched
 ```
 
-Tags are workspace-scoped: the same tag name in two projects never collides.
+### 7. Search and tags
 
-### 9. Link generation
+```sh
+rstore find                                # everything, newest first
+rstore find logo                           # name contains "logo"
+rstore find -b media --path docs/ --sort size:desc --limit 100
+rstore find --type image --ext png
+rstore find -t brand,final                 # carries every tag
+rstore find -t brand -t draft --any-tag    # carries either
+rstore find --untagged
+rstore find --after <cursor>               # next page
+
+rstore stat media/img/logo.png --offline   # catalog entry with tags, no network
+
+rstore tag add media/img/logo.png -t brand,final   # unknown tags are created on first use
+rstore tag add - -t draft < uris.txt               # batch
+rstore tag add <ref> -t a,b --replace              # replace the whole set
+rstore tag remove <ref> -t draft                   # omit -t to clear all
+rstore tag list                                    # with object counts
+rstore tag edit brand --color ff0000 --description "Brand assets"
+rstore tag merge old-name new-name -y              # source tag is deleted
+rstore tag delete draft -y
+```
+
+A tag created by `tag add` is reported as a warning, so a mistyped name is
+noticed. Creation waits until an object resolves: a batch that tags nothing
+creates nothing.
+
+### 8. Link generation
 
 ```sh
 rstore url media/img/logo.png                    # public URL from bucket config
 rstore url media/img/logo.png --format markdown
-rstore url <uri> --format s3                     # s3://bucket/key
-rstore url <uri> --format path                   # bucket-relative path
-rstore url <uri> --format html --json            # batch, machine-readable
+rstore url <ref> --format s3                     # s3://bucket/key
+rstore url <ref> --format path                   # bucket-relative path
+rstore url <ref> --format html --json            # batch, machine-readable
 rstore url - --format json < uris.txt            # stdin batch (# = comment)
 
-# Presigned URLs (time-limited, up to 7 days).
-rstore url media/report.pdf --signed --ttl 1h
+rstore url media/report.pdf --ttl 1h             # presigned (--ttl implies --signed)
 rstore url media/report.pdf --signed             # bucket default TTL
 ```
 
-Each URI succeeds or fails independently — one bad reference does not affect
-the rest (human output stays one pipeable link per line; per-item errors go
-to stderr). Any failure exits 13.
+Each reference succeeds or fails independently (human output stays one
+pipeable link per line; per-item errors go to stderr). Any failure exits 13.
 
 **Link configuration**: connections store public/CDN base defaults and each
 bucket may override them; permissions and the default TTL belong to the
-bucket. `bucket show` displays the effective value and marks values inherited
-from the connection:
+bucket. `bucket show` displays the effective values and marks values
+inherited from the connection:
 
 ```sh
-rstore connection edit supabase \
+rstore conn edit supa \
   --public-base https://<ref>.supabase.co/storage/v1/object/public \
   --cdn-base https://assets.example.com
-rstore bucket link show bucket_name/media
-rstore bucket link set bucket_name/media \
+rstore bucket edit media \
   --public-base https://public.example.com/media \
   --cdn-base https://cdn.example.com/media \
-  --allow-presigned --default-ttl 15m
-# The same five flags also work after `bucket edit`.
+  --presigned --public-url=false --default-ttl 15m
 ```
 
 Effective public base precedence: bucket CDN override → connection CDN
 default → bucket public override → connection public default → connection
-endpoint. rstore never guesses provider-specific URL shapes; Supabase, for
-example, needs its public base configured explicitly. Passing an empty string
-to `--public-base`/`--cdn-base` clears the override. Presigning requires
-bucket and adapter support and reports `capability_unsupported` otherwise.
+endpoint. rstore never guesses provider-specific URL shapes. An empty
+`--public-base`/`--cdn-base` clears the override. Presigning requires bucket
+and adapter support and reports `capability_unsupported` otherwise.
 
-### 10. Task management
+### 9. Jobs
 
-Every upload/download/cp/mv/rm is a persisted job:
+Every `cp`/`mv`/`rm` is a persisted job:
 
 ```sh
 rstore task list                 # newest first; repair counts when present
-rstore task show 1               # newest job, or a job_… id
-rstore task show 1 --errors      # include failure details
-rstore task retry 1              # re-arm a failed/partial job
-rstore task cancel 3
-rstore task pause 2 / rstore task resume 2
+rstore task show                 # the newest job
+rstore task show 3 --errors      # by ordinal or job_… id, with failure details
+rstore task cancel 3             # retire an unfinished job
 ```
 
-To actually resume work, re-issue the original command — transfers continue
-from checkpoints. Pausing a live transfer inside another rstore process is
-not supported yet (the process lock serializes runtimes).
+To resume, re-issue the original command — transfers continue from their
+checkpoints. One rstore process runs per data directory, so a job cannot be
+paused from another terminal; stop it with Ctrl+C.
 
-### 11. Diagnostics, configuration, migration
+### 10. Diagnostics, configuration, migration
 
 ```sh
 rstore doctor          # adapter, connections (+untested), outbox/repairs, interrupts
@@ -318,74 +298,75 @@ rstore config show     # data/config/cache/log directories and db path
 # Machine migration/backup of the registry — never contains credentials.
 rstore config export > bundle.json
 rstore config export --out bundle.json
-rstore config import bundle.json --dry-run    # preview
+rstore config import bundle.json -n           # preview
 rstore config import bundle.json              # duplicates are skipped, never overwritten
 ```
 
 After migrating, re-enter credentials with
-`connection edit NAME --access-key … --secret-key …` — excluding secrets from
+`conn edit NAME --access-key … --secret-key …` — excluding secrets from
 bundles is deliberate.
 
-### 12. Scripting cheat sheet
+### 11. Scripting cheat sheet
 
 ```sh
 rstore ... --json | jq .data            # structured payload lives in data
-some-cmd | rstore rm -                  # stdin batch URIs (# starts a comment)
+some-cmd | rstore rm - -y               # stdin batch references (# starts a comment)
 some-cmd | rstore url - --format json
+rstore -w proj-a find --json            # pin the workspace instead of relying on `ws use`
+RSTORE_WORKSPACE=proj-a rstore tag list
 rstore ... --quiet                      # results only
-rstore ... 2>/dev/null                  # stdout results, drop diagnostics
-set -e; rstore upload ...               # any item failure exits 13
+set -e; rstore cp ./dist/ media/site/ -r -f   # any item failure exits 13
 ```
+
+Scripts should pass `-w` (or set `RSTORE_WORKSPACE`) and write local paths
+with `./`, so neither the current workspace nor a same-named local directory
+can change what a command does.
 
 ---
 
 ## Command reference
 
-Global options on every command: `--config <PATH>` (data root), `--log-level
-<LEVEL>` (default `warn`), `--json`, `-q/--quiet`.
+Global options on every command: `--config <PATH>` (data root),
+`--log-level <LEVEL>` (default `warn`), `--json`, `-q/--quiet`,
+`-w/--workspace <WS>` (env `RSTORE_WORKSPACE`), `-y/--yes`.
 
 | Command | Purpose | Key flags |
 |---|---|---|
-| `connection add <NAME>` | Register a connection | `--endpoint` `--public-base` `--cdn-base` `--region` `--addressing-style {auto,path,virtual-host}` `--access-key` `--secret-key` `--tls-verify` |
-| `connection list` | List connections | `--filter <substring>` (case-insensitive name/endpoint) |
-| `connection show <REF>` | Connection details | masked keys; `--capabilities` runs live probes |
-| `connection test <REF>` | Three-step test | `--write-test` adds a write probe |
-| `connection edit <REF>` | Edit mutable fields | `--name` `--endpoint` `--public-base` `--cdn-base` `--region` `--addressing-style` (plus re-entering keys) |
-| `connection remove <REF>` | Remove registration | `--yes`; deletes stored credentials too |
-| `bucket discover <CONN>` | List visible remote buckets | |
-| `bucket add <CONN> <NAME>` | Register a bucket | `--display-name` `--read-only` `--allow-delete` `--index-enabled` `--conflict` `--skip-verify` |
-| `bucket list` | Registered buckets | |
-| `bucket show <REF>` / `bucket edit <REF>` | View/adjust settings | edit accepts the registration flags plus `--concurrency` and the five link flags |
-| `bucket remove <REF>` | Remove registration | `--yes` |
-| `bucket link show/set <REF>` | Bucket link profile | `--public-base` `--cdn-base` `--allow-public-url` `--allow-presigned` `--default-ttl`; only given flags change |
-| `bucket ignore add/list/remove <REF> <DIR>` | Index ignore directories | |
-| `workspace create <NAME>` | Create a workspace | `--description` |
-| `workspace list/show/edit/remove` | Manage | remove requires `--yes` |
-| `workspace bucket add/remove/list <WS>` | Membership | |
-| `remote ls <URI>` | Live listing | short references; `--cursor` `--limit` `--update-catalog` |
-| `remote stat <URI>` | Object metadata | |
-| `index start <BUCKET>` | Scan into catalog | checkpointed; takes a **bucket reference** |
-| `index status/stats` | State and sizes | |
-| `index pause/resume/cancel <BUCKET>` | Scan control | |
-| `index refresh <BUCKET>` | Reconcile stale rows | |
-| `index rebuild <BUCKET>` | Full rescan | destructive confirmation; non-interactive requires `--yes` |
-| `files list <WS>` | Mixed listing | `--path` `--bucket` (repeatable) `--sort <field>:<dir>` `--limit` `--after` `--untagged` |
-| `files search <WS> <PATTERN>` | Name search | `--sort` `--limit` |
-| `files show <URI>` | Object detail | `--workspace` |
-| `tag create <WS> <NAME>` | Create a tag | `--color` `--description` |
-| `tag list/edit/remove` | Manage | remove requires `--yes` |
-| `tag merge <WS> <SRC> <DST>` | Merge tags | source removed, associations deduplicated; destructive confirmation, non-interactive requires `--yes` |
-| `tag add <WS> <URIS…/- >` | Attach tags | `--tag` (repeatable) `--replace`; `-` reads stdin |
-| `tag detach <WS> <URIS…/- >` | Detach tags | omitting `--tag` clears all |
-| `upload <SOURCES…> <TARGET>` | Upload | `-r` `--conflict` `--dry-run` `--yes` `--no-progress`; `-` reads stdin |
-| `download <SOURCES…> <TARGET>` | Download | multi-URI batches become per-URI subtasks |
-| `cp <SOURCES…/-> <TARGET>` | Copy | `-r` `--conflict` `--dry-run` `--yes` `--keep-tags` |
-| `mv <SOURCES…/-> <TARGET>` | Move | as cp; verifies target before deleting source |
-| `rm <URIS…/->` | Delete | `-r` `--dry-run` `--yes` |
-| `task list/show/pause/resume/retry/cancel` | Job management | show supports `--errors`; ordinals accepted |
-| `url <URIS…/->` | Links | per-item independence; `--format path/s3/url/markdown/html/json` `--signed` `--ttl` |
-| `catalog gc` | Purge tombstones | `--dry-run` `--retention 30m/1h/1d/2w/seconds` (max 365d); actual purge is destructive confirmation, non-interactive requires `--yes` |
-| `config show/export/import` | Local configuration | export `--out`; import `--dry-run` skips duplicates |
+| `ls [REF]` | Remote listing; registered buckets without `REF` | `--limit` `--cursor` `--catalog` |
+| `stat REF` | Object metadata | `--offline` reads the catalog (tags, staleness) |
+| `cp SRC… DST` | Upload, download, or remote copy, routed by the arguments | `-r` `-n` `-f` `--conflict` `--keep-tags` `--no-progress`; `-` reads stdin |
+| `mv SRC… DST` | Move between remote locations | as `cp`; verifies the target before deleting the source |
+| `rm REF…` | Delete remote objects | `-r` `-n`; `-` reads stdin |
+| `url REF…` | Links | `--format path/s3/url/markdown/html/json` `--signed` `--ttl` |
+| `find [PATTERN]` | Catalog search in the workspace | `-b` (repeatable) `--path` `-t` `--any-tag` `--untagged` `--type` `--ext` `--sort <field>:<dir>` `--limit` `--after` |
+| `tag add REF… -t TAG…` | Attach tags, creating missing ones | `--replace`; `-` reads stdin |
+| `tag remove REF…` | Detach tags | `-t` (omit to clear all) |
+| `tag list` / `tag edit TAG` | Tag definitions | edit: `--name` `--color` `--description` |
+| `tag delete TAG` | Delete a tag | destructive |
+| `tag merge SRC DST` | Merge tags | source deleted, associations deduplicated; destructive |
+| `connection add NAME` (`conn`) | Register, test, register buckets | `--endpoint` `--provider` `--region` `--addressing-style` `--public-base` `--cdn-base` `--tls-verify` `--access-key` `--secret-key` `--buckets all\|A,B` `--no-test` |
+| `connection list [FILTER]` | List connections | substring over name/endpoint |
+| `connection show CONN` | Details, masked keys | `--capabilities` runs live probes |
+| `connection test CONN` | Three-step test | `--write` adds a write probe; failure exits 13 |
+| `connection edit CONN` | Edit fields | as `add` (plus re-entering keys) |
+| `connection remove CONN` | Remove registration | destructive; deletes stored credentials too |
+| `bucket list [CONN]` | Registered buckets | `--remote` lists what the credentials can see |
+| `bucket add BUCKET…` | Register and join the workspace | `--read-only` `--no-delete` `--no-index` `--conflict` `--skip-verify` |
+| `bucket show BUCKET` | Settings, link profile, ignore rules | |
+| `bucket edit BUCKET` | Adjust settings | `--display-name` `--read-only[=B]` `--allow-delete[=B]` `--index[=B]` `--conflict` `--concurrency` `--public-base` `--cdn-base` `--public-url[=B]` `--presigned[=B]` `--default-ttl` `--ignore DIR` `--unignore DIR` |
+| `bucket remove BUCKET…` | Remove registrations | destructive |
+| `workspace list` (`ws`) | Workspaces, `*` = current | |
+| `workspace use WS` | Select the current workspace | |
+| `workspace create NAME` | Create; current when none is selected | `--description` |
+| `workspace show` / `edit` | The target workspace | edit: `--name` `--description` |
+| `workspace delete WS` | Delete a workspace | destructive |
+| `workspace add\|remove BUCKET…` | Membership | |
+| `index run [BUCKET…]` | Scan into the catalog | `--all` `--refresh` `--rebuild` (destructive) |
+| `index status` | Totals and per-bucket state | |
+| `index cancel BUCKET` | Drop a paused scan's checkpoint | |
+| `index gc` | Purge tombstones | `-n` `--retention 30m/1h/1d/2w/seconds` (max 365d); destructive |
+| `task list` / `task show [JOB]` / `task cancel JOB` | Jobs | show: `--errors`; ordinals accepted |
+| `config show\|export\|import` | Local configuration | export `--out`; import `-n` |
 | `doctor` | Health report | |
 | `version` | Version | |
 
@@ -395,18 +376,22 @@ Global options on every command: `--config <PATH>` (data root), `--log-level
 |---|---|
 | Catalog (connections, buckets, workspaces, tags, index, jobs) | `catalog.db` (SQLite, WAL) — see `rstore config show` |
 | Credentials | The connection table inside the catalog database |
+| Current workspace | The `workspace.current` setting inside the catalog database |
 | Logs | `<log dir>/` (daily rolling) |
 
 ### Troubleshooting
 
 - **Connection test passes, bucket operations 404** — verify the endpoint is
-  complete; gateways like Supabase need `--addressing-style path`.
+  complete; gateways like Supabase need path-style requests
+  (`--provider supabase` or `--addressing-style path`).
 - **`bucket add` warns "not readable" but registers** — the probe is
-  non-blocking; run `remote ls` for the real error or pass `--skip-verify`.
-- **Non-interactive delete/confirm errors** — destructive operations need
-  `--yes` (including `catalog gc`, `tag merge`, `index rebuild`); an `ask`
-  conflict policy needs `--yes` (resolved as overwrite) or a different
-  `--conflict`.
+  non-blocking; run `ls <bucket>/` for the real error or pass `--skip-verify`.
+- **"N workspaces exist and none is selected"** — run `rstore ws use
+  <name>` once, or pass `-w <name>`.
+- **"`…` is ambiguous"** — a local file or directory shares its name with a
+  registered bucket; write `./name` for the local path.
+- **Non-interactive confirm errors** — destructive operations need `-y`; an
+  unresolved `ask` conflict policy needs `-f` or `--conflict`.
 - **Self-signed certificates / `--tls-verify=false`** — the setting is
   stored but not yet applied to a custom verifier; system defaults still
   apply.

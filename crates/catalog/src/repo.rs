@@ -179,7 +179,7 @@ impl InMemoryCatalog {
     }
 
     /// Register a bucket as visible inside a workspace (the equivalent of
-    /// `workspace bucket add` on the SQL side).
+    /// `workspace add` on the SQL side).
     pub fn add_bucket(&self, workspace: WorkspaceId, bucket: BucketId) {
         self.members
             .lock()

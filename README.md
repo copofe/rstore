@@ -53,22 +53,24 @@ cp target/release/rstore ~/.local/bin/
 ## Quickstart
 
 ```sh
-# Register a connection (credentials are stored in the local SQLite catalog).
+# One step: register the connection, test it, register its buckets (they
+# join the `default` workspace, created on first use).
 export RSTORE_HOME=/tmp/rstore-demo   # optional: portable data root
-rstore connection add prod \
-  --endpoint http://localhost:9000 --access-key AK --secret-key SK
+rstore conn add prod --endpoint http://localhost:9000 --provider minio \
+  --access-key AK --secret-key SK --buckets all
 
-# Verify connectivity, register a bucket, index it.
-rstore connection test prod --write-test
-rstore bucket add prod media
-rstore index start media
+# Index the workspace's buckets into the local catalog.
+rstore index run
 
-# Everyday work.
-rstore ls prod/media/docs/
-rstore upload ./report.pdf prod/media/reports/
-rstore cp prod/media/reports/report.pdf backup/archive/ --recursive
-rstore rm prod/media/tmp/ --recursive --yes
-rstore url prod/media/reports/report.pdf --signed --ttl 1h
+# Everyday work. `cp` uploads, downloads, or copies remotely depending on
+# which side is local (`./…`) and which names a registered bucket.
+rstore ls media/docs/
+rstore cp ./report.pdf media/reports/
+rstore cp media/reports/report.pdf backup/archive/
+rstore rm media/tmp/ -r -y
+rstore url media/reports/report.pdf --ttl 1h
+rstore tag add media/reports/report.pdf -t q3,final
+rstore find report -t final
 ```
 
 Scripts and CI must pass `--access-key`/`--secret-key` explicitly: with
@@ -125,8 +127,9 @@ rules, and data-flow constraints.
 
 - Applying the stored `--tls-verify=false` setting to a custom S3 TLS
   verifier (the flag is persisted; the adapter still uses the system default).
-- A *resident* outbox consumer loop (startup drain via `dispatch_once` and the
-  remote-verify projection exist; only a long-lived host process is missing).
+- A *resident* outbox consumer loop (the budgeted drain before remote-facing
+  commands and the remote-verify projection exist; only a long-lived host
+  process is missing).
 - GPUI desktop pages; the desktop composition contract is present and
   exercised.
 

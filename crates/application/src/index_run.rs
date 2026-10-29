@@ -13,11 +13,11 @@ use rstore_domain::{Clock, Result};
 
 use super::IndexReport;
 
-/// What a run starts from.
+/// What an index run starts from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RunMode {
+pub enum IndexMode {
     /// Resume from the bucket's saved checkpoint, if any.
-    Start,
+    Resume,
     /// Fresh scan from the bucket root; stale rows are marked afterwards.
     Refresh,
     /// Fresh scan after marking every existing row stale; unreached rows
@@ -84,20 +84,20 @@ impl IndexRunLifecycle {
     /// existing catalog rows in the bucket stale before scanning.
     pub(crate) async fn prepare(
         &mut self,
-        mode: RunMode,
+        mode: IndexMode,
         catalog: &dyn RemoteObjectRepository,
     ) -> Result<Option<String>> {
         match mode {
-            RunMode::Start => self
+            IndexMode::Resume => self
                 .runs
                 .checkpoint(self.bucket_id)
                 .await
                 .map(|checkpoint| checkpoint.and_then(|value| value.continuation_token)),
-            RunMode::Refresh => {
+            IndexMode::Refresh => {
                 self.runs.clear_checkpoint(self.bucket_id).await?;
                 Ok(None)
             }
-            RunMode::Rebuild => {
+            IndexMode::Rebuild => {
                 // Every row that exists when a rebuild begins was confirmed
                 // before it started — the refresh spelling with the run's
                 // own start marks exactly those.
@@ -154,18 +154,18 @@ impl IndexRunLifecycle {
     /// belong to the resuming run.
     pub(crate) async fn reconcile(
         &mut self,
-        mode: RunMode,
+        mode: IndexMode,
         completion: ScanCompletion,
         catalog: &dyn RemoteObjectRepository,
     ) -> Result<()> {
-        if mode == RunMode::Refresh && completion == ScanCompletion::Complete {
+        if mode == IndexMode::Refresh && completion == ScanCompletion::Complete {
             // Rows not seen by this scan were last confirmed before it
             // started, i.e. they may have vanished remotely.
             self.report.objects_stale = catalog
                 .mark_stale_older_than(self.bucket_id, self.run.started_at)
                 .await?;
         }
-        if mode == RunMode::Rebuild && completion == ScanCompletion::Complete {
+        if mode == IndexMode::Rebuild && completion == ScanCompletion::Complete {
             self.report.objects_pruned = catalog.delete_stale_in_bucket(self.bucket_id).await?;
         }
         Ok(())

@@ -4,19 +4,24 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use rstore_application_ports::{IgnoreRuleStore, IndexRunStore, RuntimeStats, SettingsStore};
+use rstore_application_ports::{
+    IgnoreRuleStore, IndexRunStore, RuntimeStats, SettingsStore, WorkspaceStore,
+};
 use rstore_catalog::RemoteObjectRepository;
 use rstore_domain::bucket::Bucket;
-use rstore_domain::id::{BucketId, IndexRunId};
+use rstore_domain::id::{BucketId, IndexRunId, WorkspaceId};
 use rstore_domain::workspace::{IgnoreRule, IndexRun, IndexRunState};
 use rstore_domain::{Clock, Error, Result};
 use rstore_storage_api::model::ListPage;
 use rstore_storage_api::Storage;
 use rstore_transfer::CancellationToken;
 
+use crate::batch_outcome::{BatchOutcome, ItemOutcome};
 use crate::bucket::{BucketRef, BucketService};
 use crate::expand::{scan_pages, PageSink};
-use crate::index_run::{IndexRunLifecycle, RunMode, ScanCompletion};
+use crate::index_run::{IndexRunLifecycle, ScanCompletion};
+
+pub use crate::index_run::IndexMode;
 use crate::locator::CatalogLocator;
 
 /// Outcome of one index run.
@@ -56,6 +61,17 @@ pub struct IndexStats {
     pub db_bytes: u64,
 }
 
+/// The buckets one index run covers.
+#[derive(Debug, Clone)]
+pub enum IndexScope {
+    /// Exactly these buckets; one with indexing disabled fails as its own item.
+    Buckets(Vec<BucketRef>),
+    /// The index-enabled members of a workspace.
+    Workspace(WorkspaceId),
+    /// Every index-enabled registered bucket.
+    All,
+}
+
 /// Per-bucket snapshot of index state for status output.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BucketIndexStatus {
@@ -68,24 +84,28 @@ pub struct BucketIndexStatus {
     pub ignore_rules: u64,
 }
 
-/// Catalog indexing operations: runs (`start`/`refresh`/`rebuild`),
-/// lifecycle control (`pause`/`cancel`), reporting, and GC.
+/// Catalog indexing operations: runs over a bucket scope, checkpoint
+/// cancellation, reporting, and GC.
 #[async_trait]
 pub trait IndexService: Send + Sync {
-    /// Scan the bucket into the catalog, resuming from any saved
-    /// checkpoint. Pauses cleanly when `cancel` fires, checkpointing
-    /// progress.
-    async fn start(&self, bucket: &BucketRef, cancel: &CancellationToken) -> Result<IndexReport>;
+    /// Scan every bucket in `scope` into the catalog, one after another, in
+    /// `mode`. Failures are per bucket; explicit bucket references resolve
+    /// before any scan starts, so a typo fails the whole call. When `cancel`
+    /// fires, the running scan checkpoints and reports `paused`, and the
+    /// remaining buckets are not started.
+    async fn run(
+        &self,
+        scope: &IndexScope,
+        mode: IndexMode,
+        cancel: &CancellationToken,
+    ) -> Result<BatchOutcome<IndexReport>>;
 
     /// Status of every registered bucket.
     async fn status(&self) -> Result<Vec<BucketIndexStatus>>;
 
-    /// Pause the bucket's running index without clearing its checkpoint.
-    /// Errors when no run is active.
-    async fn pause(&self, bucket: &BucketRef) -> Result<IndexRun>;
-
-    /// Cancel the bucket's active (running or paused) index and clear its
-    /// checkpoint. Errors when no run is active.
+    /// Discard the bucket's active (running or paused) index and clear its
+    /// checkpoint; rows already published stay. Errors when no run is
+    /// active.
     async fn cancel(&self, bucket: &BucketRef) -> Result<IndexRun>;
 
     /// Purge expired tombstones older than the retention window (setting
@@ -95,14 +115,6 @@ pub trait IndexService: Send + Sync {
 
     /// Aggregate catalog statistics.
     async fn stats(&self) -> Result<IndexStats>;
-
-    /// Fresh full scan from the bucket root; rows not reconfirmed by the
-    /// completed scan are marked stale.
-    async fn refresh(&self, bucket: &BucketRef, cancel: &CancellationToken) -> Result<IndexReport>;
-
-    /// Fresh full scan after marking every existing row stale; rows not
-    /// reconfirmed by the completed scan are deleted.
-    async fn rebuild(&self, bucket: &BucketRef, cancel: &CancellationToken) -> Result<IndexReport>;
 }
 
 /// Production [`IndexService`] over the locator, catalog repository,
@@ -110,6 +122,7 @@ pub trait IndexService: Send + Sync {
 pub struct DefaultIndexService {
     locator: CatalogLocator,
     buckets: Arc<dyn BucketService>,
+    workspaces: Arc<dyn WorkspaceStore>,
     catalog: Arc<dyn RemoteObjectRepository>,
     ignores: Arc<dyn IgnoreRuleStore>,
     runs: Arc<dyn IndexRunStore>,
@@ -124,6 +137,7 @@ impl DefaultIndexService {
     pub fn new(
         locator: CatalogLocator,
         buckets: Arc<dyn BucketService>,
+        workspaces: Arc<dyn WorkspaceStore>,
         catalog: Arc<dyn RemoteObjectRepository>,
         ignores: Arc<dyn IgnoreRuleStore>,
         runs: Arc<dyn IndexRunStore>,
@@ -134,6 +148,7 @@ impl DefaultIndexService {
         Self {
             locator,
             buckets,
+            workspaces,
             catalog,
             ignores,
             runs,
@@ -159,6 +174,36 @@ impl DefaultIndexService {
 
     async fn resolve_bucket(&self, bucket: &BucketRef) -> Result<Bucket> {
         self.buckets.resolve(bucket).await
+    }
+
+    /// The buckets `scope` covers, in registry order.
+    async fn scope_buckets(&self, scope: &IndexScope) -> Result<Vec<Bucket>> {
+        match scope {
+            IndexScope::Buckets(references) => {
+                let mut buckets = Vec::with_capacity(references.len());
+                for reference in references {
+                    buckets.push(self.resolve_bucket(reference).await?);
+                }
+                Ok(buckets)
+            }
+            IndexScope::Workspace(workspace) => {
+                let members = self.workspaces.buckets(*workspace).await?;
+                Ok(self
+                    .buckets
+                    .list()
+                    .await?
+                    .into_iter()
+                    .filter(|b| b.config.index_enabled && members.contains(&b.id))
+                    .collect())
+            }
+            IndexScope::All => Ok(self
+                .buckets
+                .list()
+                .await?
+                .into_iter()
+                .filter(|b| b.config.index_enabled)
+                .collect()),
+        }
     }
 
     /// Move the bucket's run in one of `active_states` to `target`,
@@ -240,11 +285,11 @@ impl DefaultIndexService {
     /// Execute one run end-to-end in `mode`; on any failure the run is
     /// persisted as failed before the error propagates (a persistence
     /// failure while doing so is logged, never masks the original error).
-    async fn run(
+    async fn run_one(
         &self,
         bucket: &BucketRef,
         cancel: &CancellationToken,
-        mode: RunMode,
+        mode: IndexMode,
     ) -> Result<IndexReport> {
         let (bucket, storage, mut lifecycle) = self.begin(bucket, true).await?;
         let result = async {
@@ -284,8 +329,8 @@ impl DefaultIndexService {
         let b = self.resolve_bucket(bucket).await?;
         if require_enabled && !b.config.index_enabled {
             return Err(Error::invalid_input(format!(
-                "bucket `{}` has indexing disabled (BKT-009)",
-                b.name
+                "bucket `{}` has indexing disabled; enable it with `bucket edit {} --index`",
+                b.name, b.name
             )));
         }
         let (_, storage) = self.locator.resolve_bucket_target(&b).await?;
@@ -380,8 +425,27 @@ impl IndexService for DefaultIndexService {
         })
     }
 
-    async fn start(&self, bucket: &BucketRef, cancel: &CancellationToken) -> Result<IndexReport> {
-        self.run(bucket, cancel, RunMode::Start).await
+    async fn run(
+        &self,
+        scope: &IndexScope,
+        mode: IndexMode,
+        cancel: &CancellationToken,
+    ) -> Result<BatchOutcome<IndexReport>> {
+        let buckets = self.scope_buckets(scope).await?;
+        let mut items = Vec::with_capacity(buckets.len());
+        for bucket in buckets {
+            if cancel.check().is_err() {
+                break;
+            }
+            let label = self.locator.bucket_label(&bucket).await;
+            items.push(
+                match self.run_one(&BucketRef::Id(bucket.id), cancel, mode).await {
+                    Ok(report) => ItemOutcome::succeeded(label, report),
+                    Err(error) => ItemOutcome::failed(label, &error),
+                },
+            );
+        }
+        Ok(BatchOutcome::new(items))
     }
 
     async fn status(&self) -> Result<Vec<BucketIndexStatus>> {
@@ -407,19 +471,6 @@ impl IndexService for DefaultIndexService {
         Ok(out)
     }
 
-    async fn pause(&self, bucket: &BucketRef) -> Result<IndexRun> {
-        let b = self.resolve_bucket(bucket).await?;
-        self.transition_active(
-            b.id,
-            &[IndexRunState::Running],
-            IndexRunState::Paused,
-            false,
-            false,
-            "no running index for this bucket",
-        )
-        .await
-    }
-
     async fn cancel(&self, bucket: &BucketRef) -> Result<IndexRun> {
         let b = self.resolve_bucket(bucket).await?;
         self.transition_active(
@@ -431,13 +482,5 @@ impl IndexService for DefaultIndexService {
             "no active index for this bucket",
         )
         .await
-    }
-
-    async fn refresh(&self, bucket: &BucketRef, cancel: &CancellationToken) -> Result<IndexReport> {
-        self.run(bucket, cancel, RunMode::Refresh).await
-    }
-
-    async fn rebuild(&self, bucket: &BucketRef, cancel: &CancellationToken) -> Result<IndexReport> {
-        self.run(bucket, cancel, RunMode::Rebuild).await
     }
 }

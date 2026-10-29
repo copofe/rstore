@@ -15,7 +15,7 @@ terms map to crates. Entries are grouped by concern.
   turns an opened `Database` (which carries the injected clock) plus an
   optional storage factory into the application dependency graph; the group
   structs and port aliases live in `rstore_application_ports::deps`.
-  Bootstrap and the application test fixture both go through it — neither
+  Bootstrap goes through it, as must any test fixture — nothing
   re-transcribes the dependency list.
 - **Write gate** — `rstore_persistence::tx::WriteGate`. The write pool and
   the bounded writer actor as an inseparable pair, handed out only by
@@ -29,8 +29,16 @@ terms map to crates. Entries are grouped by concern.
   the database (with the configured clock) → run migrations →
   `Application::initialize` (startup recovery: orphaned non-terminal jobs are
   marked interrupted, outbox events stuck mid-processing return to the due
-  queue) → drain the due outbox through the wired remote-verify consumer. The
-  returned `Runtime` holds the lock guard for the process lifetime.
+  queue). The returned `Runtime` holds the lock guard for the process
+  lifetime.
+- **Outbox drain (`Runtime::drain_outbox(budget)`)** — the budgeted delivery
+  of due outbox facts to the remote-verify consumer, scheduled by the entry
+  point after `open_locked`: the CLI before commands that reach the remote
+  anyway (`Command::reaches_remote`, 2-second budget), the desktop at
+  startup. A handler still running at the deadline is abandoned as a failed
+  attempt (normal backoff); events claimed but never started are released
+  back to the due queue without spending an attempt
+  (`OutboxStore::release`, counted in `DispatchReport::deferred`).
 - **Construction vs recovery** — `Application::from_dependencies` only wires
   services and stays deterministic; `Application::initialize` applies startup
   recovery rules. Deliberately separate so tests can construct without
@@ -72,6 +80,21 @@ terms map to crates. Entries are grouped by concern.
   definition.
 - **Workspace** — a local grouping of buckets that scopes catalog rows,
   tags, and ignore rules.
+- **Current workspace** — the workspace selected in the `workspace.current`
+  setting. `WorkspaceService::target` resolves an omitted workspace
+  reference: explicit reference → current → the only workspace → error.
+  The first workspace created becomes current; enrolling a bucket while no
+  workspace exists creates and selects `default`.
+- **Onboarding** — `RegistryApi::onboarding()`: registering buckets as one
+  use case — add each bucket, then enroll it into the target workspace —
+  plus `unregistered`, the visible buckets not yet registered. `bucket add`
+  and `connection add` both go through it.
+- **Reference grammar (`References`)** — `RegistryApi::references()`: the
+  one expansion of `[<connection>/]<bucket>/[key]` into a `RemoteUri` bound
+  to the connection id, and `route`, which classifies transfer
+  arguments as local or remote (`./`, `../`, `~/`, absolute → local;
+  registered first segment → remote; registered *and* present locally →
+  ambiguous error) and yields upload, download, or copy.
 - **RemoteObject** — the local projection of one remote object in the
   catalog, including its tombstone lifecycle.
 - **Job** — the persisted intent and state machine of one batch run

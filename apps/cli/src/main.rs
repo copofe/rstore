@@ -2,7 +2,8 @@
 //!
 //! Thin binary: parse → init tracing → resolve dirs → (for DB commands) run
 //! the full startup sequence ([`rstore_bootstrap::Runtime::open_locked`]:
-//! create dirs, write lock, migrate, recover) → dispatch via [`rstore_cli`] →
+//! create dirs, write lock, migrate, recover) → for commands that reach the
+//! remote anyway, a budgeted outbox drain → dispatch via [`rstore_cli`] →
 //! render human/JSON and map to a stable exit code.
 //!
 //! Command identity and the version renderer come from the library (single
@@ -14,6 +15,10 @@ use rstore_cli::output::{envelope, error_envelope, exit_code_for};
 use rstore_cli::{parse_command_line, resolve_dirs, version_output, HandlerResult};
 use rstore_domain::{Clock, SystemClock};
 use time::OffsetDateTime;
+
+/// Longest a command waits on verifying earlier remote mutations before it
+/// runs; what is left waits for the next remote-facing command.
+const OUTBOX_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[tokio::main]
 async fn main() {
@@ -40,11 +45,18 @@ async fn main() {
             return;
         }
     };
+    // Verification of earlier mutations is housekeeping: a failure is logged
+    // and never blocks the command the user asked for.
+    if cli.command.reaches_remote() {
+        if let Err(error) = runtime.drain_outbox(OUTBOX_DRAIN_BUDGET).await {
+            tracing::warn!(%error, "outbox drain failed");
+        }
+    }
 
     // Ctrl+C: cancel the cooperative token; the running transfer persists its
     // checkpoints and reports state `interrupted`, which emit() turns into
     // exit 130.
-    let cancel = rstore_transfer::CancellationToken::new();
+    let cancel = rstore_cli::CancellationToken::new();
     {
         let cancel = cancel.clone();
         let quiet = cli.quiet;

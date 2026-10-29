@@ -65,13 +65,14 @@ impl Transport {
         }
     }
 
-    /// A bare 429/5xx status, or a timeout, is transient regardless of the
-    /// (missing) code: proxies and MinIO regularly fail without S3 error
-    /// bodies, so codeless transient responses are retried.
+    /// A bare 429/5xx status, a timeout, or no response at all (DNS/connect
+    /// failure) is transient regardless of the (missing) code: proxies and
+    /// MinIO regularly fail without S3 error bodies, and a refused or dropped
+    /// connection is the network failing, not the request being wrong.
     fn is_transient(self) -> bool {
         self.status()
             .is_some_and(|s| s == 429 || (500..=599).contains(&s))
-            || self == Transport::TimedOut
+            || matches!(self, Transport::TimedOut | Transport::NoResponse)
     }
 }
 

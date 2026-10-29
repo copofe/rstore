@@ -10,7 +10,45 @@ use serde_json::Value;
 use time::OffsetDateTime;
 
 use crate::contexts::BoundedContext;
+use crate::error::{Error, Result};
+use crate::id::EventId;
 use crate::locator::RemoteLocator;
+
+/// Kind of remote mutation a settled fact records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MutationOperation {
+    Upload,
+    Copy,
+    Delete,
+}
+
+impl MutationOperation {
+    /// Stable wire/persistence token for this operation kind.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Upload => "upload",
+            Self::Copy => "copy",
+            Self::Delete => "delete",
+        }
+    }
+
+    /// Decode a persisted token.
+    ///
+    /// # Errors
+    /// [`Error::database`] for an unknown token: a vocabulary miss in a stored
+    /// column is internal corruption, not user input.
+    pub fn parse(token: &str) -> Result<Self> {
+        match token {
+            "upload" => Ok(Self::Upload),
+            "copy" => Ok(Self::Copy),
+            "delete" => Ok(Self::Delete),
+            other => Err(Error::database(format!(
+                "unknown mutation operation `{other}`"
+            ))),
+        }
+    }
+}
 
 /// Version of the serialized domain-event payload contract.
 pub const DOMAIN_EVENT_SCHEMA_VERSION: u32 = 1;
@@ -30,7 +68,7 @@ pub enum DomainEvent {
     /// receipt is ready for projection/repair handling.
     RemoteMutationCompleted {
         locator: RemoteLocator,
-        operation: String,
+        operation: MutationOperation,
     },
 }
 
@@ -56,7 +94,7 @@ impl DomainEvent {
     /// from serializable values, so this is unreachable by construction.
     pub fn envelope(
         &self,
-        event_id: uuid::Uuid,
+        event_id: EventId,
         aggregate_version: u64,
         occurred_at: OffsetDateTime,
     ) -> EventEnvelope {
@@ -91,7 +129,7 @@ impl DomainEvent {
 /// metadata, but must preserve these fields and their ordering semantics.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventEnvelope {
-    pub event_id: uuid::Uuid,
+    pub event_id: EventId,
     pub context: BoundedContext,
     pub aggregate_type: String,
     pub aggregate_id: String,

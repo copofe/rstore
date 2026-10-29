@@ -97,7 +97,7 @@ sequenceDiagram
 ```
 
 Why the hand-off instead of letting the CLI library call bootstrap itself:
-handlers stay testable against any `ApplicationApi` (the test fixture composes
+handlers can be driven against any `ApplicationApi` (a test fixture can compose
 fakes without SQLite), neither reusable library transitively depends on
 infrastructure, and startup policy — database path, clock, storage factory,
 lock or no lock — remains owned by the binary, where desktop and CLI can
@@ -108,7 +108,7 @@ differ freely.
 | Crate | Owns | Must never do |
 | --- | --- | --- |
 | `domain` | Entities, value objects, typed IDs, error model, domain events, conflict decision table, clock abstraction | Depend on GPUI, an SDK, or SQLite; perform I/O; panic on external input |
-| `application` | Context APIs (`RegistryApi`, `CatalogApi`, …), use-case orchestration, gateway guard handles, job bookkeeping, mutation settlement | Depend on SQLx, an SDK, or GPUI in its normal dependency graph |
+| `application` | Context APIs (`RegistryApi`, `CatalogApi`, …), use-case orchestration, gateway guard handles, job bookkeeping, mutation settlement; every module is private and the surface is the crate-root re-exports | Depend on SQLx, an SDK, or GPUI in its normal dependency graph |
 | `application-ports` | Every local persistence port plus the dependency-group vocabulary in `deps.rs` | Expose SQLx types or transaction objects |
 | `catalog` | The SQLite-free query seam: filters, sort keys, keyset cursors, repository contracts | Contain SQL or know which database stores rows |
 | `transfer` | The streaming engine: multipart, resume, retry, cancellation, conflict probes at targets, remote-to-remote copy routing | Depend on persistence; own catalog or registry concerns |
@@ -116,7 +116,7 @@ differ freely.
 | `bootstrap` | The sole composition root: opens the database, selects adapters, maps lock errors | Implement business rules or render output |
 | `persistence` | SQLite schema/migrations, read pool, bounded writer actor, repositories | Depend on `transfer`; choose which adapter the app uses |
 | `storage-s3` | Map AWS SDK onto `storage-api`, classify provider errors | Leak SDK types upward |
-| `crates/cli`, `apps/*` | Parse input, build commands/queries, render envelopes, map exit codes; binaries own runtime/lock setup | Touch SQLite or an SDK in business paths |
+| `crates/cli`, `apps/*` | Parse input, build commands/queries, render envelopes, map exit codes; binaries own runtime/lock setup and when the outbox drains | Touch SQLite or an SDK in business paths; depend on the transfer engine (its run types are re-exported by `application`) |
 
 ## 2. Workspace layout
 
@@ -134,9 +134,7 @@ differ freely.
 │   ├── storage-s3/          # AWS SDK adapter
 │   ├── persistence/         # SQLite: migrations, actor, repositories
 │   ├── platform/            # app directories, cross-process lock
-│   ├── cli/                 # command tree, handlers, envelope, exit codes
-│   ├── test-support/        # FakeStorage, TempDb, contract suites
-│   └── application-test-support/
+│   └── cli/                 # command tree, handlers, envelope, exit codes
 ├── apps/
 │   ├── cli/                 # the rstore binary
 │   └── desktop/             # desktop composition contract (no GPUI pages yet)
@@ -145,8 +143,11 @@ differ freely.
 └── xtask/                   # build and packaging helpers
 ```
 
-Tests live beside the crate they cover in `crates/<crate>/tests/`; CLI output
-snapshots live in `crates/cli/tests/snapshots/`.
+Test code is owned by an independent verifier, not by the implementation side
+(see `AGENTS.md`); the tree currently carries none. When added, tests live
+beside the crate they cover in `crates/<crate>/tests/`, shared fakes and
+contract suites in a dedicated test-support crate, and CLI output snapshots in
+`crates/cli/tests/snapshots/`.
 
 ## 3. Conventions
 
@@ -194,9 +195,9 @@ Every change must be explainable along these lines; a reverse dependency
 requires updating this document first.
 
 1. **Normalize at the edge.** The CLI parses strings and paths; short remote
-   references are expanded once by `crates/application/src/reference.rs`
-   into canonical `<connection-id>/<bucket>/<key>` form and parsed into
-   `RemoteUri`. Inside the core, addresses are typed
+   references are expanded once by `References` (`reference.rs`) into a
+   `RemoteUri` bound to the connection id, and the application API takes
+   `RemoteUri`, never reference strings. Inside the core, addresses are typed
    (`RemoteLocator`) or validated (`ObjectPath`).
 2. **Entry points assemble and render.** Binaries initialize directories,
    tracing, and the runtime; business actions go through the application
@@ -221,7 +222,10 @@ requires updating this document first.
    because a blind overwrite is the one outcome the policy table must never
    produce.
 7. **Provider access crosses the storage port exactly once.**
-   Application/Transfer → `storage-api` → `storage-s3` → provider.
+   Application/Transfer → `storage-api` → `storage-s3` → provider. Retries
+   live in one layer: every adapter the gateway issues is wrapped in
+   `RetryingStorage`, which reads the transient signal from the adapter's
+   error classification; the S3 SDK's own retries are disabled.
 8. **Secrets stay sealed.** Credentials persist inside the connection row,
    live in memory as `Secret<T>`, never enter exports, generic JSON, logs,
    or error context, and render only as masked previews.
@@ -274,11 +278,16 @@ sequenceDiagram
 
 The outbox keeps `event_id` idempotency, per-aggregate version ordering, and
 attempt accounting; exhausted deliveries become repair rows in the same unit.
-Delivery happens through `OutboxDispatcher::dispatch_once`; bootstrap drains
-the backlog once per process start into `RemoteVerifyHandler`, which re-stats
-the settled object — presence acknowledges, absence becomes a repair row,
-transient provider faults stay queued. No resident task schedules dispatch
-between starts yet; that waits for a long-lived host process (desktop).
+Delivery happens through `OutboxDispatcher::dispatch_once`; the entry point
+calls `Runtime::drain_outbox(budget)` after taking the write lock — the CLI
+only before commands that reach the remote anyway, the desktop at startup —
+and the backlog goes to `RemoteVerifyHandler`, which re-stats the settled
+object: presence acknowledges, absence becomes a repair row, transient
+provider faults stay queued. The budget bounds the wait: a verification
+still running at the deadline counts as a failed attempt, and claimed events
+never started are released untouched. No
+resident task schedules dispatch between starts yet; that waits for a
+long-lived host process (desktop).
 
 ## 5. Related documents
 

@@ -7,12 +7,12 @@ use async_trait::async_trait;
 use rstore_application_ports::{
     OutboxEvent, OutboxStore, RemoteMutationReceipt, RepairItem, RepairKind, RepairStatus,
 };
-use rstore_domain::id::RepairId;
+use rstore_domain::id::{EventId, RepairId};
 use rstore_domain::{BoundedContext, Error, Result};
 use sqlx::sqlite::SqliteRow;
 use time::OffsetDateTime;
 
-use crate::codec::{unix_secs, RowReader};
+use crate::codec::{unix_secs, uuid_to_text, RowReader};
 use crate::error::map_sqlx;
 use crate::tx::WriteGate;
 
@@ -59,7 +59,7 @@ impl OutboxRepository {
         let mut stored = event.clone();
         if let Some(row) =
             sqlx::query("SELECT aggregate_version FROM outbox_events WHERE event_id = ?")
-                .bind(event.event_id.to_string())
+                .bind(uuid_to_text(&event.event_id))
                 .fetch_optional(&mut **tx)
                 .await
                 .map_err(map_sqlx)?
@@ -118,7 +118,7 @@ impl OutboxRepository {
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(event_id) DO NOTHING",
         )
-        .bind(event.event_id.to_string())
+        .bind(uuid_to_text(&event.event_id))
         .bind(event.context.as_str())
         .bind(&event.aggregate_type)
         .bind(&event.aggregate_id)
@@ -195,7 +195,7 @@ impl OutboxStore for OutboxRepository {
                             "UPDATE outbox_events SET status = 'processing', attempts = attempts + 1 \
                              WHERE event_id = ?",
                         )
-                        .bind(event.event_id.to_string())
+                        .bind(uuid_to_text(&event.event_id))
                         .execute(&mut **tx)
                         .await
                         .map_err(map_sqlx)?;
@@ -206,7 +206,7 @@ impl OutboxStore for OutboxRepository {
                              SELECT event_id, attempts, ?, 'claimed' FROM outbox_events WHERE event_id = ?",
                         )
                         .bind(unix_secs(now))
-                        .bind(event.event_id.to_string())
+                        .bind(uuid_to_text(&event.event_id))
                         .execute(&mut **tx)
                         .await
                         .map_err(map_sqlx)?;
@@ -233,14 +233,46 @@ impl OutboxStore for OutboxRepository {
         Ok(affected)
     }
 
-    async fn acknowledge(&self, event_id: uuid::Uuid, at: OffsetDateTime) -> Result<()> {
+    async fn release(&self, event_ids: &[EventId]) -> Result<()> {
+        let ids: Vec<String> = event_ids.iter().map(uuid_to_text).collect();
+        self.gate
+            .write_unit("outbox release", move |tx| {
+                Box::pin(async move {
+                    for id in &ids {
+                        // Drop the claim's attempt row first: its number is the
+                        // event's current count.
+                        sqlx::query(
+                            "DELETE FROM outbox_attempts WHERE event_id = ? AND outcome = 'claimed' \
+                             AND attempt_no = (SELECT attempts FROM outbox_events WHERE event_id = ?)",
+                        )
+                        .bind(id)
+                        .bind(id)
+                        .execute(&mut **tx)
+                        .await
+                        .map_err(map_sqlx)?;
+                        sqlx::query(
+                            "UPDATE outbox_events SET status = 'pending', attempts = attempts - 1 \
+                             WHERE event_id = ? AND status = 'processing'",
+                        )
+                        .bind(id)
+                        .execute(&mut **tx)
+                        .await
+                        .map_err(map_sqlx)?;
+                    }
+                    Ok(())
+                })
+            })
+            .await
+    }
+
+    async fn acknowledge(&self, event_id: EventId, at: OffsetDateTime) -> Result<()> {
         let _write = self.gate.permit().await?;
         let affected = sqlx::query(
             "UPDATE outbox_events SET status = 'published', published_at = ?, \
              last_error = NULL WHERE event_id = ?",
         )
         .bind(unix_secs(at))
-        .bind(event_id.to_string())
+        .bind(uuid_to_text(&event_id))
         .execute(self.gate.pool())
         .await
         .map_err(map_sqlx)?
@@ -253,7 +285,7 @@ impl OutboxStore for OutboxRepository {
         Ok(())
     }
 
-    async fn retry(&self, event_id: uuid::Uuid, error: &str, now: OffsetDateTime) -> Result<()> {
+    async fn retry(&self, event_id: EventId, error: &str, now: OffsetDateTime) -> Result<()> {
         let error = error.to_owned();
         self.gate
             .write_unit("outbox retry", move |tx| {
@@ -263,7 +295,7 @@ impl OutboxStore for OutboxRepository {
                                 event_type, schema_version, occurred_at, payload_json, attempts \
                          FROM outbox_events WHERE event_id = ?",
                     )
-                    .bind(event_id.to_string())
+                    .bind(uuid_to_text(&event_id))
                     .fetch_optional(&mut **tx)
                     .await
                     .map_err(map_sqlx)?
@@ -280,7 +312,7 @@ impl OutboxStore for OutboxRepository {
                                  WHERE event_id = ?",
                             )
                             .bind(&error)
-                            .bind(event.event_id.to_string())
+                            .bind(uuid_to_text(&event.event_id))
                             .execute(&mut **tx)
                             .await
                             .map_err(map_sqlx)?;
@@ -296,8 +328,10 @@ impl OutboxStore for OutboxRepository {
                                 attempts: event.attempts,
                                 last_error: Some(error.clone()),
                                 next_attempt_at: now,
+                                // The event itself stays linked by `event_id`;
+                                // a dead-letter is not tied to one mutation kind.
                                 locator: None,
-                                operation: Some(event.event_type.clone()),
+                                operation: None,
                             };
                             upsert_repair(&mut **tx, &item, now).await?;
                             Ok(())
@@ -309,7 +343,7 @@ impl OutboxStore for OutboxRepository {
                             )
                             .bind(unix_secs(next_attempt_at))
                             .bind(&error)
-                            .bind(event_id.to_string())
+                            .bind(uuid_to_text(&event_id))
                             .execute(&mut **tx)
                             .await
                             .map_err(map_sqlx)?;
@@ -318,7 +352,7 @@ impl OutboxStore for OutboxRepository {
                                  WHERE event_id = ? AND attempt_no = ?",
                             )
                             .bind(&error)
-                            .bind(event_id.to_string())
+                            .bind(uuid_to_text(&event_id))
                             .bind(attempts)
                             .execute(&mut **tx)
                             .await
@@ -338,6 +372,7 @@ fn row_to_event(row: SqliteRow) -> Result<OutboxEvent> {
         .map_err(|e| Error::database("decode outbox payload").with_source(e))?;
     Ok(OutboxEvent {
         event_id: uuid::Uuid::parse_str(&reader.text("event_id")?)
+            .map(EventId::from_uuid)
             .map_err(|e| Error::database("decode outbox event id").with_source(e))?,
         context: BoundedContext::parse(&reader.text("context")?)?,
         aggregate_type: reader.text("aggregate_type")?,

@@ -97,17 +97,17 @@ pub trait RemoteService: Send + Sync {
     /// Lists one page of a directory reference.
     async fn ls(
         &self,
-        uri: &str,
+        uri: &RemoteUri,
         cursor: Option<String>,
         limit: u32,
         update_catalog: bool,
     ) -> Result<LsResult>;
 
     /// Fetches metadata for one object reference.
-    async fn stat(&self, uri: &str) -> Result<ObjectMetadata>;
+    async fn stat(&self, uri: &RemoteUri) -> Result<ObjectMetadata>;
 
     /// Expands references into the concrete items a removal would touch.
-    async fn plan_removals(&self, uris: &[String], recursive: bool) -> Result<RemovalPlan>;
+    async fn plan_removals(&self, uris: &[RemoteUri], recursive: bool) -> Result<RemovalPlan>;
 
     /// Executes a previously built removal plan as a tracked job.
     async fn remove_planned(
@@ -192,14 +192,13 @@ impl DefaultRemoteService {
         }
     }
 
-    /// Parses a URI and resolves its connection, bucket and storage adapter.
+    /// Resolves a reference's connection, bucket and storage adapter.
     async fn resolve_target(
         &self,
-        uri: &str,
-    ) -> Result<(rstore_domain::Bucket, Arc<dyn Storage>, RemoteUri)> {
-        let parsed = RemoteUri::parse(uri)?;
-        let (_config, bucket, storage) = self.locator.resolve_target(&parsed).await?;
-        Ok((bucket, storage, parsed))
+        uri: &RemoteUri,
+    ) -> Result<(rstore_domain::Bucket, Arc<dyn Storage>)> {
+        let (_config, bucket, storage) = self.locator.resolve_target(uri).await?;
+        Ok((bucket, storage))
     }
 }
 
@@ -207,15 +206,16 @@ impl DefaultRemoteService {
 impl RemoteService for DefaultRemoteService {
     async fn ls(
         &self,
-        uri: &str,
+        uri: &RemoteUri,
         cursor: Option<String>,
         limit: u32,
         update_catalog: bool,
     ) -> Result<LsResult> {
-        let (bucket, storage, parsed) = self.resolve_target(uri).await?;
+        let (bucket, storage) = self.resolve_target(uri).await?;
+        let parsed = uri;
         if !parsed.is_directory_ref() {
             return Err(Error::invalid_input(format!(
-                "`remote ls` needs a directory reference; write `{uri}/`"
+                "`ls` needs a directory reference; write `{uri}/`"
             )));
         }
 
@@ -276,17 +276,17 @@ impl RemoteService for DefaultRemoteService {
         })
     }
 
-    async fn stat(&self, uri: &str) -> Result<ObjectMetadata> {
-        if uri.ends_with('/') {
+    async fn stat(&self, uri: &RemoteUri) -> Result<ObjectMetadata> {
+        if uri.is_directory_ref() {
             return Err(Error::invalid_input(
-                "`remote stat` targets an object; the URI must not end with `/`",
+                "`stat` targets an object; the reference must name a key and not end with `/`",
             ));
         }
-        let (bucket, storage, parsed) = self.resolve_target(uri).await?;
-        storage.stat(&bucket.name, &parsed.object_path()?).await
+        let (bucket, storage) = self.resolve_target(uri).await?;
+        storage.stat(&bucket.name, &uri.object_path()?).await
     }
 
-    async fn plan_removals(&self, uris: &[String], recursive: bool) -> Result<RemovalPlan> {
+    async fn plan_removals(&self, uris: &[RemoteUri], recursive: bool) -> Result<RemovalPlan> {
         let mut endpoints = crate::batch_plan::Endpoints::default();
         let mut plan = RemovalPlan::default();
         for uri in uris {

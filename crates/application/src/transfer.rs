@@ -53,27 +53,22 @@ pub fn classify_download(source_count: usize, target: &Path) -> Result<DownloadM
     Ok(DownloadMode::Single)
 }
 
-/// Parses canonical remote references into one plan per source.
-///
-/// Parsing happens once here so later stages never re-expand references.
+/// One plan per expanded remote source, all mirroring into `target`.
 pub fn download_plans(
-    references: &[String],
+    references: &[RemoteUri],
     target: PathBuf,
     conflict: ConflictPolicy,
     recursive: bool,
-) -> Result<Vec<DownloadPlan>> {
+) -> Vec<DownloadPlan> {
     references
         .iter()
-        .map(|uri| {
-            let parsed = RemoteUri::parse(uri)?;
-            Ok(DownloadPlan {
-                connection: parsed.connection,
-                bucket: parsed.bucket,
-                prefix: parsed.key,
-                target: target.clone(),
-                conflict,
-                recursive,
-            })
+        .map(|uri| DownloadPlan {
+            connection: uri.connection.clone(),
+            bucket: uri.bucket.clone(),
+            prefix: uri.key.clone(),
+            target: target.clone(),
+            conflict,
+            recursive,
         })
         .collect()
 }

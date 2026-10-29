@@ -82,16 +82,15 @@ pub struct RemoteItem {
 pub async fn remote_items(
     locator: &CatalogLocator,
     endpoints: &mut Endpoints,
-    uri: &str,
+    uri: &RemoteUri,
     recursive: bool,
 ) -> Result<Vec<RemoteItem>> {
-    let parsed = RemoteUri::parse(uri)?;
-    crate::expand::require_recursive(uri, &parsed.key, recursive)?;
-    let endpoint = endpoints.resolve(locator, &parsed).await?;
+    crate::expand::require_recursive(&uri.to_string(), &uri.key, recursive)?;
+    let endpoint = endpoints.resolve(locator, uri).await?;
     let entries = crate::expand::source_entries(
         endpoint.storage.as_ref(),
         &endpoint.bucket.name,
-        &parsed.key,
+        &uri.key,
         recursive,
     )
     .await?;

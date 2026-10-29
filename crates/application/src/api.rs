@@ -6,11 +6,13 @@
 //! carries a rule — the bounded repair log on [`JobApi`], the conflict-policy precedence and run
 //! orchestration on [`TransferApi`]). Never mix both for the same service.
 
-use std::path::Path;
 use std::sync::Arc;
 
 use crate::bucket::BucketService;
-use crate::commands::{CopyObjectsCommand, DownloadObjectsCommand, UploadObjectsCommand};
+use crate::commands::{
+    BatchDownloadCommand, CopyObjectsCommand, DownloadObjectsCommand, RunControl,
+    UploadObjectsCommand,
+};
 use crate::config_bundle::{ConfigBundle, DefaultConfigTransferService, ImportReport};
 use crate::connection::ConnectionService;
 use crate::copy::DefaultCopyService;
@@ -20,6 +22,8 @@ use crate::health::{HealthReport, HealthService};
 use crate::indexer::IndexService;
 use crate::job::JobService;
 use crate::link::{DefaultLinkService, GeneratedLink, LinkProfileInput, LinkRequest};
+use crate::onboarding::Onboarding;
+use crate::reference::References;
 use crate::remote::RemoteService;
 use crate::tag::TagService;
 use crate::transfer::DefaultTransferService;
@@ -37,6 +41,8 @@ pub(crate) struct Services {
     pub(crate) connections: Arc<dyn ConnectionService>,
     pub(crate) diagnostics: Arc<ConnectionDiagnostics>,
     pub(crate) buckets: Arc<dyn BucketService>,
+    pub(crate) references: Arc<References>,
+    pub(crate) onboarding: Arc<Onboarding>,
     pub(crate) remote: Arc<dyn RemoteService>,
     pub(crate) jobs: Arc<dyn JobService>,
     pub(crate) transfers: Arc<DefaultTransferService>,
@@ -74,6 +80,8 @@ impl ApplicationApi {
             registry: RegistryApi {
                 connections: services.connections.clone(),
                 buckets: services.buckets.clone(),
+                references: services.references.clone(),
+                onboarding: services.onboarding.clone(),
             },
             catalog: CatalogApi {
                 workspaces: services.workspaces.clone(),
@@ -105,7 +113,7 @@ impl ApplicationApi {
         }
     }
 
-    /// Connections and buckets — the registry contexts.
+    /// Connections, buckets, and the reference grammar — the registry contexts.
     pub fn registry(&self) -> RegistryApi {
         self.registry.clone()
     }
@@ -141,11 +149,13 @@ impl ApplicationApi {
     }
 }
 
-/// Connection and bucket lifecycle handles (accessor style).
+/// Connection and bucket lifecycle handles plus the reference grammar (accessor style).
 #[derive(Clone)]
 pub struct RegistryApi {
     connections: Arc<dyn ConnectionService>,
     buckets: Arc<dyn BucketService>,
+    references: Arc<References>,
+    onboarding: Arc<Onboarding>,
 }
 
 impl RegistryApi {
@@ -157,6 +167,16 @@ impl RegistryApi {
     /// Bucket registration, guards, and resolution.
     pub fn buckets(&self) -> Arc<dyn BucketService> {
         self.buckets.clone()
+    }
+
+    /// Short-reference expansion and transfer routing against the registry.
+    pub fn references(&self) -> Arc<References> {
+        self.references.clone()
+    }
+
+    /// Bucket registration that also enrolls into a workspace.
+    pub fn onboarding(&self) -> Arc<Onboarding> {
+        self.onboarding.clone()
     }
 }
 
@@ -205,23 +225,23 @@ impl TransferApi {
     ///
     /// Precedence: an explicit policy wins; otherwise the target bucket's default; otherwise
     /// [`rstore_domain::ConflictPolicy::Ask`]. Callers may still decide how to handle `Ask`
-    /// (prompt, `--yes`, or a blocked item), but the source precedence belongs here.
+    /// (prompt, an explicit flag, or a blocked item), but the source precedence belongs here.
     pub async fn conflict_policy(
         &self,
         explicit: Option<rstore_domain::ConflictPolicy>,
-        target: Option<(&crate::connection::ConnectionRef, &str)>,
+        target: Option<&crate::reference::RemoteUri>,
     ) -> Result<rstore_domain::ConflictPolicy> {
         if let Some(explicit) = explicit {
             return Ok(explicit);
         }
-        let Some((connection, bucket)) = target else {
+        let Some(target) = target else {
             return Ok(rstore_domain::ConflictPolicy::Ask);
         };
         let bucket = self
             .buckets
             .resolve(&crate::bucket::BucketRef::Scoped(
-                connection.clone(),
-                bucket.to_string(),
+                target.connection.clone(),
+                target.bucket.clone(),
             ))
             .await?;
         Ok(bucket.config.default_conflict)
@@ -232,64 +252,84 @@ impl TransferApi {
         self.remote.clone()
     }
 
-    /// Execute an upload command's plan with progress reporting and cancellation.
+    /// Execute an upload command's plan.
     pub async fn run_upload(
         &self,
         command: &UploadObjectsCommand,
-        progress: &dyn rstore_transfer::ProgressSink,
-        cancel: &rstore_transfer::CancellationToken,
+        control: RunControl<'_>,
     ) -> Result<crate::transfer::TransferReport> {
         self.transfers
-            .run_upload(&command.plan, &command.options, progress, cancel)
+            .run_upload(
+                &command.plan,
+                &command.options,
+                control.progress,
+                control.cancel,
+            )
             .await
     }
 
-    /// Execute a download command's plan with progress reporting and cancellation.
+    /// Execute a download command's plan.
     pub async fn run_download(
         &self,
         command: &DownloadObjectsCommand,
-        progress: &dyn rstore_transfer::ProgressSink,
-        cancel: &rstore_transfer::CancellationToken,
+        control: RunControl<'_>,
     ) -> Result<crate::transfer::TransferReport> {
         self.transfers
-            .run_download(&command.plan, &command.options, progress, cancel)
+            .run_download(
+                &command.plan,
+                &command.options,
+                control.progress,
+                control.cancel,
+            )
             .await
     }
 
     /// Execute several download plans as one batch run.
     pub async fn run_batch_download(
         &self,
-        plans: &[crate::transfer::DownloadPlan],
-        options: &crate::transfer::RunOptions,
-        progress: &dyn rstore_transfer::ProgressSink,
-        cancel: &rstore_transfer::CancellationToken,
+        command: &BatchDownloadCommand,
+        control: RunControl<'_>,
     ) -> Result<crate::transfer::BatchDownloadReport> {
         self.transfers
-            .run_batch_download(plans, options, progress, cancel)
+            .run_batch_download(
+                &command.plans,
+                &command.options,
+                control.progress,
+                control.cancel,
+            )
             .await
     }
 
-    /// Execute a server-side copy command.
+    /// Execute a remote copy command (server-side on one connection, relayed
+    /// across connections).
     pub async fn run_copy(
         &self,
         command: &CopyObjectsCommand,
-        cancel: &rstore_transfer::CancellationToken,
-        progress: &dyn rstore_transfer::ProgressSink,
+        control: RunControl<'_>,
     ) -> Result<crate::transfer::TransferReport> {
         self.copies
-            .run_copy(&command.pairs, &command.options, cancel, progress)
+            .run_copy(
+                &command.pairs,
+                &command.options,
+                control.cancel,
+                control.progress,
+            )
             .await
     }
 
-    /// Execute a move command (copy followed by source deletion).
+    /// Execute a move command (copy, verify, then delete the source).
     pub async fn run_move(
         &self,
         command: &CopyObjectsCommand,
-        cancel: &rstore_transfer::CancellationToken,
-        progress: &dyn rstore_transfer::ProgressSink,
+        control: RunControl<'_>,
     ) -> Result<crate::transfer::TransferReport> {
         self.copies
-            .run_move(&command.pairs, &command.options, cancel, progress)
+            .run_move(
+                &command.pairs,
+                &command.options,
+                control.cancel,
+                control.progress,
+            )
             .await
     }
 }
@@ -321,7 +361,7 @@ impl AccessApi {
     /// Turn remote references into paths, URIs, URLs, and documents.
     pub async fn generate(
         &self,
-        uris: &[String],
+        uris: &[crate::reference::RemoteUri],
         request: &LinkRequest,
     ) -> crate::batch_outcome::BatchOutcome<GeneratedLink> {
         self.links.generate(uris, request).await
@@ -338,8 +378,8 @@ pub struct DiagnosticsApi {
 
 impl DiagnosticsApi {
     /// Whole-catalog doctor report.
-    pub async fn health(&self, db_path: &Path) -> HealthReport {
-        self.health.health(db_path, self.storage_adapter).await
+    pub async fn health(&self) -> HealthReport {
+        self.health.health(self.storage_adapter).await
     }
 
     /// Registered storage adapter name, or `None` when no factory was injected.
@@ -381,21 +421,6 @@ impl JobApi {
     /// Resolve a job by id or list ordinal.
     pub async fn resolve(&self, reference: &crate::job::JobRef) -> Result<rstore_domain::Job> {
         self.jobs.resolve(reference).await
-    }
-
-    /// Pause a running job.
-    pub async fn pause(&self, reference: &crate::job::JobRef) -> Result<rstore_domain::Job> {
-        self.jobs.pause(reference).await
-    }
-
-    /// Resume a paused or interrupted job.
-    pub async fn resume(&self, reference: &crate::job::JobRef) -> Result<rstore_domain::Job> {
-        self.jobs.resume(reference).await
-    }
-
-    /// Re-run a failed or partially successful job.
-    pub async fn retry(&self, reference: &crate::job::JobRef) -> Result<rstore_domain::Job> {
-        self.jobs.retry(reference).await
     }
 
     /// Cancel a job in any non-terminal state.

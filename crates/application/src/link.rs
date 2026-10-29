@@ -193,22 +193,22 @@ impl DefaultLinkService {
     /// projected failure.
     pub(crate) async fn generate(
         &self,
-        uris: &[String],
+        uris: &[RemoteUri],
         request: &LinkRequest,
     ) -> BatchOutcome<GeneratedLink> {
         let mut items = Vec::with_capacity(uris.len());
         for uri in uris {
             items.push(match self.one(uri, request).await {
-                Ok(link) => ItemOutcome::succeeded(uri.clone(), link),
-                Err(e) => ItemOutcome::failed(uri.clone(), &e),
+                Ok(link) => ItemOutcome::succeeded(uri.to_string(), link),
+                Err(e) => ItemOutcome::failed(uri.to_string(), &e),
             });
         }
         BatchOutcome::new(items)
     }
 
-    async fn one(&self, uri: &str, request: &LinkRequest) -> Result<GeneratedLink> {
-        let parsed = RemoteUri::parse(uri)?;
-        let (config, bucket) = self.locator.resolve_bucket(&parsed).await?;
+    async fn one(&self, uri: &RemoteUri, request: &LinkRequest) -> Result<GeneratedLink> {
+        let parsed = uri;
+        let (config, bucket) = self.locator.resolve_bucket(parsed).await?;
         let key = &parsed.key;
         if key.is_empty() {
             return Err(Error::invalid_input(format!(
@@ -268,7 +268,7 @@ impl DefaultLinkService {
             LinkFormat::Path => path.as_str().to_string(),
             LinkFormat::S3 => s3_uri.clone(),
             LinkFormat::Json => serde_json::json!({
-                "uri": uri,
+                "uri": uri.to_string(),
                 "path": path.as_str(),
                 "s3_uri": s3_uri,
                 "url": public_url,

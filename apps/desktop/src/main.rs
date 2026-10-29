@@ -20,6 +20,11 @@ async fn run() -> rstore_domain::Result<()> {
     // cross-process write lock, open + migrate + recover. The lock guard
     // lives inside the returned Runtime.
     let runtime = Runtime::open_locked(&dirs).await?;
+    // A long-lived host can afford a longer startup drain; a resident
+    // consumer loop replaces it once the desktop runs continuously.
+    runtime
+        .drain_outbox(std::time::Duration::from_secs(10))
+        .await?;
     let _api = runtime.application().api();
     println!("rstore desktop runtime ready (GPUI presentation pending)");
     Ok(())

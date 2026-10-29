@@ -94,6 +94,10 @@ impl Application {
                 dependencies.registry.connections.clone(),
                 dependencies.runtime.clock.clone(),
             ));
+        let references = Arc::new(crate::reference::References::new(
+            connections.clone(),
+            buckets.clone(),
+        ));
         let diagnostics = Arc::new(crate::diagnostics::ConnectionDiagnostics::new(
             dependencies.registry.connections.clone(),
             gateway.clone(),
@@ -137,7 +141,13 @@ impl Application {
             dependencies.registry.workspaces.clone(),
             buckets.clone(),
             dependencies.registry.ignore_rules.clone(),
+            dependencies.registry.settings.clone(),
             dependencies.runtime.clock.clone(),
+        ));
+        let onboarding = Arc::new(crate::onboarding::Onboarding::new(
+            connections.clone(),
+            buckets.clone(),
+            workspaces.clone(),
         ));
         let tags = Arc::new(crate::tag::DefaultTagService::new(
             dependencies.registry.tags.clone(),
@@ -148,6 +158,7 @@ impl Application {
         let indexer = Arc::new(crate::indexer::DefaultIndexService::new(
             locator.clone(),
             buckets.clone(),
+            dependencies.registry.workspaces.clone(),
             catalog.clone(),
             dependencies.registry.ignore_rules.clone(),
             dependencies.catalog.index_runs.clone(),
@@ -186,6 +197,8 @@ impl Application {
                 connections,
                 diagnostics,
                 buckets,
+                references,
+                onboarding,
                 remote,
                 jobs,
                 transfers,
@@ -202,30 +215,35 @@ impl Application {
         }
     }
 
-    /// Deliver every due outbox fact to the remote-verify consumer, looping
-    /// until the backlog is gone or a safety cap of 16 cycles is hit (each
-    /// cycle claims up to one batch). The startup drain runs under the
-    /// process write lock; a long-lived host would schedule it instead.
-    pub async fn drain_outbox(&self) -> Result<crate::outbox::DispatchReport> {
-        let mut total = crate::outbox::DispatchReport {
-            claimed: 0,
-            published: 0,
-            retried: 0,
-            repair_required: 0,
-        };
+    /// Deliver due outbox facts to the remote-verify consumer until the
+    /// backlog is gone, a safety cap of 16 cycles is hit (each cycle claims up
+    /// to one batch), or `budget` is spent — whichever comes first. A fact
+    /// still being verified at the deadline counts as a failed attempt; facts
+    /// not yet started go back to the due queue untouched.
+    /// Runs under the process write lock; the entry point decides when.
+    pub async fn drain_outbox(
+        &self,
+        budget: std::time::Duration,
+    ) -> Result<crate::outbox::DispatchReport> {
+        let deadline = tokio::time::Instant::now() + budget;
+        let mut total = crate::outbox::DispatchReport::default();
         for _ in 0..16 {
             let report = self
                 .dispatcher
                 .dispatch_once(
                     self.dependencies.runtime.clock.now(),
                     self.verifier.as_ref(),
+                    Some(deadline),
                 )
                 .await?;
             total.claimed += report.claimed;
             total.published += report.published;
             total.retried += report.retried;
-            total.repair_required += report.repair_required;
-            if report.claimed == 0 {
+            total.deferred += report.deferred;
+            // A snapshot of pending repairs, not a per-cycle delta.
+            total.repair_required = report.repair_required;
+            if report.claimed == 0 || report.deferred > 0 || tokio::time::Instant::now() >= deadline
+            {
                 break;
             }
         }

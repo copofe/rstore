@@ -53,6 +53,44 @@ pub(crate) async fn resolve_connection(
     found.ok_or_else(|| Error::not_found(format!("connection `{}` not found", reference.display())))
 }
 
+/// A known S3-compatible service whose connection defaults differ from the generic ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderPreset {
+    Aws,
+    R2,
+    Minio,
+    Supabase,
+    Generic,
+}
+
+impl ProviderPreset {
+    /// Parse a preset name: `aws`, `r2`, `minio`, `supabase`, or `generic`.
+    ///
+    /// # Errors
+    /// `invalid_input` for any other name.
+    pub fn parse(token: &str) -> Result<Self> {
+        match token {
+            "aws" => Ok(Self::Aws),
+            "r2" => Ok(Self::R2),
+            "minio" => Ok(Self::Minio),
+            "supabase" => Ok(Self::Supabase),
+            "generic" => Ok(Self::Generic),
+            other => Err(Error::invalid_input(format!(
+                "unknown provider `{other}` (aws|r2|minio|supabase|generic)"
+            ))),
+        }
+    }
+
+    /// The addressing style the provider needs when none is given explicitly: MinIO and
+    /// Supabase gateways only serve path-style requests.
+    pub fn addressing_style(self) -> AddressingStyle {
+        match self {
+            Self::Minio | Self::Supabase => AddressingStyle::Path,
+            Self::Aws | Self::R2 | Self::Generic => AddressingStyle::Auto,
+        }
+    }
+}
+
 /// A credential pair supplied by the user.
 ///
 /// Wrapped in `Secret<…>` at the CLI boundary so it never reaches logs or `Debug` output.
@@ -112,7 +150,7 @@ pub trait ConnectionService: Send + Sync {
     /// Narrow [`Self::list`] by a case-insensitive substring over name and endpoint.
     ///
     /// One implementation of the filter semantics, so the CLI and the desktop agree on what
-    /// `--filter` matches.
+    /// the `connection list` filter matches.
     async fn list_matching(&self, needle: &str) -> Result<Vec<ConnectionConfig>> {
         let needle = needle.to_lowercase();
         Ok(self

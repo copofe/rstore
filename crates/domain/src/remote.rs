@@ -138,6 +138,24 @@ impl FileType {
         }
     }
 
+    /// Parse the token written by [`FileType::as_str`].
+    ///
+    /// # Errors
+    /// `invalid_input` for any other token.
+    pub fn parse(token: &str) -> crate::Result<Self> {
+        match token {
+            "image" => Ok(Self::Image),
+            "video" => Ok(Self::Video),
+            "audio" => Ok(Self::Audio),
+            "document" => Ok(Self::Document),
+            "archive" => Ok(Self::Archive),
+            "other" => Ok(Self::Other),
+            other => Err(crate::Error::invalid_input(format!(
+                "unknown file type `{other}` (image|video|audio|document|archive|other)"
+            ))),
+        }
+    }
+
     /// Classify a MIME type; unrecognised types fall back to [`FileType::Other`].
     pub fn from_mime(mime: &str) -> Self {
         if mime.starts_with("image/") || mime == "image" {

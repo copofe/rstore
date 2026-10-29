@@ -46,6 +46,8 @@ pub struct Database {
     read_pool: SqlitePool,
     writer: SqliteWriter,
     clock: Arc<dyn Clock>,
+    /// Where the catalog lives: the file path, or `:memory:`.
+    location: String,
 }
 
 impl Database {
@@ -89,6 +91,7 @@ impl Database {
             read_pool,
             writer: SqliteWriter::new(64),
             clock,
+            location: db_path.display().to_string(),
         };
         db.migrate().await?;
         Ok(db)
@@ -118,6 +121,7 @@ impl Database {
             pool,
             writer: SqliteWriter::new(64),
             clock,
+            location: ":memory:".to_string(),
         };
         db.migrate().await?;
         Ok(db)
@@ -438,6 +442,10 @@ impl rstore_application_ports::RuntimeStats for Database {
 
     async fn size_bytes(&self) -> Result<u64> {
         self.size_bytes().await
+    }
+
+    fn location(&self) -> String {
+        self.location.clone()
     }
 }
 

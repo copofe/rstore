@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use aws_sdk_s3::config::{BehaviorVersion, Credentials};
+use aws_smithy_types::retry::RetryConfig;
 use rstore_domain::connection::{AddressingStyle, ConnectionConfig, Region};
 use rstore_storage_api::{Storage, StorageCredentials, StorageFactory};
 
@@ -41,6 +42,11 @@ pub(crate) fn build_client(
 ) -> aws_sdk_s3::Client {
     let mut builder = aws_sdk_s3::Config::builder()
         .behavior_version(BehaviorVersion::latest())
+        // Retries belong to one layer: every adapter the gateway hands out is
+        // wrapped in `RetryingStorage`, which reads the transient signal from
+        // the error classification. SDK retries underneath would multiply
+        // the attempts and hide them from that policy.
+        .retry_config(RetryConfig::disabled())
         .region(aws_sdk_s3::config::Region::new(region_string(
             &config.region,
         )))

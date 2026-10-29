@@ -24,33 +24,15 @@ use rstore_application_ports::{
 };
 use rstore_catalog::RemoteObjectRepository;
 use rstore_domain::events::DomainEvent;
-use rstore_domain::id::{BucketId, ConnectionId, JobId, ReceiptId, RepairId};
+use rstore_domain::id::{BucketId, ConnectionId, EventId, JobId, ReceiptId, RepairId};
 use rstore_domain::remote::ObjectPath;
 use rstore_domain::{Clock, Error, RemoteLocator};
 use rstore_storage_api::model::ObjectMetadata;
 use time::OffsetDateTime;
-use uuid::Uuid;
 
 use rstore_application_ports::deps::{RepairPort, UnitOfWorkPort};
 
-/// Kind of remote mutation being settled.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum MutationOperation {
-    Upload,
-    Copy,
-    Delete,
-}
-
-impl MutationOperation {
-    /// Stable wire/persistence name for this operation kind.
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Upload => "upload",
-            Self::Copy => "copy",
-            Self::Delete => "delete",
-        }
-    }
-}
+pub(crate) use rstore_domain::MutationOperation;
 
 /// Result of trying to make a remote mutation durable locally.
 ///
@@ -253,18 +235,16 @@ impl MutationCoordinator {
     ) -> RemoteSettlement {
         let now = self.clock.now();
         let receipt_id = ReceiptId::new_random();
-        let event_id = Uuid::new_v4();
         let event = DomainEvent::RemoteMutationCompleted {
             locator: locator.clone(),
-            operation: operation.as_str().to_owned(),
+            operation,
         }
-        .envelope(event_id, 0, now);
+        .envelope(EventId::new_random(), 0, now);
         let receipt = RemoteMutationReceipt {
             receipt_id,
             job_id,
-            operation: operation.as_str().to_owned(),
-            locator_json: serde_json::to_string(locator)
-                .expect("RemoteLocator is always serializable"),
+            operation,
+            locator: locator.clone(),
             remote_version: metadata.and_then(|value| value.version_id.clone()),
             remote_etag: metadata.and_then(|value| value.etag.clone()),
             completed_at: now,
@@ -350,8 +330,8 @@ impl MutationCoordinator {
             attempts: 0,
             last_error: Some(error.to_owned()),
             next_attempt_at: self.clock.now(),
-            locator: serde_json::to_string(locator).ok(),
-            operation: Some(operation.as_str().to_owned()),
+            locator: Some(locator.clone()),
+            operation: Some(operation),
         };
 
         if let Err(insert_error) = self.repairs.insert(&item).await {

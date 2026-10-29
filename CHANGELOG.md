@@ -21,6 +21,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **CLI command tree redesigned for fewer keystrokes** (breaking; see
+  `docs/cli-guide.md`):
+  - `upload`/`download`/`cp` merge into `cp`, which routes by its arguments;
+    `remote ls`/`remote stat` become top-level `ls`/`stat` (`files show` is
+    `stat --offline`); `files list`/`files search` become `find [PATTERN]`
+    with tag, type, and extension filters.
+  - Catalog commands no longer take a workspace argument: `-w/--workspace`
+    (or `RSTORE_WORKSPACE`) overrides the current workspace selected with
+    `workspace use`; the first workspace becomes current, and registering a
+    bucket while none exists creates `default`.
+  - `connection add` tests the connection and registers buckets
+    (`--buckets all|a,b`, or an interactive choice); `--provider` presets the
+    addressing style. `bucket add` takes `[<connection>/]<bucket>…` and joins
+    the workspace; `bucket discover` is `bucket list --remote`; link-profile
+    and ignore-rule subcommands fold into `bucket show`/`bucket edit`.
+  - `tag add` creates missing tags; `tag detach` → `tag remove`, the old
+    `tag remove` → `tag delete`; `tag create` is gone.
+  - `workspace create|delete|add|remove|use`, `index run [--all|--refresh|
+    --rebuild]`, `index gc` (was `catalog gc`), `index status` (absorbs
+    `index stats`).
+  - `-y/--yes` is global and only confirms destructive actions; overwriting
+    on conflict is `-f` (`--conflict overwrite`). `-n` is `--dry-run`.
+- Application API: reference expansion and transfer routing live on
+  `RegistryApi::references()`; `WorkspaceService` gains
+  `current`/`select`/`target`/`enroll`; `IndexService::run` takes an
+  `IndexScope` and `IndexMode`; `TagService::attach_many` returns an
+  `AttachReport`.
+- Application API takes `RemoteUri` instead of reference strings (`ls`,
+  `stat`, `plan_removals`, link generation, tag attach/detach, `files show`,
+  `CopyPair`, `download_plans`, `conflict_policy`); `References::expand` and
+  `route` return `RemoteUri`.
+- Transfer runs share one signature, `(command, RunControl { progress,
+  cancel })`; batch downloads take a `BatchDownloadCommand`. The run types
+  (`CancellationToken`, `ProgressSink`, `TransferConfig`, …) are re-exported by
+  `rstore-application`, so the CLI crates no longer depend on the transfer
+  engine.
+- `RegistryApi::onboarding()` registers buckets and enrolls them into a
+  workspace as one use case (`bucket add` and `connection add` share it).
+- Every `rstore-application` module is private; the crate-root re-exports
+  are the whole public surface (gateway, dispatcher, and diagnostics service
+  types are no longer exported).
+- `DiagnosticsApi::health()` takes no path: the catalog location comes from
+  the `RuntimeStats` port.
+- The outbox drain is no longer part of `Runtime::open_locked`: entry points
+  call `Runtime::drain_outbox(budget)`. The CLI drains for at most two
+  seconds and only before commands that reach the remote anyway; a handler
+  still running at the deadline counts as a failed attempt, and claimed
+  events never started are released without spending one
+  (`OutboxStore::release`).
+- Outbox event ids are a typed `EventId`; receipts and repairs carry a typed
+  `MutationOperation` and `RemoteLocator` instead of strings. Dead-letter
+  repairs no longer put the event type into `operation`.
+- `tag add` creates missing tags only once an object resolves; batch lines
+  for `tag` and `url` name references as typed; `index run` lines read
+  `<connection>/<bucket>`.
+
 - **Unified batch outcome vocabulary** — every batch operation (`cp`/`mv`,
   `rm`, tag attach/detach, `url`) now reports per-item results through one
   `Disposition` type (succeeded / skipped with reason / blocked with reason /
@@ -65,6 +121,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `-r` is accepted as the short form of `--recursive` on `rm`, `cp`, and `mv`
   as it already was on transfers.
 
+### Fixed
+
+- `connection test` reported `endpoint/auth` as passed for rejected
+  credentials and failed for unreachable networks — inverted. It now passes
+  only when the endpoint answered and accepted the credentials.
+- Requests that never got a response (DNS failure, refused or dropped
+  connection) were classified `unknown` and not retried; they are now
+  `network_unreachable` (exit 6) and retryable.
+- S3 requests could be retried by both the SDK and `RetryingStorage`,
+  multiplying attempts; SDK retries are disabled.
+- The startup drain summed per-cycle repair snapshots into
+  `repair_required`; it now reports the latest snapshot.
+
 ### Added
 
 - Outbox consumption is live: `RemoteVerifyHandler` re-stats every settled
@@ -74,6 +143,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- `task pause|resume|retry` and `index pause|resume`: with one runtime per
+  data directory they could only flip stored state. Ctrl+C stops a run;
+  re-running the original command resumes from checkpoints.
+- Job states `paused` and `retrying` and the transitions back into `running`:
+  every run is a fresh job.
 - Dead schema tables (`remote_object_revisions`, `index_errors`,
   `job_events`, `operation_audit`) and write-only tombstone columns.
 - Unused port surface (`ConnectionStore::count`, `NoopUnitOfWork`,

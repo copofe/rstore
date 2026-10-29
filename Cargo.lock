@@ -2228,10 +2228,10 @@ dependencies = [
  "rstore-cli",
  "rstore-domain",
  "rstore-platform",
- "rstore-transfer",
  "serde_json",
  "time",
  "tokio",
+ "tracing",
  "tracing-appender",
  "tracing-subscriber",
 ]
@@ -2266,7 +2266,6 @@ dependencies = [
  "serde",
  "serde_json",
  "time",
- "uuid",
 ]
 
 [[package]]
@@ -2304,7 +2303,6 @@ dependencies = [
  "rstore-application",
  "rstore-domain",
  "rstore-platform",
- "rstore-transfer",
  "serde",
  "serde_json",
  "time",

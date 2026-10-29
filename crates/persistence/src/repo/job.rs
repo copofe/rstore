@@ -293,7 +293,7 @@ impl JobRepository for SqliteJobRepository {
         let _write = self.gate.permit().await?;
         let affected = sqlx::query(
             "UPDATE transfer_jobs SET state = 'interrupted', updated_at = ? \
-             WHERE state IN ('pending', 'running', 'retrying')",
+             WHERE state IN ('pending', 'running')",
         )
         .bind(unix_secs(at))
         .execute(self.gate.pool())

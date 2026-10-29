@@ -1,5 +1,6 @@
 //! Terminal interaction policy in one home: hidden credential input, y/N
-//! confirmations, conflict resolution, and stdin URI lists all read a single
+//! confirmations, numbered selections, conflict resolution, and stdin URI
+//! lists all read a single
 //! [`Session`] for "may we prompt?" instead of re-deriving it from the
 //! terminal per call site. JSON and non-terminal sessions never block on an
 //! interactive prompt.
@@ -56,14 +57,16 @@ pub(super) fn confirm(prompt: &str, session: &Session) -> Result<bool> {
     Ok(session.read_answer()?.eq_ignore_ascii_case("y"))
 }
 
-/// Gates destructive commands: `--yes` skips the prompt, non-interactive
-/// sessions require `--yes`, interactive sessions get a y/N prompt.
+/// Gates destructive commands: `-y` skips the prompt, non-interactive
+/// sessions require `-y`, interactive sessions get a y/N prompt.
 pub(super) fn confirm_destructive(prompt: &str, yes: bool, session: &Session) -> Result<()> {
     if yes {
         return Ok(());
     }
     if !session.is_interactive() {
-        return Err(Error::invalid_input("non-interactive mode requires --yes"));
+        return Err(Error::invalid_input(
+            "non-interactive mode requires -y/--yes to confirm",
+        ));
     }
     if confirm(&format!("{prompt}?"), session)? {
         Ok(())
@@ -87,6 +90,43 @@ pub(super) async fn remove_flow(
     confirm_destructive(&prompt, yes, session)?;
     remove.await?;
     Ok(crate::output::HandlerOutput::human(done))
+}
+
+/// Lists `options` numbered on stderr under `header` and reads a choice:
+/// `all`, comma-separated numbers, or an empty answer for none.
+pub(super) fn select(
+    header: &str,
+    question: &str,
+    options: &[String],
+    session: &Session,
+) -> Result<Vec<String>> {
+    let mut stderr = std::io::stderr();
+    writeln!(stderr, "{header}").ok();
+    for (number, option) in options.iter().enumerate() {
+        writeln!(stderr, "  {:>2}) {option}", number + 1).ok();
+    }
+    write!(stderr, "{question} [all / 1,3 / empty = none] ").ok();
+    stderr.flush().ok();
+    let answer = session.read_answer()?;
+    if answer.is_empty() {
+        return Ok(Vec::new());
+    }
+    if answer.eq_ignore_ascii_case("all") {
+        return Ok(options.to_vec());
+    }
+    answer
+        .split(',')
+        .map(|part| {
+            part.trim()
+                .parse::<usize>()
+                .ok()
+                .and_then(|number| options.get(number.checked_sub(1)?))
+                .cloned()
+                .ok_or_else(|| {
+                    Error::invalid_input(format!("no choice numbered `{}`", part.trim()))
+                })
+        })
+        .collect()
 }
 
 /// Reads one line of hidden input (credentials) from the terminal.
@@ -178,7 +218,7 @@ pub(super) fn read_edit_credential_input(
         "New secret key (empty = keep)",
         Some(format!(
             "Leave both empty to keep the existing credentials for `{}`.",
-            args.reference
+            args.connection
         )),
         session,
     )
@@ -186,23 +226,18 @@ pub(super) fn read_edit_credential_input(
 
 /// Resolves the interactive part of the conflict policy. The Application API
 /// has already applied the explicit-policy / bucket-default precedence; this
-/// function only handles `ask`, `--yes`, and the terminal prompt.
+/// function only handles `ask` and the terminal prompt.
 pub(super) fn resolve_conflict(
     policy: ConflictPolicy,
-    yes: bool,
     session: &Session,
 ) -> Result<ConflictPolicy> {
     if policy != ConflictPolicy::Ask {
         return Ok(policy);
     }
-    if yes {
-        return Ok(ConflictPolicy::Overwrite);
-    }
     if !session.is_interactive() {
         return Err(Error::invalid_input(
             "the conflict policy is unresolved (`ask`) and cannot prompt in \
-             non-interactive mode; pass --conflict skip|overwrite|rename or \
-             --yes",
+             non-interactive mode; pass --conflict skip|overwrite|rename or -f",
         ));
     }
     let mut stderr = std::io::stderr();

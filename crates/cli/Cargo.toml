@@ -10,7 +10,6 @@ license.workspace = true
 rstore-application.workspace = true
 rstore-domain.workspace = true
 rstore-platform.workspace = true
-rstore-transfer.workspace = true
 clap.workspace = true
 base64.workspace = true
 serde.workspace = true
