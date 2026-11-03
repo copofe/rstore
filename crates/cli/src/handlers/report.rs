@@ -10,7 +10,7 @@
 //! The JSON envelopes stay per-command — they are view types at the service
 //! seam, not one shape.
 
-use rstore_application::{Disposition, Severity, SkipReason, TransferReportItem};
+use rstore_engine::{Disposition, Severity, SkipReason, TransferReportItem};
 
 use crate::output::HandlerOutput;
 

@@ -24,9 +24,9 @@ mod workspace;
 
 use std::collections::HashMap;
 
-use rstore_application::{ApplicationApi, CancellationToken, RemoteUri, WorkspaceRef};
 use rstore_domain::{BucketId, Result, Workspace};
-use rstore_platform::AppDirs;
+use rstore_engine::AppDirs;
+use rstore_engine::{ApplicationApi, CancellationToken, RemoteUri, WorkspaceRef};
 use serde::Serialize;
 
 use crate::args::{Cli, Command, ConfigCommand};
@@ -144,7 +144,7 @@ pub async fn run_api(
 
 /// Expand a user remote reference (short or canonical form) through the
 /// application's one grammar — the rule lives in
-/// `rstore_application::References`, so other frontends expand identically.
+/// `rstore_engine::References`, so other frontends expand identically.
 async fn expand_remote(app: &ApplicationApi, reference: &str) -> Result<RemoteUri> {
     app.registry().references().expand(reference).await
 }
@@ -165,7 +165,7 @@ async fn resolve_bucket_ids(app: &ApplicationApi, refs: &[String]) -> Result<Vec
     for r in refs {
         ids.push(
             buckets
-                .resolve(&rstore_application::BucketRef::parse(r))
+                .resolve(&rstore_engine::BucketRef::parse(r))
                 .await?
                 .id,
         );
@@ -200,8 +200,7 @@ async fn bucket_labels(app: &ApplicationApi) -> Result<HashMap<BucketId, String>
         .collect())
 }
 
-/// Parse the top-level `--config` override into the resolved application
-/// directories.
+/// Resolve the application directories, honouring the top-level `--home`.
 pub fn resolve_dirs(cli: &Cli) -> AppDirs {
-    rstore_platform::resolve_app_dirs(cli.config.as_deref())
+    rstore_engine::resolve_app_dirs(cli.home.as_deref())
 }

@@ -221,18 +221,16 @@ impl IndexRunState {
     }
 }
 
-/// Catalog-side object freshness: when the index last confirmed the object
-/// against the remote, and whether it has since gone stale or been deleted
-/// (tombstoned).
+/// Catalog-side object freshness: whether the last full scan of the bucket
+/// still saw the cached object.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ObjectState {
     #[default]
     Confirmed,
-    /// A refresh marked it missing remotely but inside the retention window:
-    /// still listed, flagged stale.
+    /// A refresh no longer saw it remotely; the row stays (flagged) until GC
+    /// or a rebuild drops it, or for good while it carries tags.
     Stale,
-    Deleted,
 }
 
 impl ObjectState {
@@ -241,7 +239,6 @@ impl ObjectState {
         match self {
             Self::Confirmed => "confirmed",
             Self::Stale => "stale",
-            Self::Deleted => "deleted",
         }
     }
 
@@ -253,7 +250,6 @@ impl ObjectState {
         Ok(match token {
             "confirmed" => Self::Confirmed,
             "stale" => Self::Stale,
-            "deleted" => Self::Deleted,
             other => {
                 return Err(Error::database("decode object state").with_context("value", other))
             }

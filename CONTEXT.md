@@ -7,45 +7,25 @@ terms map to crates. Entries are grouped by concern.
 
 ## Composition and startup
 
-- **Composition root** — `crates/bootstrap`. The only layer allowed to choose
-  concrete SQLite, storage adapter, and outbox implementations; the only
-  production code that opens the `Database`.
-- **Assembly point (`assemble`)** — `rstore_persistence::assemble(db,
-  storage_factory) -> ApplicationDependencies`. The single function that
-  turns an opened `Database` (which carries the injected clock) plus an
-  optional storage factory into the application dependency graph; the group
-  structs and port aliases live in `rstore_application_ports::deps`.
-  Bootstrap goes through it, as must any test fixture — nothing
-  re-transcribes the dependency list.
-- **Write gate** — `rstore_persistence::tx::WriteGate`. The write pool and
-  the bounded writer actor as an inseparable pair, handed out only by
-  `Database::gate()`. Multi-statement repository writes go through
-  `gate.write_unit(label, work)` (the permit and the transaction are acquired
-  together, so re-entrant deadlock is impossible by construction); single
-  statements take `gate.permit()`. Repository constructors receive only
-  `(gate, read_pool)` — no construction path can bypass the shared gate.
-- **Startup sequence (`Runtime::open_locked`)** — the complete process-startup
-  order: create data directories → take the cross-process write lock → open
-  the database (with the configured clock) → run migrations →
-  `Application::initialize` (startup recovery: orphaned non-terminal jobs are
-  marked interrupted, outbox events stuck mid-processing return to the due
-  queue). The returned `Runtime` holds the lock guard for the process
-  lifetime.
-- **Outbox drain (`Runtime::drain_outbox(budget)`)** — the budgeted delivery
-  of due outbox facts to the remote-verify consumer, scheduled by the entry
-  point after `open_locked`: the CLI before commands that reach the remote
-  anyway (`Command::reaches_remote`, 2-second budget), the desktop at
-  startup. A handler still running at the deadline is abandoned as a failed
-  attempt (normal backoff); events claimed but never started are released
-  back to the due queue without spending an attempt
-  (`OutboxStore::release`, counted in `DispatchReport::deferred`).
-- **Construction vs recovery** — `Application::from_dependencies` only wires
-  services and stays deterministic; `Application::initialize` applies startup
-  recovery rules. Deliberately separate so tests can construct without
-  recovering.
-- **Process write lock (`AppLock`)** — the cross-process mutex from
-  `crates/platform`. The platform crate does not depend on domain; mapping a
-  `LockError` to a `domain::Error` happens only in bootstrap.
+- **Runtime (`engine::Runtime`)** — the process-startup sequence and the only
+  production code that opens SQLite and selects the storage factory:
+  `Runtime::open_in(dirs)` creates the data directories, opens and migrates the
+  database (carrying the configured clock), wires the engine, and runs startup
+  recovery. There is no process lock; several runtimes may share one data
+  directory.
+- **Wiring (`Application::new`)** — the one place every service is assembled
+  over the opened store. Construction is deterministic;
+  `Application::initialize` applies startup recovery separately so a caller can
+  construct without recovering.
+- **Startup recovery** — pending or running jobs whose lease lapsed become
+  `interrupted`. Jobs another live process owns are left alone.
+- **Write gate (`db::tx::WriteGate`)** — the write side of the store: a
+  single-connection pool, so in-process writes serialise on it while WAL and
+  the busy timeout arbitrate between processes. Multi-statement writes run in
+  `BEGIN IMMEDIATE` transactions through `write_unit`.
+- **Store (`engine::db`)** — the SQLite repositories, private to the engine.
+  SQLite is the application's file format, so use cases call repositories
+  directly; no single-implementation trait sits in between.
 
 ## Core domains
 
@@ -66,6 +46,11 @@ terms map to crates. Entries are grouped by concern.
 - **Bucket** — a remote bucket registered under a connection, carrying the
   `read_only` and `allow_delete` guard bits. The gateway enforces them at
   the seam by issuing guarded adapters for mutations — never raw ones.
+- **Remote gateway (`RemoteGateway`)** — the one path from a reference to a
+  registered bucket and a connected adapter: connection reference → config →
+  registered bucket → retry-decorated adapter, plus the guarded `writer` /
+  `deleter` issuance. Every service resolves remote targets through it, so a
+  broken connection or an unregistered bucket fails the same way everywhere.
 - **Guarded adapter** — the storage decorator `RemoteGateway::writer` /
   `deleter` issue over the retry-decorated adapter. The write methods
   (`put`, `copy`, `delete`, `create_multipart`, `adopt_multipart`) check
@@ -95,47 +80,57 @@ terms map to crates. Entries are grouped by concern.
   arguments as local or remote (`./`, `../`, `~/`, absolute → local;
   registered first segment → remote; registered *and* present locally →
   ambiguous error) and yields upload, download, or copy.
-- **RemoteObject** — the local projection of one remote object in the
-  catalog, including its tombstone lifecycle.
+- **Catalog** — the local cache of remote state: every object of an indexed
+  bucket plus any tagged object. The provider is the source of truth; the
+  catalog may be stale, never invented. Listings and index refreshes correct
+  it.
+- **RemoteObject** — one cached row of the catalog, `confirmed` or `stale`
+  (not seen by the last complete refresh).
+- **Indexed bucket** — a bucket whose objects the catalog holds in full, making
+  it searchable by name and attributes. Opt-in, off by default; naming a
+  bucket in `index run` switches it on, and switching it off drops the
+  bucket's untagged rows.
+- **Tag association** — a workspace tag on the object at `(bucket, path)`
+  (`object_tags`). Independent of indexing; attaching first confirms the object
+  exists. Tags are user data: GC, rebuilds, and index toggles never drop them;
+  rstore's own `rm` clears them and `mv` carries them.
+- **Write-through (`WriteThrough`)** — how the catalog follows what the
+  provider just confirmed: a landed object is upserted when its bucket is
+  indexed or the object is tagged or already cached; a deleted object loses its
+  row and tags; an `ls --catalog` page of an indexed bucket refreshes its rows.
+  Best-effort: a failed cache write becomes a note on the item (or a listing
+  that did not update the catalog), never a failed remote operation. The same
+  module owns `confirmed_object`, the one mapping from provider metadata to a
+  cache row.
 - **Job** — the persisted intent and state machine of one batch run
-  (pending → running → …); no job survives its process.
-- **Outbox / Repair** — two separate durable lifecycles: the outbox records
-  remote-change facts for delivery, while the repair store records queryable
-  follow-up failures. `OutboxStore` owns append, ordering, claiming,
-  acknowledgement, retry, and dead-lettering; `RepairStore` owns repair
-  insert, list, and resolve, backed by the SQLite `RepairRepository` adapter.
-  Repair identity is deterministic: event-driven repairs (delivery
-  dead-letters, verification divergences) derive their `RepairId` from the
-  outbox event, receipt-driven repairs (settlement/projection failures) from
-  the mutation receipt, so re-recording the same cause upserts one row. One
-  write path (`RepairStore::insert`) serves every producer; the delivery
-  policy — backoff schedule, attempt ceiling, dead-letter decision — lives
-  entirely in `OutboxStore::retry`, as the pure `delivery_decision` function
-  plus its transactional write. Dead-letter status and repair insertion stay
-  atomic through the shared `upsert_repair` statement.
-- **Shared SQL statements** — cross-repository writes share free functions,
-  not repository methods: `upsert_object_on` (remote-object upsert, used by
-  the catalog repo and the index run's page commit) and
-  `upsert_checkpoint_on` (index-checkpoint upsert, used by
-  `save_checkpoint` and the page commit). The shared thing at the seam is
-  the SQL statement, not a repository identity — an aggregate's
-  transaction borrows statements, never another repository's interface.
-- **RemoteMutationReceipt** — the durable fact that a remote operation
-  succeeded, committed in the same transaction as its outbox fact.
-- **Storage / StorageFactory** — the provider-neutral storage port and its
-  factory port (`crates/storage-api`). `Storage::copy` takes locators only:
-  the adapter stats the source itself and owns its copy strategy; the
-  source bucket must be reachable through the adapter (adapters are built
-  per connection, so same-connection copies address any bucket the
-  connection sees; cross-connection copies relay through the host).
+  (pending → running → …). Its items are persisted as they settle, so other
+  processes see the run advance.
+- **Job lease** — `lease_owner` plus `lease_expires_at` on a running job,
+  renewed by the owning process's heartbeat every 10 seconds (30-second
+  lease). A lapsed lease marks the job orphaned.
+- **Cancel request** — `cancel_requested` on a job another process owns; its
+  heartbeat turns the request into a cancel and the run ends `cancelled`.
+- **Live jobs (`LiveJobs`)** — the registry of jobs this process runs, by id;
+  a cancel for one of them trips its token immediately.
+- **EngineEvent** — a best-effort runtime message on the broadcast stream from
+  `ApplicationApi::events()`: job started / progress / finished, catalog
+  changed for a bucket, tags changed for a workspace. Not a durable fact,
+  never replayed; subscribers re-query the API.
+- **Storage / StorageFactory** — the provider-neutral storage trait and its
+  factory (`crates/storage`, with the S3 adapter in `storage::s3`).
+  `Storage::copy` takes locators only: the adapter stats the source itself
+  and owns its copy strategy; the source bucket must be reachable through the
+  adapter (adapters are built per connection, so same-connection copies
+  address any bucket the connection sees; cross-connection copies relay
+  through the host).
 - **Remote copy entry (`transfer::copy`)** — the one entry that executes a
   remote-to-remote copy: stat the source, apply the conflict decision (the
   probe and rename re-entry live here and nowhere else), route
   same-connection copies to provider-side `Storage::copy` and
   cross-connection copies to the internal relay, and report through
   `ItemOutcome`, including dry-run previews. Guarded adapters from the
-  gateway remain the write-guard proof; settlement lives with the
-  copy/move settlement module.
+  gateway remain the write-guard proof; settlement lives with the copy
+  service's `CopySettle`.
 - **Run context (`transfer::run`)** — the vocabulary of one transfer run,
   owned by no single entry: `TransferConfig` (tuning), `RunContext`
   (cancel + config + progress, constructed once per run and carried through
@@ -152,27 +147,23 @@ terms map to crates. Entries are grouped by concern.
   seam (`SettleHook<T>`: every successful remote mutation is settled
   exactly here, before it is counted; a settlement may revise the verdict,
   as a failed move verification does), the one cancellation interpretation
-  (`Cancelled` interrupts the run), and the single terminal-state commit.
-  Services supply per-item execution plus one `SettleHook` implementation
-  each — upload/download, copy/move, and removal are three adapters over
-  the same seam; they no longer call settlements inline.
-- **Copy/move settlement (`settlement`)** — the module that owns everything
-  between a succeeded copy item and its final step: rederives the landed
-  target key from the adapter metadata, settles through the mutation
-  coordinator's shared primitive (receipt/outbox unit plus catalog
-  projection), mirrors tags, and — for moves, marked by the item's
+  (`Cancelled` interrupts the run; a cancel request ends it `cancelled`),
+  the job lease and its heartbeat, per-item persistence, the job events, and
+  the single terminal-state commit. Services allocate the job with
+  `JobEnv::begin` and supply per-item execution plus one `SettleHook`
+  implementation each — upload/download, copy/move, and removal.
+- **Copy/move settlement (`CopySettle` in `copy`)** — the settle hook that
+  owns everything between a succeeded copy item and its final step: rederives the landed
+  target key from the adapter metadata, mirrors tags, lets the catalog follow
+  through the write-through, and — for moves, marked by the item's
   `ItemKind` — verifies the target then deletes the source through the
-  item's guard-issued adapters, revising the verdict on failure. The run
-  loop's settle hook is a one-line handoff; the mutation coordinator is the
-  shared settlement machine: one settlement primitive
-  (`settle_confirmed`) behind every confirmed remote mutation — upload,
-  delete, and copy alike — plus the single follow-up failure entry
-  (`note_failure`) that copy-specific steps use to record repairs.
+  item's guard-issued adapters, revising the verdict on failure (the source
+  is kept). Cache notes ride in the item detail.
 
 ## Multipart sessions
 
-- **Multipart session (`MultipartSession`)** — the provider-side session port
-  on `storage-api`: `Storage::create_multipart` / `adopt_multipart` return a
+- **Multipart session (`MultipartSession`)** — the provider-side session trait
+  in `storage`: `Storage::create_multipart` / `adopt_multipart` return a
   handle owning part upload (`upload_part`), server-side part copy
   (`copy_part`, default `CapabilityUnsupported`; S3 overrides with
   UploadPartCopy; its production consumer is the S3 adapter's
@@ -183,4 +174,5 @@ terms map to crates. Entries are grouped by concern.
   caller resumes), `abort` is strict (failure surfaces),
   `abandon(self)` is warn-only teardown for callers without a resume path.
   The retry decorator wraps sessions transparently, preserving per-part
-  retry semantics.
+  retry semantics. Upload checkpoints persist in the store's
+  `MultipartStore`; sessions never touch them.

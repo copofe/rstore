@@ -49,13 +49,13 @@ The full contract lives in the
 [architecture guide](docs/architecture-guide.md). The rules reviewers enforce
 most often:
 
-- **One core, two entry points.** Business logic lives in the application
-  core. The CLI and the future desktop must not duplicate orchestration,
-  read SQLite directly, or call an AWS SDK.
+- **One engine, two entry points.** Business logic lives in `crates/engine`.
+  The CLI and the future desktop must not duplicate orchestration, read SQLite
+  directly, or call an AWS SDK.
 - **Dependency direction is fixed.** `domain` depends on no I/O technology;
-  adapters (`persistence`, `storage-s3`) depend on ports, never the reverse;
-  `bootstrap` is the only layer that opens the database and selects concrete
-  implementations.
+  the AWS SDK appears only in `storage`; the engine's store, transfer, and
+  catalog modules are private; `engine::Runtime` is the only code that opens
+  the database and selects the storage implementation.
 - **Typed IDs everywhere.** Business identifiers use the newtypes from
   `rstore-domain::id`, never bare `String`/`Uuid`/integers.
 - **Errors are domain errors.** Map external failures into

@@ -13,6 +13,6 @@ pub use args::{
 pub use handlers::{resolve_dirs, run_api, HandlerResult};
 pub use output::{envelope, error_envelope, exit_code_for, version_output, HandlerOutput};
 /// The token [`run_api`] watches; the binary cancels it on Ctrl+C.
-pub use rstore_application::CancellationToken;
+pub use rstore_engine::CancellationToken;
 
 pub use clap::Parser;

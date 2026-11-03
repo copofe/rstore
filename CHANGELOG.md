@@ -7,7 +7,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — workbench architecture
+
+- The workspace collapses to four library crates: `domain`, `storage`
+  (provider-neutral `Storage` trait plus the S3 adapter), `engine` (use cases,
+  SQLite store, transfer engine, jobs, events, `Runtime`), and `cli`.
+  `application`, `application-ports`, `catalog`, `persistence`, `transfer`,
+  `bootstrap`, `platform`, `storage-api`, and `storage-s3` are gone. Services
+  are concrete types; single-implementation repository and service traits are
+  removed.
+- The catalog is a cache: every object of an indexed bucket plus any tagged
+  object. Remote changes update it best-effort through `WriteThrough`; a
+  failed cache write becomes an item note instead of a failure.
+- Indexing is opt-in per bucket and off by default for new buckets; naming a
+  bucket in `index run` switches its index on, switching it off drops the
+  bucket's untagged rows. `find` lists the buckets it could not search
+  (`unindexed`).
+- Tags key on `(bucket, path)` (`object_tags`) and no longer require an
+  indexed object; GC, rebuilds, and index toggles never drop them.
+- `index gc` removes untagged stale rows; `--retention` is gone.
+- No process lock: several processes share one data directory. Running jobs
+  hold leases renewed by a heartbeat; startup recovery interrupts only jobs
+  whose lease lapsed; `task cancel` reaches jobs in other processes (they end
+  `cancelled`). Items persist as they settle. SQLite busy past the timeout
+  maps to retryable `DatabaseBusy`; `LockBusy` is gone.
+- Writes go through a single-connection pool with `BEGIN IMMEDIATE`
+  transactions; the bounded writer actor is gone.
+- Retry backoff uses equal jitter.
+- Remote resolution has one home: `RemoteGateway` resolves references to
+  registered buckets and issues retry-decorated (and guarded) adapters;
+  `CatalogLocator` is gone. A bucket that is not registered under the named
+  connection fails with the same message and hint everywhere.
+- `connection show --capabilities` probes live every time; the 24-hour cache
+  in `app_settings` is gone.
+- `ls --catalog` refreshes the cache best-effort: a cache write that fails no
+  longer fails the listing, and a successful refresh publishes
+  `CatalogChanged`.
+- Files: the database is `rstore.db` (it holds everything, not just the
+  catalog), under a plain `rstore` directory — macOS `~/Library/Application
+  Support/rstore` with logs in `~/Library/Logs/rstore`, Linux
+  `~/.local/share/rstore` with logs in `~/.local/state/rstore`, Windows
+  `%LOCALAPPDATA%\rstore`. A `--home` / `RSTORE_HOME` root holds `rstore.db`
+  and `log/` directly. The unused config and cache directories are gone;
+  `config show` prints the database and log paths.
+- The global `--config <PATH>` flag is now `--home <PATH>`.
+- `doctor` drops the constant `tls_default` / `telemetry` fields; index
+  reports and status drop the unused `catalog_revision` (and its table).
+- The API groups are views over one shared service bundle;
+  `DiagnosticsApi::storage_adapter` is gone (the adapter name is in the
+  `doctor` report). `RuntimeConfig::storage_factory` is required.
+
 ### Added
+
+- `ApplicationApi::events()`: an `EngineEvent` broadcast stream (job started,
+  progress, finished; catalog changed; tags changed).
+
+### Removed
+
+- The receipt / outbox / repair chain (`UnitOfWork`, `OutboxStore`,
+  `RepairStore`, `RemoteVerifyHandler`, `Runtime::drain_outbox`,
+  `Command::reaches_remote`), deletion tombstones, and their tables; `doctor`
+  reports stale catalog rows instead of outbox/repair counts. The `deleted`
+  object state is gone.
+- Schema migrations: the schema is one baseline again, with no upgrade path
+  from earlier development databases (including the legacy multipart-column
+  and pre-baseline history shims). Delete an existing data directory's
+  `catalog.db` before running this build.
+
+### Added (earlier)
 
 - Apache-2.0 `LICENSE` file, CI workflow (format, clippy, tests, docs), and
   contributor documentation.

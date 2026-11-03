@@ -1,10 +1,11 @@
 //! Minimal desktop composition entry point.
 //!
-//! This deliberately contains no GPUI page. It proves that the future
-//! desktop process can open the same Bootstrap runtime and obtain the
-//! stable Application API without importing SQLite or a provider SDK.
+//! This deliberately contains no GPUI page. It proves that the desktop
+//! process opens the same engine runtime as the CLI — side by side with it,
+//! over the same data directory — and drives its views from the engine's
+//! event stream without importing SQLite or a provider SDK.
 
-use rstore_bootstrap::Runtime;
+use rstore_engine::Runtime;
 
 #[tokio::main]
 async fn main() {
@@ -15,17 +16,14 @@ async fn main() {
 }
 
 async fn run() -> rstore_domain::Result<()> {
-    let dirs = rstore_platform::resolve_app_dirs(None);
-    // Full startup sequence, identical to the CLI's: create dirs,
-    // cross-process write lock, open + migrate + recover. The lock guard
-    // lives inside the returned Runtime.
-    let runtime = Runtime::open_locked(&dirs).await?;
-    // A long-lived host can afford a longer startup drain; a resident
-    // consumer loop replaces it once the desktop runs continuously.
-    runtime
-        .drain_outbox(std::time::Duration::from_secs(10))
-        .await?;
-    let _api = runtime.application().api();
+    let dirs = rstore_engine::resolve_app_dirs(None);
+    // Full startup sequence, identical to the CLI's: create dirs, open +
+    // migrate + recover orphaned jobs. No process lock: a CLI may run beside it.
+    let runtime = Runtime::open_in(&dirs).await?;
+    let api = runtime.application().api();
+    // Views subscribe once and re-query the API when an event says something
+    // changed; GPUI pages attach here.
+    let _events = api.events().subscribe();
     println!("rstore desktop runtime ready (GPUI presentation pending)");
     Ok(())
 }

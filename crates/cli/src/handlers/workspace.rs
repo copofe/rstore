@@ -1,8 +1,8 @@
 //! `workspace …` handlers (WSP-). Subcommands without a workspace argument
 //! act on the workspace from `-w`, else the current one.
 
-use rstore_application::{BucketRef, CreateWorkspaceInput, UpdateWorkspaceInput, WorkspaceRef};
 use rstore_domain::{Bucket, Workspace};
+use rstore_engine::{BucketRef, CreateWorkspaceInput, UpdateWorkspaceInput, WorkspaceRef};
 
 use super::{Ctx, HandlerResult};
 use crate::args::WorkspaceCommand;

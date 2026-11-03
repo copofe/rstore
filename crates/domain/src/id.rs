@@ -152,38 +152,3 @@ define_id!(
     JobId,
     "job"
 );
-
-define_id!(
-    /// Correlates one durable remote-mutation receipt with its repair items.
-    ReceiptId,
-    "rcpt"
-);
-
-define_id!(
-    /// Identifies one queryable catalog follow-up failure.
-    RepairId,
-    "rep"
-);
-
-define_id!(
-    /// Identifies one domain fact in the outbox.
-    EventId,
-    "evt"
-);
-
-/// Repair identity is deterministic: one underlying cause maps to exactly
-/// one repair row, so repeated dispatch or re-projection upserts the same
-/// row instead of accumulating duplicates.
-impl RepairId {
-    /// Identity for event-driven repairs: outbox delivery dead-letters and
-    /// remote-verification divergences.
-    pub const fn from_event(event_id: EventId) -> Self {
-        Self(event_id.0)
-    }
-
-    /// Identity for receipt-driven repairs: settlement and projection
-    /// failures behind a durable remote-mutation receipt.
-    pub const fn from_receipt(receipt: ReceiptId) -> Self {
-        Self(receipt.0)
-    }
-}

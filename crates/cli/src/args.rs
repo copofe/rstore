@@ -1,5 +1,5 @@
 //! Command-line argument definitions: the full clap command tree of the CLI.
-//! Every command is dispatched through the Bootstrap-created Application API;
+//! Every command is dispatched through the `Runtime`-created application API;
 //! [`parse_command_line`] derives the envelope's `command` identity from the
 //! same tree, so the grammar has exactly one spelling.
 //!
@@ -23,9 +23,10 @@ use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
                   Documentation: see `rstore <command> --help`."
 )]
 pub struct Cli {
-    /// Override the data/config root directory.
+    /// Keep the database and logs under this directory instead of the
+    /// platform default (same as `RSTORE_HOME`).
     #[arg(long, value_name = "PATH", global = true)]
-    pub config: Option<PathBuf>,
+    pub home: Option<PathBuf>,
 
     /// Log level for stderr diagnostics.
     #[arg(long, value_name = "LEVEL", global = true, default_value = "warn")]
@@ -121,34 +122,6 @@ pub enum Command {
     Doctor,
     /// Print consolidated version information.
     Version,
-}
-
-impl Command {
-    /// Whether the command talks to remote storage anyway. The binary drains
-    /// the outbox (remote verification of earlier mutations) only before
-    /// these, so local-only commands never wait on the network.
-    pub fn reaches_remote(&self) -> bool {
-        match self {
-            Command::Ls(args) => args.reference.is_some(),
-            Command::Stat { offline, .. } => !offline,
-            Command::Cp(_) | Command::Mv(_) | Command::Rm(_) => true,
-            Command::Index { action } => matches!(action, IndexCommand::Run { .. }),
-            Command::Connection { action } => matches!(
-                action,
-                ConnectionCommand::Add(_)
-                    | ConnectionCommand::Test { .. }
-                    | ConnectionCommand::Show {
-                        capabilities: true,
-                        ..
-                    }
-            ),
-            Command::Bucket { action } => matches!(
-                action,
-                BucketCommand::Add(_) | BucketCommand::List { remote: true, .. }
-            ),
-            _ => false,
-        }
-    }
 }
 
 /// Parses a command line into the typed grammar plus its dotted command
@@ -643,10 +616,11 @@ pub enum WorkspaceCommand {
 #[derive(Subcommand, Debug)]
 pub enum IndexCommand {
     /// Scan buckets into the catalog, resuming from saved checkpoints.
+    /// Naming a bucket turns its index on.
     Run {
-        /// Buckets to scan; omit for the index-enabled buckets of the workspace.
+        /// Buckets to index; omit for the indexed buckets of the workspace.
         buckets: Vec<String>,
-        /// Scan every index-enabled bucket.
+        /// Scan every indexed bucket.
         #[arg(long, conflicts_with = "buckets")]
         all: bool,
         /// Rescan from the root and mark rows gone remotely as stale.
@@ -663,14 +637,11 @@ pub enum IndexCommand {
         /// `[<connection>/]<bucket>` or a `bkt_…` id.
         bucket: String,
     },
-    /// Purge records of deleted objects past their retention period.
+    /// Remove untagged catalog rows the last refresh no longer saw.
     Gc {
         /// Count without deleting.
         #[arg(long, short = 'n')]
         dry_run: bool,
-        /// Override the retention setting: plain seconds or 30m/1h/1d/2w.
-        #[arg(long)]
-        retention: Option<String>,
     },
 }
 

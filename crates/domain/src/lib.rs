@@ -8,14 +8,11 @@ pub mod bucket;
 pub mod clock;
 pub mod conflict;
 pub mod connection;
-pub mod contexts;
 pub mod duration;
 pub mod error;
-pub mod events;
 pub mod id;
 pub mod job;
 pub mod link;
-pub mod locator;
 pub mod outcome;
 pub mod policy;
 pub mod remote;
@@ -26,16 +23,12 @@ pub use bucket::{Bucket, BucketConfig};
 pub use clock::{Clock, SystemClock};
 pub use conflict::{ConflictDecision, ConflictProbe, Resolved};
 pub use connection::{AddressingStyle, ConnectionConfig, ConnectionTestStatus, Region};
-pub use contexts::BoundedContext;
 pub use error::{Error, ErrorCode, ErrorContext, Result};
-pub use events::{DomainEvent, EventEnvelope, MutationOperation, DOMAIN_EVENT_SCHEMA_VERSION};
 pub use id::{
-    BucketId, ConnectionId, EventId, IndexRunId, JobId, ReceiptId, RemoteObjectId, RepairId, TagId,
-    TypedId, WorkspaceId,
+    BucketId, ConnectionId, IndexRunId, JobId, RemoteObjectId, TagId, TypedId, WorkspaceId,
 };
 pub use job::{Job, JobItem, JobKind, JobState};
 pub use link::LinkProfile;
-pub use locator::RemoteLocator;
 pub use policy::ConflictPolicy;
 pub use remote::{FileType, ObjectPath, RemoteObject};
 pub use secret::{mask_secret, Secret};

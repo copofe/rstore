@@ -3,7 +3,7 @@
 //! workspace from `-w` or the current one. The batch arms render through the
 //! shared batch-report grammar.
 
-use rstore_application::{TagRef, UpdateTagInput, WorkspaceRef};
+use rstore_engine::{TagRef, UpdateTagInput, WorkspaceRef};
 
 use super::{Ctx, HandlerResult};
 use crate::args::TagCommand;
@@ -144,7 +144,7 @@ pub(super) async fn tag(ctx: &Ctx<'_>, action: &TagCommand) -> HandlerResult {
 /// their error as the detail line and drive the exit-13 policy.
 fn render_tag_batch(
     inputs: &[String],
-    outcomes: &rstore_application::BatchOutcome<()>,
+    outcomes: &rstore_engine::BatchOutcome<()>,
     success_marker: &str,
     data: serde_json::Value,
 ) -> HandlerResult {
@@ -183,9 +183,9 @@ fn render_tag_batch(
 }
 
 /// The projected failure message of one batch item, if it failed.
-fn failure_message(item: &rstore_application::ItemOutcome<()>) -> Option<String> {
+fn failure_message(item: &rstore_engine::ItemOutcome<()>) -> Option<String> {
     match &item.disposition {
-        rstore_application::Disposition::Failed(f) => Some(f.message.clone()),
+        rstore_engine::Disposition::Failed(f) => Some(f.message.clone()),
         _ => None,
     }
 }
@@ -193,9 +193,9 @@ fn failure_message(item: &rstore_application::ItemOutcome<()>) -> Option<String>
 /// `-` expands to one reference per stdin line; returns the references as
 /// written next to their expansions, in the same order.
 async fn expand_uris(
-    app: &rstore_application::ApplicationApi,
+    app: &rstore_engine::ApplicationApi,
     uris: &[String],
-) -> rstore_domain::Result<(Vec<String>, Vec<rstore_application::RemoteUri>)> {
+) -> rstore_domain::Result<(Vec<String>, Vec<rstore_engine::RemoteUri>)> {
     let inputs = super::tty::resolve_uris(
         uris,
         "pass at least one remote URI (or `-` to read them from stdin)",

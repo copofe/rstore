@@ -22,8 +22,9 @@ order is a development order, not a statement of product priority. The
 future GPUI desktop shares the same application core — no duplicated logic,
 and no direct SQLite or provider SDK access.
 
-The current desktop entry point wires bootstrap and obtains the application
-API only; job notifications and full pages are deferred.
+The current desktop entry point opens the engine runtime, obtains the
+application API, and subscribes to its event stream; full pages are deferred.
+The CLI and the desktop may run at the same time over one data directory.
 
 ## 3. Domain scope
 
@@ -64,10 +65,10 @@ API only; job notifications and full pages are deferred.
   relay, and recursive expansion.
 - Move verifies the target before deleting the source.
 - Delete supports batches, recursion, dry runs, exact confirmation counts,
-  bucket policy checks, and tombstones.
+  and bucket policy checks.
 - Ctrl+C persists an observable interrupted state; re-running the original
-  command resumes from checkpoints. The `task` commands never steer a live
-  transfer inside another process.
+  command resumes from checkpoints. `task cancel` reaches a running job in
+  any process sharing the data directory.
 
 ### 3.4 Access diagnostics
 
@@ -75,8 +76,8 @@ API only; job notifications and full pages are deferred.
   performs a write probe.
 - Capability probes cover listing, multipart upload, server-side copy, and
   presigning.
-- `doctor` summarizes connection health, adapter identity, job, outbox, and
-  repair status.
+- `doctor` summarizes connection health, adapter identity, interrupted jobs,
+  and stale catalog rows.
 - Unsupported capabilities return a distinct `CapabilityUnsupported` error.
 
 ## 4. CLI commands
@@ -102,8 +103,7 @@ registration or association and never touch remote data; `create`/`delete`
 manage local entities; only `rm` deletes remote objects.
 
 Short references expand to canonical strings first and resolve into
-`RemoteUri` afterwards; only flows that need stable catalog/outbox identity
-construct a `RemoteLocator`. Short-reference rules:
+`RemoteUri` afterwards. Short-reference rules:
 
 - `bucket/` or `connection/bucket/` is a directory reference.
 - `bucket/key` is an exact object.
@@ -131,35 +131,34 @@ ConfigApi
 
 APIs accept typed commands, queries, and service input types, and return
 domain types or application-facing pages, views, reports, and outcomes — for
-example `FilesPage`, `TransferReport`, and `RepairItem`. Neither entry point
-depends on repositories, SQLite, SQLx, the AWS SDK, or concrete service
-implementations.
+example `FilesPage`, `TransferReport`, and `CancelReport`. Neither entry point
+depends on repositories, SQLite, SQLx, or the AWS SDK. `ApplicationApi::events()`
+streams job lifecycle and progress plus catalog and tag changes as
+best-effort runtime messages.
 
 ## 6. Consistency
 
-SQLite writes serialize through a single bounded writer actor; reads use a
-read-only pool. WAL, foreign keys, busy timeouts, and transaction helpers
-define local boundaries. `UnitOfWork` currently carries exactly one
-operation: the remote mutation whose receipt and outbox fact commit together.
-
-Remote providers and SQLite share no cross-system transaction; a remote
-change flows through:
+The provider is the source of truth; the local catalog is a cache of every
+object of an indexed bucket plus any tagged object. Remote providers and SQLite
+share no transaction, and none is simulated. A remote change flows through:
 
 ```text
-job intent
+job row (leased)
 → remote operation
-→ RemoteMutationReceipt + outbox fact
-→ catalog follow-up
-→ repair item on failure
+→ catalog write-through (best-effort)
+→ item state persisted
 ```
 
-Outbox events carry event-id idempotency, aggregate ordering, backoff retry,
-failure records, and repair state. The first projection consumer re-verifies
-each settled mutation against the provider (`RemoteVerifyHandler` through the
-budgeted `Runtime::drain_outbox`, run before remote-facing CLI commands and at
-desktop startup): present objects acknowledge the fact, missing ones become
-repair rows, transient failures stay queued. Progress events are
-runtime-only and never become domain events.
+A succeeded remote change is never reported as failed because the cache could
+not follow; the item carries a note, and listings or index refreshes correct
+the row. Tags are user data: index toggles, rebuilds, and GC never drop them.
+
+SQLite runs in WAL mode with foreign keys and a busy timeout. Writes go
+through a single-connection pool (multi-statement writes in `BEGIN IMMEDIATE`
+transactions); reads use a read-only pool. Several processes may share one
+database; running jobs hold leases renewed by a heartbeat, so startup
+recovery interrupts only jobs whose process died, and a cancel request from
+another process reaches the owner at its next heartbeat.
 
 ## 7. Security
 
@@ -199,12 +198,13 @@ failed batches and 130 for interruptions.
 
 ## 9. Observability and recovery
 
-- Jobs persist at creation time, before any work starts.
-- Startup marks unresumable running jobs interrupted.
+- Jobs persist at creation time, before any work starts, and persist each
+  item as it settles.
+- Startup marks jobs whose lease lapsed interrupted; live jobs of other
+  processes keep running.
 - Multipart checkpoints record source size, mtime, and completed parts.
-- A remote success followed by a failed catalog follow-up keeps both the
-  receipt and a repair item.
-- `doctor`, `task list`, and `task show` surface pending repairs.
+- A remote success whose cache write failed carries a note in the item
+  detail; `doctor` reports stale catalog rows.
 
 ## 10. Non-goals
 

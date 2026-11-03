@@ -3,27 +3,24 @@
 
 use super::HandlerResult;
 use crate::output::HandlerOutput;
-use rstore_platform::AppDirs;
+use rstore_engine::AppDirs;
 
-/// Render the resolved application directories as a labeled detail view.
+/// Render where rstore keeps its files as a labeled detail view.
 pub(super) fn config_show(dirs: &AppDirs) -> HandlerResult {
     let data = super::json_value(dirs)?;
     let mut fields = super::format::Fields::new();
     fields
-        .header("Application directories:")
-        .push("config", dirs.config_dir.display())
-        .push("data", dirs.data_dir.display())
-        .push("cache", dirs.cache_dir.display())
-        .push("log", dirs.log_dir.display())
-        .push("db", dirs.db_path.display());
+        .header("rstore files:")
+        .push("database", dirs.db_path.display())
+        .push("logs", dirs.log_dir.display());
     Ok(HandlerOutput::human(fields.render()).with_data(data))
 }
 
-/// Report environment health: pending outbox and repair items, connection
-/// counts, database location, and storage adapter.
+/// Report environment health: stale catalog rows, connection counts,
+/// database location, and storage adapter.
 ///
-/// Pending repairs and interrupted jobs are surfaced as warnings on top of
-/// the detail view so they cannot scroll by unnoticed.
+/// Interrupted jobs are surfaced as a warning on top of the detail view so
+/// they cannot scroll by unnoticed.
 pub(super) async fn doctor(ctx: &super::Ctx<'_>) -> HandlerResult {
     let report = ctx.app.diagnostics().health().await;
 
@@ -32,8 +29,7 @@ pub(super) async fn doctor(ctx: &super::Ctx<'_>) -> HandlerResult {
     let mut fields = super::format::Fields::new();
     fields
         .header("rstore doctor")
-        .push("outbox pending", report.pending_outbox)
-        .push("repairs pending", report.pending_repairs)
+        .push("stale rows", report.stale_objects)
         .push(
             "connections",
             format!(
@@ -42,17 +38,9 @@ pub(super) async fn doctor(ctx: &super::Ctx<'_>) -> HandlerResult {
             ),
         )
         .push("database", &report.db_path)
-        .push("adapter", report.storage_adapter)
-        .push("tls default", "on")
-        .push("telemetry", "disabled");
+        .push("adapter", report.storage_adapter);
     let mut out = HandlerOutput::human(fields.render()).with_data(data);
 
-    if report.pending_repairs > 0 {
-        out = out.with_warning(format!(
-            "{} repair item(s) require attention — inspect with `task list` or `doctor`",
-            report.pending_repairs
-        ));
-    }
     if report.interrupted_jobs > 0 {
         out = out.with_warning(format!(
             "{} interrupted job(s) — re-run the original command to resume",
@@ -69,7 +57,7 @@ pub(super) async fn doctor(ctx: &super::Ctx<'_>) -> HandlerResult {
 /// Fails on serialization, file write, or any transfer-service error.
 pub(super) async fn config_export(
     out: Option<&str>,
-    app: &rstore_application::ApplicationApi,
+    app: &rstore_engine::ApplicationApi,
 ) -> HandlerResult {
     let bundle = app.config().export().await?;
     let json = serde_json::to_string_pretty(&bundle)
@@ -93,11 +81,11 @@ pub(super) async fn config_export(
 pub(super) async fn config_import(
     path: &str,
     dry_run: bool,
-    app: &rstore_application::ApplicationApi,
+    app: &rstore_engine::ApplicationApi,
 ) -> HandlerResult {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| rstore_domain::Error::io("read bundle").with_source(e))?;
-    let bundle: rstore_application::ConfigBundle = serde_json::from_str(&raw)
+    let bundle: rstore_engine::ConfigBundle = serde_json::from_str(&raw)
         .map_err(|e| rstore_domain::Error::invalid_input("parse bundle").with_source(e))?;
     let report = app.config().import(&bundle, dry_run).await?;
     let data = super::json_value(&report)?;

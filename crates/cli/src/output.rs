@@ -124,7 +124,7 @@ pub fn exit_code_for(error: &Error) -> i32 {
         ErrorCode::NotFound => 7,
         ErrorCode::Conflict => 8,
         ErrorCode::Checksum => 9,
-        ErrorCode::Database | ErrorCode::LockBusy | ErrorCode::DatabaseBusy => 10,
+        ErrorCode::Database | ErrorCode::DatabaseBusy => 10,
         ErrorCode::CapabilityUnsupported => 11,
         ErrorCode::Cancelled => 12,
         ErrorCode::Timeout => 6,

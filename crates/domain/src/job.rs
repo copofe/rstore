@@ -86,11 +86,6 @@ impl JobState {
         )
     }
 
-    /// Whether the state is actively consuming resources.
-    pub fn is_active(self) -> bool {
-        self == Self::Running
-    }
-
     /// Canonical token stored in the `state` column.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -136,7 +131,7 @@ impl JobState {
     pub fn transition(self, target: JobState) -> Result<JobState, Error> {
         use JobState::*;
         let allowed = match (self, target) {
-            // Bootstrap and run-control transitions.
+            // Start and run-control transitions.
             (Pending, Running) => true,
             (Pending, Cancelled) => true,
             // Startup recovery owns the gap between persistence and the first

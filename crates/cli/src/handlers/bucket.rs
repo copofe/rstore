@@ -2,10 +2,10 @@
 //! listing local or remote buckets, and the per-bucket settings, link
 //! profile, and index ignore rules.
 
-use rstore_application::{BucketRef, ConnectionRef, Disposition, NewBucket, UpdateBucketInput};
 use rstore_domain::bucket::BucketConfig;
 use rstore_domain::policy::ConflictPolicy;
 use rstore_domain::{Bucket, Result};
+use rstore_engine::{BucketRef, ConnectionRef, Disposition, NewBucket, UpdateBucketInput};
 
 use super::{Ctx, HandlerResult};
 use crate::args::{BucketAddArgs, BucketCommand, BucketEditArgs};
@@ -378,18 +378,16 @@ async fn edit(ctx: &Ctx<'_>, args: &BucketEditArgs) -> HandlerResult {
     Ok(HandlerOutput::human(human).with_data(data))
 }
 
-/// The one flags → [`rstore_application::LinkProfileInput`] translation for
+/// The one flags → [`rstore_engine::LinkProfileInput`] translation for
 /// `bucket edit`.
-fn link_input(
-    flags: &crate::args::LinkProfileFlags,
-) -> Result<rstore_application::LinkProfileInput> {
-    Ok(rstore_application::LinkProfileInput {
+fn link_input(flags: &crate::args::LinkProfileFlags) -> Result<rstore_engine::LinkProfileInput> {
+    Ok(rstore_engine::LinkProfileInput {
         public_base_url: flags.public_base.clone().map(Some),
         cdn_base_url: flags.cdn_base.clone().map(Some),
         allow_public_url: flags.public_url,
         allow_presigned: flags.presigned,
         default_ttl_seconds: match &flags.default_ttl {
-            Some(raw) => Some(rstore_application::parse_ttl(raw)?),
+            Some(raw) => Some(rstore_engine::parse_ttl(raw)?),
             None => None,
         },
     })

@@ -40,9 +40,7 @@ pub enum ErrorCode {
     Cancelled,
     /// Operation timed out.
     Timeout,
-    /// Another runtime holds the write lock.
-    LockBusy,
-    /// The bounded SQLite writer queue is full.
+    /// SQLite stayed locked by another process past the busy timeout.
     DatabaseBusy,
     /// Local filesystem failure (exit 14) — staged files, upload sources,
     /// download targets. Distinct from [`ErrorCode::Database`]: a full disk is
@@ -55,10 +53,7 @@ impl ErrorCode {
     pub fn is_retryable(self) -> bool {
         matches!(
             self,
-            ErrorCode::NetworkUnreachable
-                | ErrorCode::Timeout
-                | ErrorCode::LockBusy
-                | ErrorCode::DatabaseBusy
+            ErrorCode::NetworkUnreachable | ErrorCode::Timeout | ErrorCode::DatabaseBusy
         )
     }
 }
@@ -145,9 +140,6 @@ impl Error {
     }
     pub fn timeout(msg: impl Into<String>) -> Self {
         Self::new(ErrorCode::Timeout, msg)
-    }
-    pub fn lock_busy(msg: impl Into<String>) -> Self {
-        Self::new(ErrorCode::LockBusy, msg)
     }
     pub fn database_busy(msg: impl Into<String>) -> Self {
         Self::new(ErrorCode::DatabaseBusy, msg).retryable(true)
@@ -263,7 +255,6 @@ impl ErrorCode {
             ErrorCode::CapabilityUnsupported => "capability_unsupported",
             ErrorCode::Cancelled => "cancelled",
             ErrorCode::Timeout => "timeout",
-            ErrorCode::LockBusy => "lock_busy",
             ErrorCode::DatabaseBusy => "database_busy",
             ErrorCode::LocalIo => "local_io",
         }
@@ -289,7 +280,6 @@ impl ErrorCode {
             "capability_unsupported" => Ok(Self::CapabilityUnsupported),
             "cancelled" => Ok(Self::Cancelled),
             "timeout" => Ok(Self::Timeout),
-            "lock_busy" => Ok(Self::LockBusy),
             "database_busy" => Ok(Self::DatabaseBusy),
             "local_io" => Ok(Self::LocalIo),
             other => Err(Error::database(format!("unknown error code `{other}`"))),

@@ -145,8 +145,7 @@ pub(super) async fn rm(ctx: &Ctx<'_>, args: &RmArgs) -> HandlerResult {
     let entries = report.outcome.items().iter().map(|item| {
         let show_detail = matches!(
             item.disposition,
-            rstore_application::Disposition::Failed(_)
-                | rstore_application::Disposition::Blocked(_)
+            rstore_engine::Disposition::Failed(_) | rstore_engine::Disposition::Blocked(_)
         );
         super::report::BatchEntry {
             marker: super::report::remove_marker(&item.disposition).to_string(),
@@ -176,7 +175,7 @@ pub(super) async fn rm(ctx: &Ctx<'_>, args: &RmArgs) -> HandlerResult {
     if report.is_interrupted() {
         return Ok(out);
     }
-    if severity != rstore_application::Severity::AllOk {
+    if severity != rstore_engine::Severity::AllOk {
         return Ok(out.with_warning(format!(
             "{} not run, {} failed — see per-item details",
             report.outcome.not_run(),

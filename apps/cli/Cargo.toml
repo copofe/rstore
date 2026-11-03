@@ -12,9 +12,8 @@ path = "src/main.rs"
 
 [dependencies]
 rstore-cli.workspace = true
-rstore-bootstrap.workspace = true
+rstore-engine.workspace = true
 rstore-domain.workspace = true
-rstore-platform.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true

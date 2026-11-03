@@ -14,31 +14,33 @@ index folders into your buckets.
 
 - **Connections** — register any number of S3-compatible endpoints with stored
   credentials, per-check connection testing including an optional write probe,
-  and cached capability reports.
+  and live capability probes.
 - **Buckets** — discover remote buckets or register them manually (no
   ListBuckets permission required); per-bucket read-only and allow-delete
   guards enforced in the core before any adapter call.
 - **Workspaces** — group registered buckets, scope the catalog and tags to a
   team-visible subset, and manage bucket-wide ignore rules for indexing.
-- **Catalog & search** — index buckets with resumable scans, full-text path
-  search, keyset pagination, stale-object reconciliation, and tombstone GC.
-- **Tags** — workspace-scoped tag definitions with object associations,
-  batch attach/detach, merge, and copy/move tag preservation.
+- **Catalog & search** — opt-in per-bucket indexing with resumable scans,
+  full-text path search, keyset pagination, and stale-object reconciliation.
+  The catalog is a cache: the provider stays the source of truth.
+- **Tags** — workspace-scoped tags on any object, indexed or not, with batch
+  attach/detach, merge, and copy/move tag preservation; tag queries cover the
+  whole workspace.
 - **Transfers** — upload/download with streaming multipart at ≥ 8 MiB,
   SQLite part checkpoints, interrupt-safe resume (Ctrl+C → re-run), ranged
   chunked downloads with atomic `.part` promotion, conflict policies
   `ask | skip | overwrite | rename`, dry runs, recursion.
 - **Copy/move** — server-side copy within a connection (single-shot or part
   copy by size) and bounded-chunk relay across connections, preserving tags.
-- **Removal** — single and batch deletes with precomputed confirmation counts,
-  guard checks, and durable tombstones.
+- **Removal** — single and batch deletes with precomputed confirmation counts
+  and guard checks.
 - **Links** — public or presigned URLs derived from bucket link profiles and
   connection CDN/public base URLs.
-- **Reliable bookkeeping** — every remote mutation persists a receipt plus a
-  versioned outbox fact in one transaction; failed follow-ups become queryable
-  repair items instead of silent drift.
-- **Doctor** — one command reporting interrupted jobs, pending outbox events,
-  repairs, untested connections, and schema health.
+- **Shared data directory** — the CLI and the desktop (or two terminals) run
+  side by side; running jobs hold leases, show progress across processes, and
+  `task cancel` reaches them wherever they run.
+- **Doctor** — one command reporting interrupted jobs, stale catalog rows,
+  untested connections, and schema health.
 
 ## Installation
 
@@ -59,8 +61,8 @@ export RSTORE_HOME=/tmp/rstore-demo   # optional: portable data root
 rstore conn add prod --endpoint http://localhost:9000 --provider minio \
   --access-key AK --secret-key SK --buckets all
 
-# Index the workspace's buckets into the local catalog.
-rstore index run
+# Index a bucket to make it searchable (indexing is opt-in per bucket).
+rstore index run media
 
 # Everyday work. `cp` uploads, downloads, or copies remotely depending on
 # which side is local (`./…`) and which names a registered bucket.
@@ -104,7 +106,7 @@ docker run -d --rm -p 19000:9000 \
 
 RSTORE_MINIO_ENDPOINT=http://localhost:19000 \
 RSTORE_MINIO_ACCESS_KEY=minioadmin RSTORE_MINIO_SECRET_KEY=minioadmin \
-  cargo test -p rstore-storage-s3 --test minio -- --ignored --nocapture
+  cargo test -p rstore-storage --test minio -- --ignored --nocapture
 ```
 
 Interrupt-resume has been verified against MinIO with a 500 MiB multipart
@@ -112,14 +114,14 @@ upload interrupted by SIGINT and resumed byte-exact.
 
 ## Architecture in one paragraph
 
-One Application Core, two entry points. `crates/domain` holds entities, value
-objects, typed IDs, and the error model with zero I/O dependencies;
-`crates/application` orchestrates use cases over ports defined in
-`crates/application-ports` and `crates/storage-api`; `crates/persistence`
-(SQLite) and `crates/storage-s3` (AWS SDK) are swappable adapters behind those
-ports; `crates/bootstrap` is the sole composition root that opens the database
-and wires concrete implementations. Both the CLI and the future desktop
-consume the same context-oriented API. See the
+One engine, two entry points. `crates/domain` holds entities, value objects,
+typed IDs, and the error model with zero I/O dependencies; `crates/storage`
+is the provider-neutral `Storage` trait with the S3 adapter behind it;
+`crates/engine` holds the use cases, the SQLite store, the transfer engine,
+job leases, and the event stream, and its `Runtime` is the one place that
+opens the database. The catalog is a cache of indexed buckets and tagged
+objects; the provider stays the source of truth. Both the CLI and the future
+desktop consume the same context-oriented API. See the
 [architecture guide](docs/architecture-guide.md) for the crate map, dependency
 rules, and data-flow constraints.
 
@@ -127,9 +129,6 @@ rules, and data-flow constraints.
 
 - Applying the stored `--tls-verify=false` setting to a custom S3 TLS
   verifier (the flag is persisted; the adapter still uses the system default).
-- A *resident* outbox consumer loop (the budgeted drain before remote-facing
-  commands and the remote-verify projection exist; only a long-lived host
-  process is missing).
 - GPUI desktop pages; the desktop composition contract is present and
   exercised.
 

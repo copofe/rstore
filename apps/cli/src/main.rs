@@ -1,24 +1,20 @@
 //! `rstore` CLI entry point.
 //!
 //! Thin binary: parse → init tracing → resolve dirs → (for DB commands) run
-//! the full startup sequence ([`rstore_bootstrap::Runtime::open_locked`]:
-//! create dirs, write lock, migrate, recover) → for commands that reach the
-//! remote anyway, a budgeted outbox drain → dispatch via [`rstore_cli`] →
-//! render human/JSON and map to a stable exit code.
+//! the full startup sequence ([`rstore_engine::Runtime::open_in`]: create
+//! dirs, migrate, recover orphaned jobs) → dispatch via [`rstore_cli`] →
+//! render human/JSON and map to a stable exit code. Several processes may
+//! run against one data directory at once; running jobs hold leases.
 //!
 //! Command identity and the version renderer come from the library (single
 //! source); the envelope timestamp flows from the injected clock.
 
-use rstore_bootstrap::Runtime;
 use rstore_cli::args::{Cli, Command};
 use rstore_cli::output::{envelope, error_envelope, exit_code_for};
 use rstore_cli::{parse_command_line, resolve_dirs, version_output, HandlerResult};
 use rstore_domain::{Clock, SystemClock};
+use rstore_engine::Runtime;
 use time::OffsetDateTime;
-
-/// Longest a command waits on verifying earlier remote mutations before it
-/// runs; what is left waits for the next remote-facing command.
-const OUTBOX_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[tokio::main]
 async fn main() {
@@ -26,7 +22,7 @@ async fn main() {
     let dirs = resolve_dirs(&cli);
     init_tracing(&cli.log_level, &dirs);
 
-    // `version` needs no database; handle it before acquiring the lock.
+    // `version` needs no database; handle it before opening one.
     if let Command::Version = cli.command {
         emit(Ok(version_output()), &cli, &command, SystemClock.now());
         return;
@@ -34,25 +30,16 @@ async fn main() {
 
     let now = SystemClock.now();
 
-    // Full startup sequence: create data directories, acquire the
-    // cross-process write lock, open + migrate + recover. Startup failures
-    // flow through the same envelope and the single-source exit-code mapping
-    // as every other domain error.
-    let runtime = match Runtime::open_locked(&dirs).await {
+    // Full startup sequence: create data directories, open + migrate +
+    // recover. Startup failures flow through the same envelope and the
+    // single-source exit-code mapping as every other domain error.
+    let runtime = match Runtime::open_in(&dirs).await {
         Ok(runtime) => runtime,
         Err(e) => {
             emit(Err(e), &cli, &command, now);
             return;
         }
     };
-    // Verification of earlier mutations is housekeeping: a failure is logged
-    // and never blocks the command the user asked for.
-    if cli.command.reaches_remote() {
-        if let Err(error) = runtime.drain_outbox(OUTBOX_DRAIN_BUDGET).await {
-            tracing::warn!(%error, "outbox drain failed");
-        }
-    }
-
     // Ctrl+C: cancel the cooperative token; the running transfer persists its
     // checkpoints and reports state `interrupted`, which emit() turns into
     // exit 130.
@@ -80,7 +67,7 @@ async fn main() {
 /// Initialise structured logging: stderr for the console and a daily-rolling
 /// file under `log_dir` to bound disk usage. Progress and logs never go to
 /// stdout.
-fn init_tracing(level: &str, dirs: &rstore_platform::AppDirs) {
+fn init_tracing(level: &str, dirs: &rstore_engine::AppDirs) {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::prelude::*;
     use tracing_subscriber::util::SubscriberInitExt;

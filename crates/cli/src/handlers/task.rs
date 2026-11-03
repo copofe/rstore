@@ -6,14 +6,13 @@ use crate::output::HandlerOutput;
 // --- task ------------------------------------------------------------------
 
 pub(super) async fn task(ctx: &Ctx<'_>, action: &crate::args::TaskCommand) -> HandlerResult {
-    use rstore_application::JobRef;
+    use rstore_engine::JobRef;
 
     let svc = ctx.app.jobs();
     match action {
         crate::args::TaskCommand::List => {
             let jobs = svc.list().await?;
-            let repairs = svc.pending_repairs().await?;
-            let data = serde_json::json!({"jobs": jobs, "repairs": repairs});
+            let data = serde_json::json!({"jobs": jobs});
             let mut table = super::format::Table::new(
                 &["#", "STATE", "KIND", "ITEMS", "ID"],
                 &[
@@ -34,17 +33,11 @@ pub(super) async fn task(ctx: &Ctx<'_>, action: &crate::args::TaskCommand) -> Ha
                     format!("{id_short}…"),
                 ]);
             }
-            let mut human = super::format::listing(
+            let human = super::format::listing(
                 "Jobs (newest first):",
                 "No jobs recorded yet. Uploads/downloads create them.",
                 table,
             );
-            if !repairs.is_empty() {
-                human.push_str(&format!(
-                    "Pending repairs: {} (inspect `doctor` for details)\n",
-                    repairs.len()
-                ));
-            }
             Ok(HandlerOutput::human(human).with_data(data))
         }
         crate::args::TaskCommand::Show { job, errors } => {
@@ -85,12 +78,17 @@ pub(super) async fn task(ctx: &Ctx<'_>, action: &crate::args::TaskCommand) -> Ha
             Ok(HandlerOutput::human(human).with_data(data))
         }
         crate::args::TaskCommand::Cancel { job } => {
-            let job = svc.cancel(&JobRef::parse(job)?).await?;
-            let data = super::json_value(&job)?;
+            let report = svc.cancel(&JobRef::parse(job)?).await?;
+            let data = super::json_value(&report)?;
+            let verb = if report.requested {
+                "Cancel requested for"
+            } else {
+                "Cancelled"
+            };
             Ok(HandlerOutput::human(format!(
-                "Cancelled job {} ({})\n",
-                job.id,
-                job.kind.as_str()
+                "{verb} job {} ({})\n",
+                report.job.id,
+                report.job.kind.as_str()
             ))
             .with_data(data))
         }

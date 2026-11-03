@@ -87,7 +87,7 @@ the test and the interactive choice.
 
 **Credential storage**
 
-- Keys are written into the connection row of the local SQLite catalog.
+- Keys are written into the connection row of the local database (`rstore.db`).
 - Terminals prompt with hidden input when both key flags are omitted;
   non-interactive runs and `--json` never prompt.
 - `conn show` masks everything but the first and last characters.
@@ -167,24 +167,27 @@ Ctrl+C is safe at any point: progress persists as an interrupted job, and
 re-running the same command resumes.
 
 `mv` safety order: copy → verify target size → delete source. A failed
-verification leaves the source untouched. `rm` persists tombstones into the
-catalog and is itself an interruptible job.
+verification leaves the source untouched. `rm` drops the object's catalog
+row and tags, and is itself an interruptible job.
 
 ### 5. Indexing the catalog
 
-Indexing scans buckets into the SQLite catalog that `find` and `tag` read.
+Indexing scans buckets into the SQLite catalog so `find` can search them by
+name and attributes. It is opt-in per bucket and off by default: naming a
+bucket in `index run` switches its index on (`bucket edit B --index=false`
+switches it off and drops its untagged rows). Tags need no index.
 
 ```sh
-rstore index run                           # index-enabled buckets of the workspace
-rstore index run media photos              # just these
-rstore index run --all                     # every index-enabled bucket
+rstore index run media photos              # index these (switches them on)
+rstore index run                           # refresh the workspace's indexed buckets
+rstore index run --all                     # every indexed bucket
 rstore index run media --refresh           # rescan; rows gone remotely turn stale
-rstore index run media --rebuild -y        # drop rows and rescan (tags survive)
+rstore index run media --rebuild -y        # drop untagged rows and rescan
 
 rstore index status                        # catalog totals + per-bucket state
 rstore index cancel media                  # drop a paused scan's checkpoint
-rstore index gc -n                         # preview tombstone purge (30-day default)
-rstore index gc --retention 7d -y
+rstore index gc -n                         # count untagged stale rows
+rstore index gc -y                         # remove them (tagged rows stay)
 ```
 
 Ctrl+C pauses the running scan at a checkpoint and skips the remaining
@@ -231,6 +234,12 @@ rstore tag edit brand --color ff0000 --description "Brand assets"
 rstore tag merge old-name new-name -y              # source tag is deleted
 rstore tag delete draft -y
 ```
+
+Any object can be tagged, indexed or not: `tag add` confirms the object
+exists (a live `stat` when the catalog does not know it yet). Tag queries
+therefore cover the whole workspace, while a name or attribute search covers
+indexed buckets only — `find` lists the buckets it could not search under
+`not indexed:` (`unindexed` in JSON).
 
 A tag created by `tag add` is reported as a warning, so a mistyped name is
 noticed. Creation waits until an object resolves: a batch that tags nothing
@@ -279,21 +288,24 @@ and adapter support and reports `capability_unsupported` otherwise.
 Every `cp`/`mv`/`rm` is a persisted job:
 
 ```sh
-rstore task list                 # newest first; repair counts when present
-rstore task show                 # the newest job
+rstore task list                 # newest first
+rstore task show                 # the newest job; items update while it runs
 rstore task show 3 --errors      # by ordinal or job_… id, with failure details
-rstore task cancel 3             # retire an unfinished job
+rstore task cancel 3             # cancel an unfinished job, wherever it runs
 ```
 
-To resume, re-issue the original command — transfers continue from their
-checkpoints. One rstore process runs per data directory, so a job cannot be
-paused from another terminal; stop it with Ctrl+C.
+Several rstore processes may share one data directory. A running job holds a
+lease its process renews; `task cancel` on a job another process runs asks
+that process to stop at its next checkpoint (within about ten seconds) and the
+job ends `cancelled`. A job whose process died is marked `interrupted` the
+next time rstore starts. To resume an interrupted transfer, re-issue the
+original command — transfers continue from their checkpoints.
 
 ### 10. Diagnostics, configuration, migration
 
 ```sh
-rstore doctor          # adapter, connections (+untested), outbox/repairs, interrupts
-rstore config show     # data/config/cache/log directories and db path
+rstore doctor          # adapter, connections (+untested), stale rows, interrupts
+rstore config show     # database and log locations
 
 # Machine migration/backup of the registry — never contains credentials.
 rstore config export > bundle.json
@@ -326,7 +338,7 @@ can change what a command does.
 
 ## Command reference
 
-Global options on every command: `--config <PATH>` (data root),
+Global options on every command: `--home <PATH>` (data root, env `RSTORE_HOME`),
 `--log-level <LEVEL>` (default `warn`), `--json`, `-q/--quiet`,
 `-w/--workspace <WS>` (env `RSTORE_WORKSPACE`), `-y/--yes`.
 
@@ -361,11 +373,11 @@ Global options on every command: `--config <PATH>` (data root),
 | `workspace show` / `edit` | The target workspace | edit: `--name` `--description` |
 | `workspace delete WS` | Delete a workspace | destructive |
 | `workspace add\|remove BUCKET…` | Membership | |
-| `index run [BUCKET…]` | Scan into the catalog | `--all` `--refresh` `--rebuild` (destructive) |
+| `index run [BUCKET…]` | Scan into the catalog; naming a bucket switches its index on | `--all` `--refresh` `--rebuild` (destructive) |
 | `index status` | Totals and per-bucket state | |
 | `index cancel BUCKET` | Drop a paused scan's checkpoint | |
-| `index gc` | Purge tombstones | `-n` `--retention 30m/1h/1d/2w/seconds` (max 365d); destructive |
-| `task list` / `task show [JOB]` / `task cancel JOB` | Jobs | show: `--errors`; ordinals accepted |
+| `index gc` | Remove untagged stale rows | `-n`; destructive |
+| `task list` / `task show [JOB]` / `task cancel JOB` | Jobs; cancel reaches other processes | show: `--errors`; ordinals accepted |
 | `config show\|export\|import` | Local configuration | export `--out`; import `-n` |
 | `doctor` | Health report | |
 | `version` | Version | |
@@ -374,10 +386,17 @@ Global options on every command: `--config <PATH>` (data root),
 
 | Contents | Location |
 |---|---|
-| Catalog (connections, buckets, workspaces, tags, index, jobs) | `catalog.db` (SQLite, WAL) — see `rstore config show` |
-| Credentials | The connection table inside the catalog database |
-| Current workspace | The `workspace.current` setting inside the catalog database |
-| Logs | `<log dir>/` (daily rolling) |
+| Connections, buckets, workspaces, tags, jobs, and the catalog cache | `rstore.db` (SQLite, WAL) |
+| Credentials | The connection table inside `rstore.db` |
+| Current workspace | The `workspace.current` setting inside `rstore.db` |
+| Logs | The log directory, rolling daily |
+
+Default locations — macOS: `~/Library/Application Support/rstore/rstore.db`,
+logs in `~/Library/Logs/rstore`; Linux: `~/.local/share/rstore/rstore.db`,
+logs in `~/.local/state/rstore`; Windows: `%LOCALAPPDATA%\rstore\rstore.db`,
+logs in `%LOCALAPPDATA%\rstore\log`. `--home <PATH>` or `RSTORE_HOME` moves
+both under one directory (`<PATH>/rstore.db`, `<PATH>/log/`); `rstore config
+show` prints the resolved paths.
 
 ### Troubleshooting
 

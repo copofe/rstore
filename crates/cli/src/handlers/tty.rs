@@ -7,10 +7,10 @@
 
 use std::io::{IsTerminal, Write};
 
-use rstore_application::CredentialInput;
 use rstore_domain::policy::ConflictPolicy;
 use rstore_domain::Secret;
 use rstore_domain::{Error, Result};
+use rstore_engine::CredentialInput;
 
 use crate::args::ConnectionAddArgs;
 

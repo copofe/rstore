@@ -14,12 +14,12 @@ pub(super) async fn url(ctx: &Ctx<'_>, args: &crate::args::UrlArgs) -> HandlerRe
     // line — the exit-13 policy still rides the batch severity.)
     let inputs = super::tty::resolve_uris(&args.references, "url needs at least one remote URI")?;
     let uris = super::expand_remote_batch(app, &inputs).await?;
-    let format = rstore_application::LinkFormat::parse(&args.format)?;
+    let format = rstore_engine::LinkFormat::parse(&args.format)?;
     let ttl = match &args.ttl {
-        Some(raw) => Some(rstore_application::parse_ttl(raw)?),
+        Some(raw) => Some(rstore_engine::parse_ttl(raw)?),
         None => None,
     };
-    let request = rstore_application::LinkRequest {
+    let request = rstore_engine::LinkRequest {
         format,
         // A lifetime only means something for a presigned link.
         signed: args.signed || args.ttl.is_some(),
@@ -40,7 +40,7 @@ pub(super) async fn url(ctx: &Ctx<'_>, args: &crate::args::UrlArgs) -> HandlerRe
                 links.push(super::json_value(link)?);
             }
             None => match &item.disposition {
-                rstore_application::Disposition::Failed(failure) => {
+                rstore_engine::Disposition::Failed(failure) => {
                     // Diagnostics go to stderr: stdout stays one pipeable
                     // link per line even in mixed batches.
                     errors.push(format!("error: {input}: {}\n", failure.message));

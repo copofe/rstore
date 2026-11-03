@@ -3,7 +3,7 @@
 //! One parser for every such flag: plain seconds (`30`) or unit sums
 //! (`1h30m`) over the caller's allowed unit set, overflow-checked and
 //! bounded. Callers decide the unit set and the bound — presign TTLs cap at
-//! S3's seven days, tombstone retention at a year.
+//! S3's seven days.
 
 use crate::{Error, Result};
 

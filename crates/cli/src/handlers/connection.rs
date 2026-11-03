@@ -5,12 +5,12 @@ use super::tty::{read_credential_input, read_edit_credential_input};
 use super::{Ctx, HandlerResult};
 use crate::args::{ConnectionAddArgs, ConnectionCommand};
 use crate::output::HandlerOutput;
-use rstore_application::{
+use rstore_domain::connection::{AddressingStyle, ConnectionTestStatus, Region};
+use rstore_domain::ConnectionConfig;
+use rstore_engine::{
     AddConnectionInput, ConnectionRef, ConnectionTestReport, NewBucket, ProviderPreset,
     UpdateConnectionInput,
 };
-use rstore_domain::connection::{AddressingStyle, ConnectionTestStatus, Region};
-use rstore_domain::ConnectionConfig;
 
 fn masked_credential(value: Option<&rstore_domain::Secret<String>>) -> String {
     value

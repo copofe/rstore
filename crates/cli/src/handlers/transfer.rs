@@ -6,7 +6,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 
-use rstore_application::{
+use rstore_engine::{
     BatchDownloadCommand, BatchDownloadReport, NullProgressSink, Progress, ProgressSink, RemoteUri,
     RunControl, RunOptions, TransferConfig, TransferReport, TransferRoute,
 };
@@ -167,7 +167,7 @@ async fn upload(
     target: RemoteUri,
 ) -> HandlerResult {
     let conflict = conflict_policy(ctx, args, Some(&target)).await?;
-    let plan = rstore_application::UploadPlan {
+    let plan = rstore_engine::UploadPlan {
         connection: target.connection,
         bucket: target.bucket,
         prefix: target.key,
@@ -180,7 +180,7 @@ async fn upload(
         .app
         .transfer()
         .run_upload(
-            &rstore_application::UploadObjectsCommand {
+            &rstore_engine::UploadObjectsCommand {
                 plan,
                 options: run_options(args),
             },
@@ -199,9 +199,9 @@ async fn download(
     sources: &[RemoteUri],
     target: PathBuf,
 ) -> HandlerResult {
-    let mode = rstore_application::classify_download(sources.len(), &target)?;
+    let mode = rstore_engine::classify_download(sources.len(), &target)?;
     let conflict = conflict_policy(ctx, args, None).await?;
-    let mut plans = rstore_application::download_plans(sources, target, conflict, args.recursive);
+    let mut plans = rstore_engine::download_plans(sources, target, conflict, args.recursive);
     let options = run_options(args);
     let progress = progress_sink(ctx, args, "download");
     let control = RunControl {
@@ -209,7 +209,7 @@ async fn download(
         cancel: ctx.cancel,
     };
     match mode {
-        rstore_application::DownloadMode::Batch => {
+        rstore_engine::DownloadMode::Batch => {
             // One child job per source; results aggregate at the
             // application seam.
             let report = ctx
@@ -219,7 +219,7 @@ async fn download(
                 .await?;
             render_batch_download_report(report, args.dry_run)
         }
-        rstore_application::DownloadMode::Single => {
+        rstore_engine::DownloadMode::Single => {
             let plan = plans
                 .pop()
                 .ok_or_else(|| Error::invalid_input("download needs a remote source reference"))?;
@@ -227,7 +227,7 @@ async fn download(
                 .app
                 .transfer()
                 .run_download(
-                    &rstore_application::DownloadObjectsCommand { plan, options },
+                    &rstore_engine::DownloadObjectsCommand { plan, options },
                     control,
                 )
                 .await?;
@@ -244,21 +244,21 @@ async fn remote_copy(
     is_move: bool,
 ) -> HandlerResult {
     let conflict = conflict_policy(ctx, args, Some(&target)).await?;
-    let options = rstore_application::CopyOptions {
+    let options = rstore_engine::CopyOptions {
         dry_run: args.dry_run,
         conflict,
         recursive: args.recursive,
         keep_tags: args.keep_tags,
         config: TransferConfig::default(),
     };
-    let pairs: Vec<rstore_application::CopyPair> = sources
+    let pairs: Vec<rstore_engine::CopyPair> = sources
         .into_iter()
-        .map(|source| rstore_application::CopyPair {
+        .map(|source| rstore_engine::CopyPair {
             source,
             target: target.clone(),
         })
         .collect();
-    let command = rstore_application::CopyObjectsCommand { pairs, options };
+    let command = rstore_engine::CopyObjectsCommand { pairs, options };
     let label = if is_move { "moving" } else { "copying" };
     let progress = progress_sink(ctx, args, label);
     let control = RunControl {

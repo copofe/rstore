@@ -4,21 +4,24 @@ members = [
     "apps/cli",
     "apps/desktop",
     "crates/domain",
-    "crates/application-ports",
-    "crates/application",
-    "crates/bootstrap",
-    "crates/storage-api",
-    "crates/storage-s3",
-    "crates/catalog",
-    "crates/persistence",
-    "crates/transfer",
-    "crates/platform",
+    "crates/storage",
+    "crates/engine",
     "crates/cli",
     "ui/ui-kit",
     "ui/desktop-ui",
     "xtask",
 ]
-default-members = ["apps/cli"]
+default-members = [
+    "apps/cli",
+    "apps/desktop",
+    "crates/domain",
+    "crates/storage",
+    "crates/engine",
+    "crates/cli",
+    "ui/ui-kit",
+    "ui/desktop-ui",
+    "xtask",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -75,15 +78,8 @@ rpassword = "7"
 
 # Internal crates (paths)
 rstore-domain = { path = "crates/domain" }
-rstore-application-ports = { path = "crates/application-ports" }
-rstore-bootstrap = { path = "crates/bootstrap" }
-rstore-application = { path = "crates/application" }
-rstore-storage-api = { path = "crates/storage-api" }
-rstore-storage-s3 = { path = "crates/storage-s3" }
-rstore-catalog = { path = "crates/catalog" }
-rstore-persistence = { path = "crates/persistence" }
-rstore-transfer = { path = "crates/transfer" }
-rstore-platform = { path = "crates/platform" }
+rstore-storage = { path = "crates/storage" }
+rstore-engine = { path = "crates/engine" }
 rstore-cli = { path = "crates/cli" }
 
 [workspace.lints.rust]

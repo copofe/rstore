@@ -18,7 +18,8 @@ pub struct BucketConfig {
     pub read_only: bool,
     /// Whether destructive operations are allowed.
     pub allow_delete: bool,
-    /// Whether this bucket participates in the index.
+    /// Whether this bucket is indexed (searchable by name and attributes).
+    /// Off by default: indexing is an explicit opt-in per bucket.
     pub index_enabled: bool,
     /// Default conflict policy for transfers into this bucket.
     pub default_conflict: ConflictPolicy,
@@ -32,7 +33,7 @@ impl Default for BucketConfig {
             display_name: None,
             read_only: false,
             allow_delete: true,
-            index_enabled: true,
+            index_enabled: false,
             default_conflict: ConflictPolicy::Ask,
             concurrency: None,
         }
