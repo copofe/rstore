@@ -156,7 +156,7 @@ impl References {
                 name: reference.to_string(),
             }),
             [] => Err(Error::invalid_input(
-                "no connection is registered; add one before registering buckets",
+                "no connection is registered; add one first: `rstore connection add`",
             )),
             _ => Err(Error::invalid_input(format!(
                 "several connections are registered; name the bucket as `<connection>/{reference}`"

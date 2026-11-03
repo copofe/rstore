@@ -342,7 +342,8 @@ pub enum TagCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum ConnectionCommand {
-    /// Register a connection, test it, and register its buckets.
+    /// Register a connection, test it, and register its buckets; on a
+    /// terminal, asks for whatever is omitted.
     Add(ConnectionAddArgs),
     /// List connections, optionally filtered by a name/endpoint substring.
     List {
@@ -353,15 +354,13 @@ pub enum ConnectionCommand {
     Show {
         /// Connection name or `conn_…` id.
         connection: String,
-        /// Include the probed capability report.
-        #[arg(long)]
-        capabilities: bool,
     },
     /// Probe a connection: credentials, endpoint/auth, ListBuckets.
     Test {
         /// Connection name or `conn_…` id.
         connection: String,
-        /// Also write and clean up a temporary object.
+        /// Also put and delete a temporary object in each registered bucket
+        /// that allows writes and deletes; read-only buckets are never touched.
         #[arg(long)]
         write: bool,
     },
@@ -376,24 +375,28 @@ pub enum ConnectionCommand {
 
 #[derive(Args, Debug)]
 pub struct ConnectionAddArgs {
-    /// Unique, human-friendly connection name.
-    pub name: String,
-    /// S3 API endpoint URL.
+    /// Unique, human-friendly connection name. Asked on a terminal when
+    /// omitted.
+    pub name: Option<String>,
+    /// S3 API endpoint URL. Asked on a terminal when omitted.
     #[arg(long)]
-    pub endpoint: String,
+    pub endpoint: Option<String>,
     /// Provider preset that fills defaults: aws, r2, minio, supabase, generic.
     #[arg(long)]
     pub provider: Option<String>,
-    /// Region (`auto` or an explicit region like `us-east-1`).
-    #[arg(long, default_value = "auto")]
-    pub region: String,
+    /// Region (`auto` or an explicit region like `us-east-1`); `auto` when
+    /// omitted, asked on a terminal for providers that need it.
+    #[arg(long)]
+    pub region: Option<String>,
     /// Addressing style: auto, path, virtual-host (overrides `--provider`).
     #[arg(long)]
     pub addressing_style: Option<String>,
-    /// Base URL for public objects; an empty value leaves it unset.
+    /// Public root serving every bucket under `/<bucket>` (Supabase:
+    /// `…/storage/v1/object/public`); an empty value leaves it unset.
     #[arg(long)]
     pub public_base: Option<String>,
-    /// Default CDN/proxy delivery base; an empty value leaves it unset.
+    /// CDN root serving every bucket under `/<bucket>`, preferred over the
+    /// public base; an empty value leaves it unset.
     #[arg(long)]
     pub cdn_base: Option<String>,
     /// TLS certificate verification (`--tls-verify=false` disables it; not recommended).
@@ -432,10 +435,12 @@ pub struct ConnectionEditArgs {
     /// Addressing style: auto, path, virtual-host (overrides `--provider`).
     #[arg(long)]
     pub addressing_style: Option<String>,
-    /// Base URL for public objects; an empty value clears it.
+    /// Public root serving every bucket under `/<bucket>`; an empty value
+    /// clears it.
     #[arg(long)]
     pub public_base: Option<String>,
-    /// Default CDN/proxy delivery base; an empty value clears it.
+    /// CDN root serving every bucket under `/<bucket>`, preferred over the
+    /// public base; an empty value clears it.
     #[arg(long)]
     pub cdn_base: Option<String>,
     /// TLS certificate verification (tri-state: absent = unchanged).
@@ -480,8 +485,8 @@ pub enum BucketCommand {
 #[derive(Args, Debug)]
 pub struct BucketAddArgs {
     /// `[<connection>/]<bucket>`; the connection may be omitted while only
-    /// one is registered.
-    #[arg(required = true)]
+    /// one is registered. Omitted on a terminal → choose from the buckets
+    /// the connection can see.
     pub buckets: Vec<String>,
     /// Refuse all writes to these buckets.
     #[arg(long)]
@@ -489,9 +494,6 @@ pub struct BucketAddArgs {
     /// Forbid deletions.
     #[arg(long)]
     pub no_delete: bool,
-    /// Leave these buckets out of indexing.
-    #[arg(long)]
-    pub no_index: bool,
     /// Default conflict policy: ask, skip, overwrite, rename.
     #[arg(long, default_value = "ask")]
     pub conflict: String,
@@ -536,11 +538,12 @@ pub struct BucketEditArgs {
 /// The bucket link-profile flags of `bucket edit`.
 #[derive(Args, Debug, Default)]
 pub struct LinkProfileFlags {
-    /// Public-object base override for this bucket; an empty value clears it.
+    /// URL serving this bucket's root (custom domain, r2.dev address, …);
+    /// overrides the connection's. An empty value clears it.
     #[arg(long)]
     pub public_base: Option<String>,
-    /// CDN/custom-domain base, preferred over the public base; an empty value
-    /// clears it.
+    /// CDN URL serving this bucket's root, preferred over the public base;
+    /// an empty value clears it.
     #[arg(long)]
     pub cdn_base: Option<String>,
     /// Allow plain public URLs; `=false` blocks them.
@@ -578,8 +581,9 @@ pub enum WorkspaceCommand {
     },
     /// Create a workspace; it becomes current when none is selected.
     Create {
-        /// Unique workspace name.
-        name: String,
+        /// Unique workspace name. Omitted on a terminal → asked, along with
+        /// the description and buckets.
+        name: Option<String>,
         #[arg(long)]
         description: Option<String>,
     },
@@ -600,8 +604,8 @@ pub enum WorkspaceCommand {
     },
     /// Add buckets to the workspace.
     Add {
-        /// `[<connection>/]<bucket>` or `bkt_…` ids.
-        #[arg(required = true)]
+        /// `[<connection>/]<bucket>` or `bkt_…` ids. Omitted on a terminal →
+        /// choose from the registered buckets.
         buckets: Vec<String>,
     },
     /// Remove buckets from the workspace.

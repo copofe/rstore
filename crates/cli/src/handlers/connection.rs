@@ -1,7 +1,8 @@
 //! `connection …` handlers (CON-). `connection add` is the one-step setup:
-//! register, test, then register buckets into the workspace.
+//! ask for what was omitted, register, test, then register buckets into the
+//! workspace.
 
-use super::tty::{read_credential_input, read_edit_credential_input};
+use super::tty::{read_credential_input, read_edit_credential_input, Session};
 use super::{Ctx, HandlerResult};
 use crate::args::{ConnectionAddArgs, ConnectionCommand};
 use crate::output::HandlerOutput;
@@ -22,14 +23,16 @@ fn masked_credential(value: Option<&rstore_domain::Secret<String>>) -> String {
 /// provider preset; `None` when neither was given.
 fn addressing_style(
     explicit: Option<&str>,
-    provider: Option<&str>,
+    provider: Option<ProviderPreset>,
 ) -> rstore_domain::Result<Option<AddressingStyle>> {
     if let Some(token) = explicit {
         return AddressingStyle::parse(token).map(Some);
     }
-    provider
-        .map(|token| ProviderPreset::parse(token).map(ProviderPreset::addressing_style))
-        .transpose()
+    Ok(provider.map(ProviderPreset::addressing_style))
+}
+
+fn provider(token: Option<&str>) -> rstore_domain::Result<Option<ProviderPreset>> {
+    token.map(ProviderPreset::parse).transpose()
 }
 
 /// One line per probe, headed by the verdict.
@@ -90,17 +93,8 @@ pub(super) async fn connection(ctx: &Ctx<'_>, action: &ConnectionCommand) -> Han
             );
             Ok(HandlerOutput::human(human).with_data(data))
         }
-        ConnectionCommand::Show {
-            connection,
-            capabilities,
-        } => {
-            let reference = ConnectionRef::parse(connection);
-            let config = svc.resolve(&reference).await?;
-            let capability_report = if *capabilities {
-                Some(ctx.app.diagnostics().capabilities(&reference).await?)
-            } else {
-                None
-            };
+        ConnectionCommand::Show { connection } => {
+            let config = svc.resolve(&ConnectionRef::parse(connection)).await?;
             let access_key = masked_credential(config.access_key.as_ref());
             let secret_key = masked_credential(config.secret_key.as_ref());
             let mut data = super::json_value(&config)?;
@@ -114,14 +108,6 @@ pub(super) async fn connection(ctx: &Ctx<'_>, action: &ConnectionCommand) -> Han
                     serde_json::Value::String(secret_key.clone()),
                 );
             }
-            let data = super::merge_field(
-                data,
-                "capabilities",
-                capability_report
-                    .as_ref()
-                    .map(super::json_value)
-                    .transpose()?,
-            )?;
             let mut fields = super::format::Fields::new();
             fields
                 .header(&config.name)
@@ -155,25 +141,6 @@ pub(super) async fn connection(ctx: &Ctx<'_>, action: &ConnectionCommand) -> Han
                         _ => "never".to_string(),
                     }
                 });
-            if let Some(report) = &capability_report {
-                fields.push_lines(
-                    "capabilities",
-                    report
-                        .entries
-                        .iter()
-                        .map(|(name, state)| {
-                            format!(
-                                "{:<18} {}",
-                                name,
-                                serde_json::to_value(state)
-                                    .unwrap_or_default()
-                                    .as_str()
-                                    .unwrap_or("?")
-                            )
-                        })
-                        .collect(),
-                );
-            }
             Ok(HandlerOutput::human(fields.render()).with_data(data))
         }
         ConnectionCommand::Test { connection, write } => {
@@ -205,7 +172,7 @@ pub(super) async fn connection(ctx: &Ctx<'_>, action: &ConnectionCommand) -> Han
                 region: args.region.as_deref().map(Region::parse_token),
                 addressing_style: addressing_style(
                     args.addressing_style.as_deref(),
-                    args.provider.as_deref(),
+                    provider(args.provider.as_deref())?,
                 )?,
                 tls_verify: args.tls_verify,
                 credentials,
@@ -229,29 +196,94 @@ pub(super) async fn connection(ctx: &Ctx<'_>, action: &ConnectionCommand) -> Han
     }
 }
 
+/// What `connection add` registers once the omitted parts are filled in.
+struct Setup {
+    name: String,
+    endpoint: String,
+    provider: Option<ProviderPreset>,
+    region: Region,
+}
+
+/// Fill in what `connection add` was not given. A terminal is asked —
+/// provider first, so the region and endpoint questions follow its shape;
+/// anywhere else NAME and `--endpoint` are required.
+fn setup(args: &ConnectionAddArgs, session: &Session) -> rstore_domain::Result<Setup> {
+    let mut provider = provider(args.provider.as_deref())?;
+    if !session.is_interactive() {
+        let (Some(name), Some(endpoint)) = (&args.name, &args.endpoint) else {
+            return Err(rstore_domain::Error::invalid_input(
+                "`connection add` needs NAME and --endpoint when it cannot prompt",
+            ));
+        };
+        return Ok(Setup {
+            name: name.clone(),
+            endpoint: endpoint.clone(),
+            provider,
+            region: Region::parse_token(args.region.as_deref().unwrap_or_default()),
+        });
+    }
+    let name = match &args.name {
+        Some(name) => name.clone(),
+        None => super::tty::ask("Connection name", None, session)?,
+    };
+    if provider.is_none() && args.endpoint.is_none() {
+        let labels: Vec<String> = ProviderPreset::ALL
+            .iter()
+            .map(|preset| preset.label().to_string())
+            .collect();
+        provider = Some(ProviderPreset::ALL[super::tty::choose("Provider:", &labels, session)?]);
+    }
+    let region = match &args.region {
+        Some(token) => Region::parse_token(token),
+        None if provider.is_some_and(ProviderPreset::needs_region) => {
+            Region::parse_token(&super::tty::ask("Region (like us-east-1)", None, session)?)
+        }
+        None => Region::Auto,
+    };
+    let endpoint = match &args.endpoint {
+        Some(endpoint) => endpoint.clone(),
+        None => {
+            let preset = provider.unwrap_or(ProviderPreset::Generic);
+            match preset.default_endpoint(&region) {
+                Some(default) => super::tty::ask("Endpoint", Some(&default), session)?,
+                None => super::tty::ask(
+                    &format!("Endpoint (like {})", preset.endpoint_example()),
+                    None,
+                    session,
+                )?,
+            }
+        }
+    };
+    Ok(Setup {
+        name,
+        endpoint,
+        provider,
+        region,
+    })
+}
+
 /// `connection add`: register the connection, test it (unless `--no-test`
 /// or no credentials), then register buckets — the `--buckets` list, every
 /// visible bucket for `all`, or a choice from the discovered ones on a
 /// terminal. Each step after the registration degrades to a warning: the
 /// connection exists either way.
 async fn add(ctx: &Ctx<'_>, args: &ConnectionAddArgs) -> HandlerResult {
-    let credentials = read_credential_input(args, &ctx.session)?;
+    let setup = setup(args, &ctx.session)?;
+    let provider = setup.provider;
+    let credentials = read_credential_input(args, &setup.name, &ctx.session)?;
     let has_credentials = credentials.is_some();
     let config = ctx
         .app
         .registry()
         .connections()
         .add(AddConnectionInput {
-            name: args.name.clone(),
-            endpoint: args.endpoint.clone(),
+            name: setup.name,
+            endpoint: setup.endpoint,
             public_base_url: args.public_base.clone(),
             cdn_base_url: args.cdn_base.clone(),
-            region: Region::parse_token(&args.region),
-            addressing_style: addressing_style(
-                args.addressing_style.as_deref(),
-                args.provider.as_deref(),
-            )?
-            .unwrap_or(AddressingStyle::Auto),
+            region: setup.region,
+            addressing_style: addressing_style(args.addressing_style.as_deref(), setup.provider)?
+                .unwrap_or(AddressingStyle::Auto),
             tls_verify: args.tls_verify,
             credentials,
         })
@@ -315,6 +347,17 @@ async fn add(ctx: &Ctx<'_>, args: &ConnectionAddArgs) -> HandlerResult {
             warnings,
         ));
     }
+    // Buckets chosen on the terminal get the guided link question too.
+    let roots = if args.buckets.is_empty() {
+        super::bucket::ask_public_roots(
+            &ctx.session,
+            &config,
+            provider.unwrap_or_else(|| ProviderPreset::recognize(&config.endpoint)),
+            &names,
+        )?
+    } else {
+        Vec::new()
+    };
     let buckets: Vec<NewBucket> = names
         .into_iter()
         .map(|name| NewBucket {
@@ -331,6 +374,7 @@ async fn add(ctx: &Ctx<'_>, args: &ConnectionAddArgs) -> HandlerResult {
     .await?;
     human.push_str("Buckets:\n");
     human.push_str(&registered.human);
+    human.push_str(&super::bucket::save_public_roots(ctx, &config, roots).await?);
     data = super::merge_field(data, "buckets", Some(registered.data.clone()))?;
     let out = finish(HandlerOutput::human(human).with_data(data), warnings);
     Ok(registered.finish(out))

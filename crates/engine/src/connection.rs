@@ -1,7 +1,7 @@
 //! Connection lifecycle service.
 //!
 //! Owns CRUD over [`ConnectionConfig`] and credential storage. Diagnostics — the connection
-//! test and capability probe — live in [`crate::diagnostics::ConnectionDiagnostics`]; both
+//! test and its write probe — live in [`crate::diagnostics::ConnectionDiagnostics`]; both
 //! services share the same repositories but neither knows about the other.
 
 use std::sync::Arc;
@@ -87,6 +87,99 @@ impl ProviderPreset {
             Self::Aws | Self::R2 | Self::Generic => AddressingStyle::Auto,
         }
     }
+
+    /// Every preset, in the order a setup prompt offers them.
+    pub const ALL: [Self; 5] = [
+        Self::R2,
+        Self::Aws,
+        Self::Minio,
+        Self::Supabase,
+        Self::Generic,
+    ];
+
+    /// The service's display name.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Aws => "AWS S3",
+            Self::R2 => "Cloudflare R2",
+            Self::Minio => "MinIO",
+            Self::Supabase => "Supabase Storage",
+            Self::Generic => "Other S3-compatible",
+        }
+    }
+
+    /// Whether requests must be signed for the account's real region; the
+    /// others accept `auto`.
+    pub fn needs_region(self) -> bool {
+        matches!(self, Self::Aws | Self::Supabase)
+    }
+
+    /// The endpoint when the provider fixes it, given the region.
+    pub fn default_endpoint(self, region: &Region) -> Option<String> {
+        match (self, region) {
+            (Self::Aws, Region::Specific(region)) => {
+                Some(format!("https://s3.{region}.amazonaws.com"))
+            }
+            (Self::Minio, _) => Some("http://localhost:9000".to_string()),
+            _ => None,
+        }
+    }
+
+    /// The shape of the provider's endpoint, with placeholders.
+    pub fn endpoint_example(self) -> &'static str {
+        match self {
+            Self::Aws => "https://s3.<region>.amazonaws.com",
+            Self::R2 => "https://<account-id>.r2.cloudflarestorage.com",
+            Self::Minio => "http://localhost:9000",
+            Self::Supabase => "https://<project-ref>.storage.supabase.co/storage/v1/s3",
+            Self::Generic => "https://s3.example.com",
+        }
+    }
+
+    /// The preset whose service hosts `endpoint`; `Generic` when the host is
+    /// not a known one (self-hosted MinIO included).
+    pub fn recognize(endpoint: &str) -> Self {
+        let host = endpoint_host(endpoint);
+        if host.ends_with(".r2.cloudflarestorage.com") {
+            Self::R2
+        } else if host.ends_with(".supabase.co") {
+            Self::Supabase
+        } else if host.ends_with(".amazonaws.com") {
+            Self::Aws
+        } else {
+            Self::Generic
+        }
+    }
+
+    /// What the URL serving a public `bucket`'s root looks like, filled in
+    /// from the connection where the provider's shape allows. Only an
+    /// example: whether the bucket is public is the provider's setting.
+    pub fn public_root_example(self, endpoint: &str, region: &Region, bucket: &str) -> String {
+        match self {
+            Self::Supabase => {
+                let project = endpoint_host(endpoint)
+                    .split('.')
+                    .next()
+                    .unwrap_or("<project-ref>");
+                format!("https://{project}.supabase.co/storage/v1/object/public/{bucket}")
+            }
+            Self::Aws => match region {
+                Region::Specific(region) => format!("https://{bucket}.s3.{region}.amazonaws.com"),
+                Region::Auto => format!("https://{bucket}.s3.<region>.amazonaws.com"),
+            },
+            Self::R2 => "https://pub-<id>.r2.dev or the bucket's custom domain".to_string(),
+            Self::Minio => format!("{}/{bucket}", endpoint.trim_end_matches('/')),
+            Self::Generic => "https://cdn.example.com".to_string(),
+        }
+    }
+}
+
+/// The host part of an endpoint URL.
+fn endpoint_host(endpoint: &str) -> &str {
+    let rest = endpoint
+        .split_once("://")
+        .map_or(endpoint, |(_, rest)| rest);
+    rest.split(['/', ':']).next().unwrap_or(rest)
 }
 
 /// A credential pair supplied by the user.

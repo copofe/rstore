@@ -329,14 +329,6 @@ impl DiagnosticsApi {
         self.0.health.health().await
     }
 
-    /// Probe and report the connection's capability set, live.
-    pub async fn capabilities(
-        &self,
-        reference: &crate::connection::ConnectionRef,
-    ) -> Result<crate::diagnostics::CapabilityReport> {
-        self.0.diagnostics.capabilities(reference).await
-    }
-
     /// Run the connection test, optionally including a write probe.
     pub async fn test(
         &self,

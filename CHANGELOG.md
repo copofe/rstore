@@ -22,7 +22,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Indexing is opt-in per bucket and off by default for new buckets; naming a
   bucket in `index run` switches its index on, switching it off drops the
   bucket's untagged rows. `find` lists the buckets it could not search
-  (`unindexed`).
+  (`unindexed`). `bucket add --no-index` is gone.
+- Empty bucket listings and `bucket add` point at `connection add` while no
+  connection is registered.
+- `url` no longer presents the S3 endpoint as a public URL (R2, Supabase,
+  and private buckets refuse unsigned reads there). A public URL needs a
+  configured public or CDN base; without one, URL formats get a presigned
+  link with the bucket's default TTL and a warning naming
+  `bucket edit --public-base`.
+- `conn test --write` writes only into registered buckets that allow writes
+  and deletes, through the write guard; it used to pick the first visible
+  bucket, read-only or not. It now checks each such bucket.
+- `connection show --capabilities` is gone, with the capability report and
+  the storage `Capability` model: nothing consumed it, listing duplicated
+  `conn test`, presign only signed locally, and the multipart/copy probes
+  wrote into user buckets. Unsupported operations still fail with
+  `capability_unsupported`.
+- A bucket's public/CDN base is that bucket's root; a connection's serves
+  every bucket under `/<bucket>`. Bucket overrides no longer get the bucket
+  name appended a second time.
+- Guided bucket registration (`bucket add` without names, the bucket choice
+  in `conn add`) asks each bucket's public URL, offering the provider's
+  shape as an example (filled in for Supabase and AWS).
+- Guided setup on a terminal: `connection add` asks for whatever is omitted
+  (name, provider, region where the provider needs one, endpoint with the
+  provider's default or shape, keys); `bucket add` and `workspace add`
+  without arguments offer a choice; `workspace create` without a name asks
+  for the name, description, and member buckets. Non-terminal and `--json`
+  runs still require the arguments. Ctrl-D at any prompt cancels.
 - Tags key on `(bucket, path)` (`object_tags`) and no longer require an
   indexed object; GC, rebuilds, and index toggles never drop them.
 - `index gc` removes untagged stale rows; `--retention` is gone.
@@ -38,8 +65,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   registered buckets and issues retry-decorated (and guarded) adapters;
   `CatalogLocator` is gone. A bucket that is not registered under the named
   connection fails with the same message and hint everywhere.
-- `connection show --capabilities` probes live every time; the 24-hour cache
-  in `app_settings` is gone.
 - `ls --catalog` refreshes the cache best-effort: a cache write that fails no
   longer fails the listing, and a successful refresh publishes
   `CatalogChanged`.

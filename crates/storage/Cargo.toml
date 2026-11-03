@@ -1,6 +1,6 @@
 [package]
 name = "rstore-storage"
-description = "Provider-neutral object-store port, capability model, and the S3 adapter. No GPUI, no SQLite."
+description = "Provider-neutral object-store port and the S3 adapter. No GPUI, no SQLite."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

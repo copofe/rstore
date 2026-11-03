@@ -93,7 +93,7 @@ sequenceDiagram
 | Crate | Owns | Must never do |
 | --- | --- | --- |
 | `domain` | Entities, value objects, typed IDs, error model, conflict decision table, job state machine, outcome vocabulary, clock abstraction | Depend on GPUI, an SDK, or SQLite; perform I/O; panic on external input |
-| `storage` | The provider-neutral `Storage` trait, multipart sessions, capability model, and the S3 adapter behind them | Depend on SQLite or GPUI; leak SDK types upward |
+| `storage` | The provider-neutral `Storage` trait, multipart sessions, and the S3 adapter behind them | Depend on SQLite or GPUI; leak SDK types upward |
 | `engine` | API groups and services, the SQLite store (`db`), the streaming transfer engine (`transfer`), the run loop with job leases, catalog write-through, the event bus, and the `Runtime` that wires it all | Depend on GPUI; expose `db`, `transfer`, or SDK types through its public surface |
 | `cli` (`crates/cli`, `apps/cli`) | Parse input, build commands/queries, render envelopes, map exit codes; the binary owns tracing and runtime startup | Touch SQLite or an SDK; contain business rules |
 | `apps/desktop` | Desktop composition; GPUI pages attach to the API and its events | Depend on SQLite or an SDK directly |
@@ -105,7 +105,7 @@ sequenceDiagram
 ├── Cargo.toml               # workspace, shared deps, lint configuration
 ├── crates/
 │   ├── domain/              # entities, value objects, typed IDs, errors
-│   ├── storage/             # Storage trait, capabilities, s3/ adapter
+│   ├── storage/             # Storage trait, s3/ adapter
 │   ├── engine/
 │   │   ├── migrations/      # embedded SQL schema
 │   │   └── src/

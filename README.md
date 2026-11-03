@@ -13,8 +13,8 @@ index folders into your buckets.
 ## Features
 
 - **Connections** — register any number of S3-compatible endpoints with stored
-  credentials, per-check connection testing including an optional write probe,
-  and live capability probes.
+  credentials and per-check connection testing, including an optional write
+  probe.
 - **Buckets** — discover remote buckets or register them manually (no
   ListBuckets permission required); per-bucket read-only and allow-delete
   guards enforced in the core before any adapter call.
@@ -56,7 +56,11 @@ cp target/release/rstore ~/.local/bin/
 
 ```sh
 # One step: register the connection, test it, register its buckets (they
-# join the `default` workspace, created on first use).
+# join the `default` workspace, created on first use). On a terminal it asks
+# for the provider, endpoint, keys, and buckets.
+rstore conn add
+
+# The same without prompts, for scripts.
 export RSTORE_HOME=/tmp/rstore-demo   # optional: portable data root
 rstore conn add prod --endpoint http://localhost:9000 --provider minio \
   --access-key AK --secret-key SK --buckets all
@@ -75,8 +79,8 @@ rstore tag add media/reports/report.pdf -t q3,final
 rstore find report -t final
 ```
 
-Scripts and CI must pass `--access-key`/`--secret-key` explicitly: with
-`--json` the CLI never prompts.
+Scripts and CI must pass every argument explicitly: without a terminal, or
+with `--json`, the CLI never prompts.
 
 ## Documentation
 

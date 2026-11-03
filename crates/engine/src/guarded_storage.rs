@@ -14,8 +14,9 @@
 //! sessions carry no guard of their own: the door —
 //! `create_multipart` / `adopt_multipart` — already passed it.
 //!
-//! Connection diagnostics probe credentials, not bucket policy, and use
-//! the unguarded adapter by definition.
+//! Connection diagnostics read through the plain adapter; their write
+//! probes go through the delete guard of a registered bucket, so a
+//! read-only or delete-forbidden bucket is never probed.
 
 use std::sync::Arc;
 

@@ -1,4 +1,4 @@
-//! The [`Storage`] facade over provider capabilities.
+//! The [`Storage`] facade over an object store.
 
 use async_trait::async_trait;
 use bytes::Bytes;

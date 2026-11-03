@@ -49,9 +49,12 @@ half is the command reference.
 ### 1. Connecting storage
 
 ```sh
-# Register, test, and pick buckets in one step. On a terminal, omitted keys
-# are prompted with hidden input and the visible buckets are offered as a
-# numbered list.
+# Guided setup: on a terminal, everything omitted is asked — name, provider,
+# region (AWS, Supabase), endpoint, keys (hidden), then which of the visible
+# buckets to register.
+rstore conn add
+
+# Register, test, and pick buckets in one step.
 rstore conn add nas --endpoint http://localhost:9000 --provider minio
 
 # Non-interactive: pass everything, including which buckets to register.
@@ -63,8 +66,7 @@ rstore conn add supa --endpoint https://<ref>.storage.supabase.co/storage/v1/s3 
 # Everything else.
 rstore conn list prod                      # substring filter on name/endpoint
 rstore conn show nas                       # secrets shown masked
-rstore conn show nas --capabilities        # probe list/multipart/copy/presign
-rstore conn test nas --write               # adds a write probe
+rstore conn test nas --write               # put+delete in each writable registered bucket
 rstore conn edit nas --region us-east-1
 rstore conn remove nas -y                  # removes only the registration
 ```
@@ -77,7 +79,12 @@ connection test passes but bucket operations return 404, check this first.
 **The test** lists buckets with the stored keys. `endpoint/auth` passes only
 when the endpoint answered and accepted the credentials (a refused listing
 still counts as authenticated); an unreachable endpoint or rejected keys fail
-it.
+it. `--write` checks the keys can write: it puts and deletes a temporary
+object under `.rstore-write-test/` in each registered bucket that allows
+writes and deletes. Read-only, delete-forbidden, and unregistered buckets are
+never written to — with none left, the check fails without writing anything.
+An operation a provider cannot perform (presigning, server-side copy) fails
+on its own with `capability_unsupported` (exit 11).
 
 **After the test**, `conn add` registers buckets: the `--buckets` list, every
 visible bucket for `--buckets all`, or your choice on a terminal. A failing
@@ -102,9 +109,10 @@ the wrong bucket. Registered buckets join the current workspace.
 rstore bucket list --remote                # what the credentials can see
 rstore bucket list --remote nas            # one connection only
 
+rstore bucket add                          # terminal: choose buckets, give each a public URL
 rstore bucket add media photos             # connection optional while only one exists
 rstore bucket add nas/archive --read-only  # refuse writes
-rstore bucket add tmp --no-delete --no-index --conflict skip
+rstore bucket add tmp --no-delete --conflict skip
 
 rstore bucket list                         # registered buckets
 rstore bucket show media                   # settings, link profile, ignore rules
@@ -201,8 +209,10 @@ are scoped to it, so the same tag name in two projects never collides.
 
 ```sh
 rstore ws list                             # `*` marks the current workspace
+rstore ws create                           # terminal: asks name, description, buckets
 rstore ws create proj-a --description "Project A assets"
 rstore ws use proj-a                       # make it current
+rstore ws add                              # terminal: choose from the registered buckets
 rstore ws add media nas/backup             # membership of the current workspace
 rstore ws remove nas/backup
 rstore ws show                             # buckets and object count
@@ -248,7 +258,7 @@ creates nothing.
 ### 8. Link generation
 
 ```sh
-rstore url media/img/logo.png                    # public URL from bucket config
+rstore url media/img/logo.png                    # public URL; presigned when no public base
 rstore url media/img/logo.png --format markdown
 rstore url <ref> --format s3                     # s3://bucket/key
 rstore url <ref> --format path                   # bucket-relative path
@@ -262,10 +272,15 @@ rstore url media/report.pdf --signed             # bucket default TTL
 Each reference succeeds or fails independently (human output stays one
 pipeable link per line; per-item errors go to stderr). Any failure exits 13.
 
-**Link configuration**: connections store public/CDN base defaults and each
-bucket may override them; permissions and the default TTL belong to the
-bucket. `bucket show` displays the effective values and marks values
-inherited from the connection:
+**Link configuration**: a bucket's public/CDN base is the URL serving that
+bucket's root (a custom domain, an r2.dev address, Supabase's
+`…/object/public/<bucket>`); a connection's base serves every bucket under
+`/<bucket>`, and a bucket base overrides it. Permissions and the default TTL
+belong to the bucket. Guided `bucket add` (and the bucket choice in
+`conn add`) asks each bucket's public URL, with the provider's shape as an
+example; an empty answer keeps a private bucket's links presigned. `bucket
+show` displays the effective root and marks one inherited from the
+connection:
 
 ```sh
 rstore conn edit supa \
@@ -278,8 +293,11 @@ rstore bucket edit media \
 ```
 
 Effective public base precedence: bucket CDN override → connection CDN
-default → bucket public override → connection public default → connection
-endpoint. rstore never guesses provider-specific URL shapes. An empty
+default → bucket public override → connection public default. The S3 endpoint
+is never used as a public base — R2, Supabase, and private buckets refuse
+unsigned reads there — so with no base configured, `url` hands out a
+presigned link (bucket default TTL) and a warning says how to set a permanent
+one. rstore never guesses provider-specific URL shapes. An empty
 `--public-base`/`--cdn-base` clears the override. Presigning requires bucket
 and adapter support and reports `capability_unsupported` otherwise.
 
@@ -356,23 +374,23 @@ Global options on every command: `--home <PATH>` (data root, env `RSTORE_HOME`),
 | `tag list` / `tag edit TAG` | Tag definitions | edit: `--name` `--color` `--description` |
 | `tag delete TAG` | Delete a tag | destructive |
 | `tag merge SRC DST` | Merge tags | source deleted, associations deduplicated; destructive |
-| `connection add NAME` (`conn`) | Register, test, register buckets | `--endpoint` `--provider` `--region` `--addressing-style` `--public-base` `--cdn-base` `--tls-verify` `--access-key` `--secret-key` `--buckets all\|A,B` `--no-test` |
+| `connection add [NAME]` (`conn`) | Register, test, register buckets; asks for what is omitted on a terminal | `--endpoint` `--provider` `--region` `--addressing-style` `--public-base` `--cdn-base` `--tls-verify` `--access-key` `--secret-key` `--buckets all\|A,B` `--no-test` |
 | `connection list [FILTER]` | List connections | substring over name/endpoint |
-| `connection show CONN` | Details, masked keys | `--capabilities` runs live probes |
-| `connection test CONN` | Three-step test | `--write` adds a write probe; failure exits 13 |
+| `connection show CONN` | Details, masked keys | |
+| `connection test CONN` | Three-step test | `--write` probes each registered bucket that allows writes and deletes; failure exits 13 |
 | `connection edit CONN` | Edit fields | as `add` (plus re-entering keys) |
 | `connection remove CONN` | Remove registration | destructive; deletes stored credentials too |
 | `bucket list [CONN]` | Registered buckets | `--remote` lists what the credentials can see |
-| `bucket add BUCKET…` | Register and join the workspace | `--read-only` `--no-delete` `--no-index` `--conflict` `--skip-verify` |
+| `bucket add [BUCKET…]` | Register and join the workspace; none → choose on a terminal | `--read-only` `--no-delete` `--conflict` `--skip-verify` |
 | `bucket show BUCKET` | Settings, link profile, ignore rules | |
 | `bucket edit BUCKET` | Adjust settings | `--display-name` `--read-only[=B]` `--allow-delete[=B]` `--index[=B]` `--conflict` `--concurrency` `--public-base` `--cdn-base` `--public-url[=B]` `--presigned[=B]` `--default-ttl` `--ignore DIR` `--unignore DIR` |
 | `bucket remove BUCKET…` | Remove registrations | destructive |
 | `workspace list` (`ws`) | Workspaces, `*` = current | |
 | `workspace use WS` | Select the current workspace | |
-| `workspace create NAME` | Create; current when none is selected | `--description` |
+| `workspace create [NAME]` | Create; current when none is selected; none → guided on a terminal | `--description` |
 | `workspace show` / `edit` | The target workspace | edit: `--name` `--description` |
 | `workspace delete WS` | Delete a workspace | destructive |
-| `workspace add\|remove BUCKET…` | Membership | |
+| `workspace add\|remove BUCKET…` | Membership | `add` without buckets chooses on a terminal |
 | `index run [BUCKET…]` | Scan into the catalog; naming a bucket switches its index on | `--all` `--refresh` `--rebuild` (destructive) |
 | `index status` | Totals and per-bucket state | |
 | `index cancel BUCKET` | Drop a paused scan's checkpoint | |

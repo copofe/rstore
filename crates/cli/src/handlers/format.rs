@@ -197,11 +197,6 @@ pub(super) fn dir_listing(
     out
 }
 
-enum FieldRow {
-    Value { label: String, value: String },
-    Lines { label: String, lines: Vec<String> },
-}
-
 /// A human-readable labeled detail view: an optional header line, then
 /// `label : value` lines under a single two-space indent, label widths
 /// adapting to the longest label, `Option` values rendering as `(none)`.
@@ -210,7 +205,7 @@ enum FieldRow {
 pub(super) struct Fields {
     header: Option<String>,
     label_width: usize,
-    rows: Vec<FieldRow>,
+    rows: Vec<(String, String)>,
 }
 
 impl Fields {
@@ -232,10 +227,7 @@ impl Fields {
     /// Append one `label : value` line.
     pub(super) fn push(&mut self, label: &str, value: impl std::fmt::Display) -> &mut Self {
         self.label_width = self.label_width.max(label.chars().count());
-        self.rows.push(FieldRow::Value {
-            label: label.to_string(),
-            value: value.to_string(),
-        });
+        self.rows.push((label.to_string(), value.to_string()));
         self
     }
 
@@ -251,17 +243,6 @@ impl Fields {
         }
     }
 
-    /// Append a labeled block of pre-rendered lines nested at a four-space
-    /// indent (e.g. capability probes).
-    pub(super) fn push_lines(&mut self, label: &str, lines: Vec<String>) -> &mut Self {
-        self.label_width = self.label_width.max(label.chars().count());
-        self.rows.push(FieldRow::Lines {
-            label: label.to_string(),
-            lines,
-        });
-        self
-    }
-
     /// Render the header (if any) followed by all field lines.
     pub(super) fn render(&self) -> String {
         let mut out = String::new();
@@ -269,20 +250,9 @@ impl Fields {
             out.push_str(header);
             out.push('\n');
         }
-        for row in &self.rows {
-            match row {
-                FieldRow::Value { label, value } => {
-                    let pad = " ".repeat(self.label_width.saturating_sub(label.chars().count()));
-                    out.push_str(&format!("  {label}{pad} : {value}\n"));
-                }
-                FieldRow::Lines { label, lines } => {
-                    let pad = " ".repeat(self.label_width.saturating_sub(label.chars().count()));
-                    out.push_str(&format!("  {label}{pad} :\n"));
-                    for line in lines {
-                        out.push_str(&format!("    {line}\n"));
-                    }
-                }
-            }
+        for (label, value) in &self.rows {
+            let pad = " ".repeat(self.label_width.saturating_sub(label.chars().count()));
+            out.push_str(&format!("  {label}{pad} : {value}\n"));
         }
         out
     }

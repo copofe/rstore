@@ -84,11 +84,12 @@ async fn list_roots(ctx: &Ctx<'_>) -> HandlerResult {
         .iter()
         .map(|(label, id)| serde_json::json!({ "bucket": label, "id": id }))
         .collect();
-    let human = super::format::listing(
-        "Registered buckets:",
+    let empty = super::no_buckets_hint(
+        ctx.app,
         "No buckets registered. Add one with `rstore bucket add <bucket>`.",
-        table,
-    );
+    )
+    .await?;
+    let human = super::format::listing("Registered buckets:", empty, table);
     Ok(HandlerOutput::human(human).with_data(serde_json::json!(data)))
 }
 

@@ -1,7 +1,7 @@
 //! `workspace …` handlers (WSP-). Subcommands without a workspace argument
 //! act on the workspace from `-w`, else the current one.
 
-use rstore_domain::{Bucket, Workspace};
+use rstore_domain::{Bucket, Error, Result, Workspace};
 use rstore_engine::{BucketRef, CreateWorkspaceInput, UpdateWorkspaceInput, WorkspaceRef};
 
 use super::{Ctx, HandlerResult};
@@ -58,19 +58,37 @@ pub(super) async fn workspace(ctx: &Ctx<'_>, action: &WorkspaceCommand) -> Handl
             )
         }
         WorkspaceCommand::Create { name, description } => {
+            // Without a name a terminal walks through the whole setup.
+            let guided = name.is_none();
+            let name = match name {
+                Some(name) => name.clone(),
+                None if ctx.session.is_interactive() => {
+                    super::tty::ask("Workspace name", None, &ctx.session)?
+                }
+                None => return Err(Error::invalid_input("name the workspace to create")),
+            };
+            let description = match description {
+                None if guided => super::tty::ask_optional("Description", &ctx.session)?,
+                description => description.clone(),
+            };
             let ws = svc
-                .create(CreateWorkspaceInput {
-                    name: name.clone(),
-                    description: description.clone(),
-                })
+                .create(CreateWorkspaceInput { name, description })
                 .await?;
             let current = svc.current().await?.is_some_and(|c| c.id == ws.id);
             let note = if current { " — now current" } else { "" };
-            Ok(HandlerOutput::human(format!(
-                "workspace `{}` created ({}){note}\n",
-                ws.name, ws.id
-            ))
-            .with_data(super::merge_field(
+            let mut human = format!("workspace `{}` created ({}){note}\n", ws.name, ws.id);
+            if guided {
+                let labels = choose_members(ctx, &ws).await?;
+                let resolved = resolve_all(ctx, &labels).await?;
+                for bucket in &resolved {
+                    svc.add_bucket(&WorkspaceRef::Id(ws.id), &BucketRef::Id(bucket.id))
+                        .await?;
+                }
+                for label in &labels {
+                    human.push_str(&format!("bucket `{label}` added to `{}`\n", ws.name));
+                }
+            }
+            Ok(HandlerOutput::human(human).with_data(super::merge_field(
                 super::json_value(&ws)?,
                 "current",
                 Some(serde_json::Value::Bool(current)),
@@ -150,12 +168,23 @@ pub(super) async fn workspace(ctx: &Ctx<'_>, action: &WorkspaceCommand) -> Handl
         }
         WorkspaceCommand::Add { buckets } => {
             let target = ctx.workspace().await?;
-            let resolved = resolve_all(ctx, buckets).await?;
+            let buckets = if buckets.is_empty() {
+                if !ctx.session.is_interactive() {
+                    return Err(Error::invalid_input("name the buckets to add"));
+                }
+                choose_members(ctx, &target).await?
+            } else {
+                buckets.clone()
+            };
+            if buckets.is_empty() {
+                return Ok(HandlerOutput::human("No buckets added.\n"));
+            }
+            let resolved = resolve_all(ctx, &buckets).await?;
             for bucket in &resolved {
                 svc.add_bucket(&WorkspaceRef::Id(target.id), &BucketRef::Id(bucket.id))
                     .await?;
             }
-            membership_output(&target, buckets, "added to")
+            membership_output(&target, &buckets, "added to")
         }
         WorkspaceCommand::Remove { buckets } => {
             let target = ctx.workspace().await?;
@@ -169,9 +198,37 @@ pub(super) async fn workspace(ctx: &Ctx<'_>, action: &WorkspaceCommand) -> Handl
     }
 }
 
+/// Ask which registered buckets outside `workspace` should join it; their
+/// `<connection>/<bucket>` labels, nothing when every bucket is a member.
+async fn choose_members(ctx: &Ctx<'_>, workspace: &Workspace) -> Result<Vec<String>> {
+    let members = ctx
+        .app
+        .catalog()
+        .workspaces()
+        .show(&WorkspaceRef::Id(workspace.id))
+        .await?
+        .buckets;
+    let mut outside: Vec<String> = super::bucket_labels(ctx.app)
+        .await?
+        .into_iter()
+        .filter(|(id, _)| !members.contains(id))
+        .map(|(_, label)| label)
+        .collect();
+    if outside.is_empty() {
+        return Ok(Vec::new());
+    }
+    outside.sort();
+    super::tty::select(
+        "Registered buckets:",
+        &format!("Add which buckets to `{}`?", workspace.name),
+        &outside,
+        &ctx.session,
+    )
+}
+
 /// Resolve every bucket reference before any membership changes, so a typo
 /// leaves the workspace untouched.
-async fn resolve_all(ctx: &Ctx<'_>, references: &[String]) -> rstore_domain::Result<Vec<Bucket>> {
+async fn resolve_all(ctx: &Ctx<'_>, references: &[String]) -> Result<Vec<Bucket>> {
     let buckets = ctx.app.registry().buckets();
     let mut resolved = Vec::with_capacity(references.len());
     for reference in references {

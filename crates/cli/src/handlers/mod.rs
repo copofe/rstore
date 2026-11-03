@@ -173,6 +173,16 @@ async fn resolve_bucket_ids(app: &ApplicationApi, refs: &[String]) -> Result<Vec
     Ok(ids)
 }
 
+/// The empty-listing line for buckets: before any connection exists the next
+/// step is `connection add`, not the caller's bucket hint.
+async fn no_buckets_hint(app: &ApplicationApi, hint: &'static str) -> Result<&'static str> {
+    if app.registry().connections().list().await?.is_empty() {
+        Ok("No connections registered. Add one with `rstore connection add`.")
+    } else {
+        Ok(hint)
+    }
+}
+
 /// `<connection>/<bucket>` labels for every registered bucket, for listings
 /// whose rows carry only bucket ids.
 async fn bucket_labels(app: &ApplicationApi) -> Result<HashMap<BucketId, String>> {

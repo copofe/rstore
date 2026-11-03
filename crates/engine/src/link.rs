@@ -2,7 +2,9 @@
 //!
 //! One service turns a remote reference into the requested representation — object path, S3
 //! URI, public URL, presigned URL, Markdown, or HTML — using the connection's defaults and the
-//! bucket's [`LinkProfile`] overrides for public/CDN bases and permissions. Presigning
+//! bucket's [`LinkProfile`] overrides for public/CDN bases and permissions. A public URL needs a
+//! configured base; without one a URL-bearing format gets a presigned link, the only kind sure to
+//! open (most providers refuse unsigned reads on the S3 endpoint). Presigning
 //! delegates to the storage adapter; a bucket or adapter that disallows it surfaces
 //! `CapabilityUnsupported` (CLI exit 11) rather than a silently degraded link. Presigned URLs
 //! are results, never logs.
@@ -80,24 +82,27 @@ pub fn parse_ttl(raw: &str) -> Result<u64> {
     rstore_domain::duration::parse_span(raw, "smhd", 7 * 86_400, "TTL", "7d (S3 presign limit)")
 }
 
-/// Resolve the effective object delivery base from connection defaults and bucket overrides.
+/// Resolve the URL serving `bucket`'s root from connection defaults and bucket overrides.
 ///
-/// Precedence: bucket CDN override, connection CDN default, bucket public override,
-/// connection public default, then the unchanged S3 endpoint. The trailing slash is trimmed so
-/// callers can join with `/`.
+/// Precedence: bucket CDN override, connection CDN default, bucket public override, then
+/// connection public default; `None` when nothing is configured. A bucket override is that
+/// bucket's root (a custom domain, an r2.dev address); a connection default serves every
+/// bucket under `/<bucket>`. The S3 endpoint is never a fallback: R2, Supabase, and private
+/// buckets everywhere refuse unsigned reads there. No trailing slash, so callers join with `/`.
 pub fn resolve_link_base(
     config: &rstore_domain::ConnectionConfig,
     profile: &LinkProfile,
-) -> String {
+    bucket: &str,
+) -> Option<String> {
+    let own = |base: &str| base.trim_end_matches('/').to_string();
+    let shared = |base: &str| format!("{}/{bucket}", base.trim_end_matches('/'));
     profile
         .cdn_base_url
         .as_deref()
-        .or(config.cdn_base_url.as_deref())
-        .or(profile.public_base_url.as_deref())
-        .or(config.public_base_url.as_deref())
-        .unwrap_or(config.endpoint.as_str())
-        .trim_end_matches('/')
-        .to_string()
+        .map(own)
+        .or_else(|| config.cdn_base_url.as_deref().map(shared))
+        .or_else(|| profile.public_base_url.as_deref().map(own))
+        .or_else(|| config.public_base_url.as_deref().map(shared))
 }
 
 /// Editable link-profile fields for the application access surface.
@@ -211,17 +216,20 @@ impl LinkService {
         let profile = self.profiles.get(bucket.id).await?;
 
         // Delivery URL: bucket CDN override, connection CDN default, bucket public override,
-        // connection public default, then the unchanged S3 endpoint.
+        // then connection public default.
         let public_url = if profile.allow_public_url {
-            let base = resolve_link_base(&config, &profile);
-            Some(format!("{}/{}/{}", base, bucket.name, encode_path(key)))
+            resolve_link_base(&config, &profile, &bucket.name)
+                .map(|root| format!("{root}/{}", encode_path(key)))
         } else {
             None
         };
 
-        // Presigned URL: gated on the profile's permission, TTL from the explicit request or
+        // Presigned URL: when asked for, and in place of a missing public URL for every format
+        // that carries one. Gated on the profile's permission, TTL from the explicit request or
         // the profile default.
-        let (presigned_url, expires_at) = if request.signed {
+        let carries_url = !matches!(request.format, LinkFormat::Path | LinkFormat::S3);
+        let fallback = carries_url && public_url.is_none() && profile.allow_presigned;
+        let (presigned_url, expires_at) = if request.signed || fallback {
             if !profile.allow_presigned {
                 return Err(Error::unsupported(format!(
                     "presigned links are disabled for bucket `{}`",
@@ -274,7 +282,8 @@ impl LinkService {
                     .or_else(|| public_url.clone())
                     .ok_or_else(|| {
                         Error::unsupported(format!(
-                            "public links are disabled for bucket `{}`; pass --signed",
+                            "no link for bucket `{}`: presigned links are disabled and \
+                             public links need a public base",
                             bucket.name
                         ))
                     })?;

@@ -1,6 +1,6 @@
 //! Terminal interaction policy in one home: hidden credential input, y/N
-//! confirmations, numbered selections, conflict resolution, and stdin URI
-//! lists all read a single
+//! confirmations, setup questions, numbered selections, conflict
+//! resolution, and stdin URI lists all read a single
 //! [`Session`] for "may we prompt?" instead of re-deriving it from the
 //! terminal per call site. JSON and non-terminal sessions never block on an
 //! interactive prompt.
@@ -38,12 +38,15 @@ impl Session {
         !self.json && self.stdin_is_tty
     }
 
-    /// Read one prompt answer from stdin.
+    /// Read one prompt answer from stdin; end of input (Ctrl-D) cancels.
     fn read_answer(&self) -> Result<String> {
         let mut line = String::new();
-        std::io::stdin()
+        let read = std::io::stdin()
             .read_line(&mut line)
             .map_err(|e| Error::invalid_input("could not read confirmation").with_source(e))?;
+        if read == 0 {
+            return Err(Error::cancelled());
+        }
         Ok(line.trim().to_string())
     }
 }
@@ -129,6 +132,55 @@ pub(super) fn select(
         .collect()
 }
 
+/// Asks `question` until it gets an answer; an empty answer takes `default`
+/// when there is one.
+pub(super) fn ask(question: &str, default: Option<&str>, session: &Session) -> Result<String> {
+    let mut stderr = std::io::stderr();
+    loop {
+        match default {
+            Some(default) => write!(stderr, "{question} [{default}]: "),
+            None => write!(stderr, "{question}: "),
+        }
+        .ok();
+        stderr.flush().ok();
+        let answer = session.read_answer()?;
+        if !answer.is_empty() {
+            return Ok(answer);
+        }
+        if let Some(default) = default {
+            return Ok(default.to_string());
+        }
+    }
+}
+
+/// Asks `question` once; an empty answer is `None`.
+pub(super) fn ask_optional(question: &str, session: &Session) -> Result<Option<String>> {
+    let mut stderr = std::io::stderr();
+    write!(stderr, "{question} (optional): ").ok();
+    stderr.flush().ok();
+    let answer = session.read_answer()?;
+    Ok((!answer.is_empty()).then_some(answer))
+}
+
+/// Lists `options` numbered on stderr under `header` and reads exactly one
+/// choice, asking again until the answer names one. Returns its index.
+pub(super) fn choose(header: &str, options: &[String], session: &Session) -> Result<usize> {
+    let mut stderr = std::io::stderr();
+    writeln!(stderr, "{header}").ok();
+    for (number, option) in options.iter().enumerate() {
+        writeln!(stderr, "  {:>2}) {option}", number + 1).ok();
+    }
+    loop {
+        write!(stderr, "Choose [1-{}]: ", options.len()).ok();
+        stderr.flush().ok();
+        let answer = session.read_answer()?;
+        match answer.parse::<usize>() {
+            Ok(number) if (1..=options.len()).contains(&number) => return Ok(number - 1),
+            _ => writeln!(stderr, "no choice numbered `{answer}`").ok(),
+        };
+    }
+}
+
 /// Reads one line of hidden input (credentials) from the terminal.
 pub(super) fn prompt_hidden(prompt: &str) -> Result<String> {
     rpassword::prompt_password(format!("{prompt}: "))
@@ -189,12 +241,13 @@ pub(super) fn read_credential_pair(
 /// Collects credentials for `connection add` from flags or a hidden prompt.
 pub(super) fn read_credential_input(
     args: &ConnectionAddArgs,
+    name: &str,
     session: &Session,
 ) -> Result<Option<Secret<CredentialInput>>> {
     read_credential_pair(
         args.access_key.as_deref(),
         args.secret_key.as_deref(),
-        &format!("Access key for `{}`", args.name),
+        &format!("Access key for `{name}`"),
         "Secret key",
         None,
         session,

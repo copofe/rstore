@@ -1,17 +1,18 @@
 //! Connection diagnostics.
 //!
 //! Split from connection lifecycle so each side is a deep module: lifecycle owns CRUD and
-//! credential storage; diagnostics owns probing — the test report, the write probe, and the
-//! capability report. Probes always run live: a diagnosis reflects the connection as it is
-//! now, not as it was when last looked at.
+//! credential storage; diagnostics owns probing — the test report and its write probe.
+//! Probes always run live: a diagnosis reflects the connection as it is now, not as it was
+//! when last looked at. The write probe writes only into registered buckets that allow writes
+//! and deletes, through the same guard real mutations use.
 
 use std::sync::Arc;
 
 use bytes::Bytes;
 use rstore_domain::connection::ConnectionTestStatus;
 use rstore_domain::{Clock, ErrorCode, Result};
-use rstore_storage::capability::Capability;
 use rstore_storage::model::PutOptions;
+use rstore_storage::Storage;
 use serde::Serialize;
 use time::OffsetDateTime;
 
@@ -47,16 +48,6 @@ impl ConnectionTestReport {
     }
 }
 
-/// Capability report for `connection show --capabilities`.
-#[derive(Debug, Clone, Serialize)]
-pub struct CapabilityReport {
-    pub connection: String,
-    #[serde(with = "time::serde::rfc3339")]
-    pub probed_at: OffsetDateTime,
-    /// Feature name → four-state capability.
-    pub entries: Vec<(String, Capability)>,
-}
-
 /// Probes connections; test outcomes persist on the connection row.
 pub struct ConnectionDiagnostics {
     repo: Arc<crate::db::ConnectionRepository>,
@@ -80,7 +71,8 @@ impl ConnectionDiagnostics {
     /// Probe the connection and persist the outcome.
     ///
     /// Checks run in order: stored credentials, endpoint/auth plus ListBuckets, then the
-    /// optional write probe (a temporary object that must be cleaned up). An adapter that
+    /// optional write probe — a temporary object put and deleted in each registered bucket
+    /// that allows both. An adapter that
     /// cannot even be constructed short-circuits to a failed report; the outcome is recorded
     /// on the connection either way.
     pub async fn test(
@@ -125,7 +117,7 @@ impl ConnectionDiagnostics {
             }
         };
 
-        let buckets = match storage.list_buckets().await {
+        match storage.list_buckets().await {
             Ok(buckets) => {
                 checks.push(CheckResult {
                     name: "endpoint/auth".into(),
@@ -137,7 +129,6 @@ impl ConnectionDiagnostics {
                     passed: true,
                     detail: format!("{} bucket(s) visible", buckets.len()),
                 });
-                buckets
             }
             Err(e) => {
                 // Only a refused listing proves the endpoint answered and accepted the
@@ -161,61 +152,24 @@ impl ConnectionDiagnostics {
                     passed: false,
                     detail: e.to_string(),
                 });
-                Vec::new()
             }
-        };
+        }
 
-        // 3. Optional write test against the first visible bucket: a temporary object is
-        //    created and must be cleaned up.
+        // 3. Optional write test: a temporary object put and deleted in every registered
+        //    bucket that allows both; read-only and delete-forbidden buckets are never touched.
         if write_test {
-            let write = match buckets.first() {
-                Some(bucket) => {
-                    // A generated probe key — a failure to parse it is a bug in this format,
-                    // not user input.
-                    let key = rstore_domain::remote::ObjectPath::new(format!(
-                        ".rstore-write-test/{}",
-                        uuid::Uuid::new_v4().simple()
-                    ))
-                    .expect("write-probe key");
-                    let body = Bytes::from_static(b"rstore connection write test");
-                    let put_result = storage
-                        .put(
-                            &bucket.name,
-                            &key,
-                            body,
-                            &PutOptions {
-                                content_type: Some("text/plain".into()),
-                                ..Default::default()
-                            },
-                        )
-                        .await;
-                    let outcome = match put_result {
-                        Ok(_) => storage.delete(&bucket.name, &key).await,
-                        Err(e) => Err(e),
-                    };
-                    match outcome {
-                        Ok(_) => CheckResult {
-                            name: "write_test".into(),
-                            passed: true,
-                            detail: format!(
-                                "put+delete succeeded in `{}` (temporary object cleaned up)",
-                                bucket.name
-                            ),
-                        },
-                        Err(e) => CheckResult {
-                            name: "write_test".into(),
-                            passed: false,
-                            detail: e.to_string(),
-                        },
-                    }
-                }
-                None => CheckResult {
+            let targets = self.gateway.probe_targets(&config, &storage).await?;
+            if targets.is_empty() {
+                checks.push(CheckResult {
                     name: "write_test".into(),
                     passed: false,
-                    detail: "no visible bucket to write into".into(),
-                },
-            };
-            checks.push(write);
+                    detail: "no registered bucket allows writes and deletes; nothing was written"
+                        .into(),
+                });
+            }
+            for (bucket, guarded) in &targets {
+                checks.push(write_probe(guarded.as_ref(), &bucket.name).await);
+            }
         }
 
         let report = ConnectionTestReport {
@@ -230,68 +184,6 @@ impl ConnectionDiagnostics {
         self.repo.record_test(config.id, status, now).await?;
         Ok(report)
     }
-
-    /// Probe the connection's capabilities.
-    ///
-    /// Every entry is a real round trip against the live adapter — none is inferred from the
-    /// provider's name. An adapter that cannot even be constructed classifies uniformly.
-    pub async fn capabilities(&self, reference: &ConnectionRef) -> Result<CapabilityReport> {
-        let config = self.gateway.config(reference).await?;
-        let probed = match self.gateway.storage_for_config(&config).await {
-            Ok(storage) => probe(storage.as_ref(), self.clock.now()).await,
-            Err(e) => ProbedCapabilities::uniform(self.clock.now(), classify(e.code)),
-        };
-        Ok(CapabilityReport {
-            connection: config.name.clone(),
-            probed_at: probed.probed_at,
-            entries: probed.entries(),
-        })
-    }
-}
-
-/// The probed capability set behind [`CapabilityReport`].
-///
-/// One listing decides `list_buckets` and supplies the bucket the write-shaped probes run
-/// against; multipart and copy probe with a throwaway object under `.rstore-write-test/`,
-/// presign signs locally.
-#[derive(Debug, Clone, Copy)]
-struct ProbedCapabilities {
-    probed_at: OffsetDateTime,
-    list_buckets: Capability,
-    multipart_upload: Capability,
-    server_side_copy: Capability,
-    presign: Capability,
-}
-
-impl ProbedCapabilities {
-    fn uniform(probed_at: OffsetDateTime, state: Capability) -> Self {
-        Self {
-            probed_at,
-            list_buckets: state,
-            multipart_upload: state,
-            server_side_copy: state,
-            presign: state,
-        }
-    }
-
-    fn entries(&self) -> Vec<(String, Capability)> {
-        vec![
-            ("list_buckets".to_string(), self.list_buckets),
-            ("multipart_upload".to_string(), self.multipart_upload),
-            ("server_side_copy".to_string(), self.server_side_copy),
-            ("presign".to_string(), self.presign),
-        ]
-    }
-}
-
-/// The one probe error classification: an adapter's honest `CapabilityUnsupported` reads as
-/// unsupported, missing permissions as denied, anything else as inconclusive.
-fn classify(code: ErrorCode) -> Capability {
-    match code {
-        ErrorCode::CapabilityUnsupported => Capability::Unsupported,
-        ErrorCode::Unauthorized | ErrorCode::Forbidden => Capability::Denied,
-        _ => Capability::Unknown,
-    }
 }
 
 /// A throwaway probe key under the established write-test prefix; a generated key failing to
@@ -304,111 +196,28 @@ fn probe_key(purpose: &str) -> rstore_domain::remote::ObjectPath {
     .expect("generated probe key")
 }
 
-async fn probe(storage: &dyn rstore_storage::Storage, at: OffsetDateTime) -> ProbedCapabilities {
-    let (list_buckets, bucket) = match storage.list_buckets().await {
-        Ok(buckets) => (
-            Capability::Supported,
-            buckets.first().map(|b| b.name.clone()),
-        ),
-        Err(e) => (classify(e.code), None),
+/// Put and delete one temporary object in `bucket`.
+async fn write_probe(storage: &dyn Storage, bucket: &str) -> CheckResult {
+    let key = probe_key("write");
+    let body = Bytes::from_static(b"rstore connection write test");
+    let options = PutOptions {
+        content_type: Some("text/plain".into()),
+        ..Default::default()
     };
-    let (multipart_upload, server_side_copy) = match &bucket {
-        Some(bucket) => (
-            probe_multipart(storage, bucket).await,
-            probe_copy(storage, bucket).await,
-        ),
-        // Without a visible bucket the write-shaped probes are inconclusive; presign still
-        // signs locally.
-        None => (Capability::Unknown, Capability::Unknown),
-    };
-    let presign = probe_presign(storage).await;
-    ProbedCapabilities {
-        probed_at: at,
-        list_buckets,
-        multipart_upload,
-        server_side_copy,
-        presign,
-    }
-}
-
-/// Create-and-abandon one multipart upload: the provider accepting the create is the
-/// capability; teardown rides the session's own warn-only abandon.
-async fn probe_multipart(storage: &dyn rstore_storage::Storage, bucket: &str) -> Capability {
-    let key = probe_key("multipart");
-    match storage
-        .create_multipart(bucket, &key, &PutOptions::default())
-        .await
-    {
-        Ok(session) => {
-            session.abandon().await;
-            Capability::Supported
-        }
-        Err(e) => classify(e.code),
-    }
-}
-
-/// Copy one throwaway object within the first visible bucket: put, copy through the adapter's
-/// copy path, clean both ends up. Adapters riding the read+put fallback also succeed — the
-/// entry reports the copy path this connection delivers; an adapter that honestly lacks
-/// server-side copy answers `CapabilityUnsupported` there.
-async fn probe_copy(storage: &dyn rstore_storage::Storage, bucket: &str) -> Capability {
-    let source = probe_key("copy");
-    let target = probe_key("copy-target");
-    let outcome = match storage
-        .put(
-            bucket,
-            &source,
-            Bytes::from_static(b"rstore capability probe"),
-            &PutOptions::default(),
-        )
-        .await
-    {
-        Ok(_) => {
-            storage
-                .copy(&rstore_storage::model::CopyRequest {
-                    source_bucket: bucket.to_string(),
-                    source_key: source.clone(),
-                    target_bucket: bucket.to_string(),
-                    target_key: target.clone(),
-                })
-                .await
-        }
+    let outcome = match storage.put(bucket, &key, body, &options).await {
+        Ok(_) => storage.delete(bucket, &key).await,
         Err(e) => Err(e),
     };
-    if let Err(error) = storage.delete(bucket, &source).await {
-        tracing::warn!(
-            error = %error,
-            bucket,
-            key = source.as_str(),
-            "capability probe could not clean up source object"
-        );
-    }
-    if let Err(error) = storage.delete(bucket, &target).await {
-        tracing::warn!(
-            error = %error,
-            bucket,
-            key = target.as_str(),
-            "capability probe could not clean up target object"
-        );
-    }
     match outcome {
-        Ok(_) => Capability::Supported,
-        Err(e) => classify(e.code),
-    }
-}
-
-/// Presign one throwaway GET: signing is local, so no request leaves the process.
-async fn probe_presign(storage: &dyn rstore_storage::Storage) -> Capability {
-    match storage
-        .presign(&rstore_storage::model::PresignRequest {
-            bucket: ".rstore-write-test".to_string(),
-            key: "probe".to_string(),
-            method: rstore_storage::model::PresignMethod::Get,
-            ttl_seconds: 60,
-        })
-        .await
-    {
-        Ok(_) => Capability::Supported,
-        Err(e) => classify(e.code),
+        Ok(_) => CheckResult {
+            name: "write_test".into(),
+            passed: true,
+            detail: format!("put+delete succeeded in `{bucket}` (temporary object cleaned up)"),
+        },
+        Err(e) => CheckResult {
+            name: "write_test".into(),
+            passed: false,
+            detail: format!("`{bucket}`: {e}"),
+        },
     }
 }

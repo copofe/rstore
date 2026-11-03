@@ -202,4 +202,24 @@ impl RemoteGateway {
     pub fn deleter(&self, storage: Arc<dyn Storage>, bucket: &Bucket) -> Result<Arc<dyn Storage>> {
         crate::guarded_storage::GuardedStorage::deleter(storage, bucket)
     }
+
+    /// The connection's registered buckets a probe may write into and clean
+    /// up after, each with its delete-guarded adapter. Read-only and
+    /// delete-forbidden buckets are left out, as is every unregistered one.
+    pub async fn probe_targets(
+        &self,
+        config: &ConnectionConfig,
+        storage: &Arc<dyn Storage>,
+    ) -> Result<Vec<(Bucket, Arc<dyn Storage>)>> {
+        Ok(self
+            .buckets
+            .list_by_connection(config.id)
+            .await?
+            .into_iter()
+            .filter_map(|bucket| {
+                let guarded = self.deleter(storage.clone(), &bucket).ok()?;
+                Some((bucket, guarded))
+            })
+            .collect())
+    }
 }

@@ -66,7 +66,7 @@ pub use connection::{
     UpdateConnectionInput,
 };
 pub use copy::{validate_copy_target, CopyOptions, CopyPair};
-pub use diagnostics::{CapabilityReport, CheckResult, ConnectionTestReport};
+pub use diagnostics::{CheckResult, ConnectionTestReport};
 pub use dirs::{resolve_app_dirs, AppDirs};
 pub use events::{EngineEvent, EventBus};
 pub use files::{FileEntry, FilesPage, FilesService};

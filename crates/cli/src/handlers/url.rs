@@ -30,11 +30,25 @@ pub(super) async fn url(ctx: &Ctx<'_>, args: &crate::args::UrlArgs) -> HandlerRe
     let mut human = String::new();
     let mut errors = Vec::new();
     let mut links = Vec::with_capacity(outcome.len());
+    // Buckets whose links were presigned for want of a public base, with
+    // the first expiry: one note each.
+    let mut unpublished: Vec<(&rstore_engine::RemoteUri, String)> = Vec::new();
     // Outcomes come back in submission order; errors name the reference as
     // the user wrote it.
-    for (input, item) in inputs.iter().zip(outcome.items()) {
+    for ((input, uri), item) in inputs.iter().zip(&uris).zip(outcome.items()) {
         match &item.value {
             Some(link) => {
+                if let (false, None, Some(expires)) =
+                    (request.signed, &link.public_url, &link.expires_at)
+                {
+                    let seen = unpublished.iter().any(|(other, _)| {
+                        other.bucket == uri.bucket
+                            && other.connection.display() == uri.connection.display()
+                    });
+                    if !seen {
+                        unpublished.push((uri, expires.clone()));
+                    }
+                }
                 human.push_str(&link.requested);
                 human.push('\n');
                 links.push(super::json_value(link)?);
@@ -53,8 +67,18 @@ pub(super) async fn url(ctx: &Ctx<'_>, args: &crate::args::UrlArgs) -> HandlerRe
         eprint!("{}", errors.concat());
     }
     let data = serde_json::json!({ "links": links, "failed": outcome.failed() });
-    Ok(super::report::with_severity(
-        HandlerOutput::human(human).with_data(data),
-        outcome.severity(),
-    ))
+    let mut out = HandlerOutput::human(human).with_data(data);
+    for (uri, expires) in unpublished {
+        let connection = match app.registry().connections().resolve(&uri.connection).await {
+            Ok(config) => config.name,
+            Err(_) => uri.connection.display(),
+        };
+        let bucket = format!("{connection}/{}", uri.bucket);
+        out = out.with_warning(format!(
+            "`{bucket}` has no public base, so the link is presigned and expires at \
+             {expires}; for a permanent link set one with \
+             `rstore bucket edit {bucket} --public-base <url>`"
+        ));
+    }
+    Ok(super::report::with_severity(out, outcome.severity()))
 }

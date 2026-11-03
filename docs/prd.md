@@ -37,8 +37,9 @@ The CLI and the desktop may run at the same time over one data directory.
 - A **LinkProfile** stores bucket-level public/CDN base overrides, presign
   permissions, and the default TTL.
 - Effective link base precedence: bucket CDN override → connection CDN
-  default → bucket public override → connection public default → native S3
-  endpoint. rstore never guesses URL shapes from the provider name.
+  default → bucket public override → connection public default. Without a
+  configured base, links are presigned; the S3 endpoint is never presented as
+  a public URL. rstore never guesses URL shapes from the provider name.
 - Credentials live directly in the connection's SQLite row, protected as
   `Secret<T>` in memory, and never enter exports, generic API JSON, or logs;
   connection details render masked previews only.
@@ -73,9 +74,10 @@ The CLI and the desktop may run at the same time over one data directory.
 ### 3.4 Access diagnostics
 
 - Connection testing checks stored credentials, connectivity, and optionally
-  performs a write probe.
-- Capability probes cover listing, multipart upload, server-side copy, and
-  presigning.
+  performs a write probe. Probes that write only touch registered buckets
+  that allow writes and deletes, through the same guard as real mutations.
+- There is no capability probe: an operation the provider cannot perform
+  fails with `capability_unsupported` when it is attempted.
 - `doctor` summarizes connection health, adapter identity, interrupted jobs,
   and stale catalog rows.
 - Unsupported capabilities return a distinct `CapabilityUnsupported` error.
@@ -170,8 +172,8 @@ another process reaches the owner at its next heartbeat.
   not yet install a custom verifier.
 - Logs, JSON output, error contexts, and diagnostics must not leak secrets or
   signed URLs.
-- Deletes, overwrites, and recursive operations pass their bucket policy and
-  capability checks first.
+- Deletes, overwrites, and recursive operations pass their bucket policy
+  checks (read-only, allow-delete) first.
 - Destructive commands in non-interactive environments require explicit
   `--yes`.
 
